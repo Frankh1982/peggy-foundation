@@ -341,7 +341,37 @@ function formatScore(score) {
 }
 
 function isGreeting(s) { return /^\s*(hi|hello|hey|howdy|yo|sup|hiya|hellooo)\s*[!?\.]*\s*$/i.test(s || ""); }
-function wantsListOnly(text) { return /\b(find|show|list)\b.+\b(more|sites|sources|articles|links)\b/i.test(text || ""); }
+
+const LIST_INTENT_REGEX = /^\s*(find|show|list|look up)\s+(more\s+)?(web\s*sites|websites|sites|sources|articles)\b/i;
+const LIST_ABOUT_FALLBACK_REGEX = /^\s*(find|show|list)\s+.*\babout\b\s+(.+)/i;
+
+function detectListIntent(text) {
+  const raw = String(text || "");
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const mainMatch = trimmed.match(LIST_INTENT_REGEX);
+  if (mainMatch) {
+    let remainder = trimmed.slice(mainMatch[0].length).trim();
+    if (!remainder) {
+      const aboutMatch = trimmed.match(/\babout\b\s+(.+)/i);
+      if (aboutMatch) remainder = aboutMatch[1].trim();
+    }
+    remainder = remainder.replace(/^(about|on|regarding)\s+/i, "").trim();
+    const query = remainder || raw.replace(LIST_INTENT_REGEX, "").trim();
+    return { query: query || trimmed };
+  }
+
+  const aboutFallback = trimmed.match(LIST_ABOUT_FALLBACK_REGEX);
+  if (aboutFallback) {
+    const query = (aboutFallback[2] || "").trim();
+    return { query: query || trimmed };
+  }
+
+  return null;
+}
+
+function wantsListOnly(text) { return Boolean(detectListIntent(text)); }
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -426,7 +456,23 @@ wss.on("connection", (ws, req) => {
     }
 
     // Search intents
-    if (wantsListOnly(content) || /^\s*(search|look up)\b/i.test(content)) {
+    const listIntent = detectListIntent(content);
+    if (listIntent) {
+      const topic = bucketTopic(content);
+      const base = listIntent.query || content;
+      const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
+      const runNumber = touchTopicRun(sessionId, topic);
+      const args = { q: base, qlist: qlist.slice(), k: 5 };
+      const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+      if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+        args.qlist = rotateList(args.qlist, runNumber - 1);
+      }
+      const spec = { tool: "web_search", args };
+      await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
+      return;
+    }
+
+    if (/^\s*(search|look up)\b/i.test(content)) {
       const topic = bucketTopic(content);
       const base = content.replace(/^\s*(search|look up)\b/i, "").trim() || content;
       const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
@@ -453,7 +499,7 @@ wss.on("connection", (ws, req) => {
 
     try {
       const { content: completion, usage } = await callOpenAI(messages);
-      handleAssistantResponse(ws, { completion, usage, userId, sessionId });
+      await handleAssistantResponse(ws, { completion, usage, userId, sessionId });
     } catch (err) {
       ws.send(JSON.stringify({ type: "assistant_message", content: "unknown with current context (API error)." }));
       console.error(err);
@@ -680,7 +726,7 @@ async function executeTool(ws, meta, call_id="auto") {
       }
 
       // If not list-only, continue to model to pick best URL
-      if (!/\b(find|show|list)\b.+\b(more|sites|sources|articles|links)\b/i.test(meta.requestText || "") && selected.length) {
+      if (!wantsListOnly(meta.requestText || "") && selected.length) {
         await callModelWithSearchResults(ws, meta, run);
       }
     } else {
@@ -722,7 +768,7 @@ async function callModelWithGetResult(ws, meta, run) {
 
   const { content: completion, usage } = await callOpenAI(messages);
   const forced = enforceSummaryCompletionFormat(completion, run);
-  handleAssistantResponse(ws, { completion: forced, usage, userId, sessionId });
+  await handleAssistantResponse(ws, { completion: forced, usage, userId, sessionId });
 }
 
 async function callModelWithSearchResults(ws, meta, run) {
@@ -741,15 +787,45 @@ async function callModelWithSearchResults(ws, meta, run) {
   ];
 
   const { content: completion, usage } = await callOpenAI(messages);
-  handleAssistantResponse(ws, { completion, usage, userId, sessionId });
+  await handleAssistantResponse(ws, { completion, usage, userId, sessionId });
 }
 
-function handleAssistantResponse(ws, { completion, usage, userId, sessionId }) {
+function hasRecentServerList(sessionId, windowMs = 2500) {
+  const stored = sessionSearch.get(sessionId);
+  if (!stored || !Number.isFinite(stored.ts)) return false;
+  return (Date.now() - stored.ts) <= windowMs;
+}
+
+async function handleAssistantResponse(ws, { completion, usage, userId, sessionId }) {
   const { cleanText, memo, gap, evidence, kdn, call, note } = extractArtifactsTolerant(completion);
   if (usage) {
     ws.send(JSON.stringify({ type:"telemetry", usage }));
     if (usage.total_tokens && updateLastEpisode({ tokens_total: usage.total_tokens })) {
       ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
+    }
+  }
+
+  const wantsServerList = /here are\s+5\s+sources\b/i.test(cleanText || "");
+  if (wantsServerList && !hasRecentServerList(sessionId)) {
+    const recentMessages = getRecentMessages(sessionId, 6) || [];
+    const lastUser = [...recentMessages].reverse().find(msg => msg?.role === "user");
+    const fallbackText = lastUser?.content ? String(lastUser.content) : "";
+    if (fallbackText) {
+      const listIntent = detectListIntent(fallbackText);
+      const base = (listIntent?.query || fallbackText).trim();
+      if (base) {
+        const topic = bucketTopic(fallbackText);
+        const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
+        const runNumber = touchTopicRun(sessionId, topic);
+        const args = { q: base, qlist: qlist.slice(), k: 5 };
+        const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+        if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+          args.qlist = rotateList(args.qlist, runNumber - 1);
+        }
+        const spec = { tool: "web_search", args };
+        await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber });
+        return;
+      }
     }
   }
 
