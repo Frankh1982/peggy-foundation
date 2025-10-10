@@ -13,8 +13,10 @@ const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
-const RECENT_N = Number(process.env.RECENT_N || 4);
-const MAX_PAGE_CHARS = Number(process.env.MAX_PAGE_CHARS || 16000);
+const envRecent = (process.env.RECENT_N ?? "").trim();
+const envDocCap = (process.env.MAX_PAGE_CHARS ?? "").trim();
+const RECENT_N = Math.max(0, Number(envRecent || 3));
+const MAX_PAGE_CHARS = Math.max(0, Number(envDocCap || 8000));
 const CALL_POLICY = (process.env.CALL_POLICY || "auto").trim().toLowerCase();
 const PEG_BUILD = "2025-10-04-v3j-learn";
 const DEFAULT_SOURCE_PRIOR = 0.45;
@@ -427,7 +429,7 @@ wss.on("connection", (ws, req) => {
     // Default → model
     const profile = getUserProfile(userId);
     const systemPrompt = buildSystemPrompt(profile);
-    const recent = getRecentMessages(sessionId, RECENT_N);
+    const recent = getTrimmedHistory(sessionId);
     const messages = [
       { role: "system", content: systemPrompt },
       ...recent,
@@ -692,16 +694,15 @@ async function callModelWithGetResult(ws, meta, run) {
   const { userId, sessionId } = meta;
   const profile = getUserProfile(userId);
   const systemPrompt = buildSystemPrompt(profile);
-  const recent = getRecentMessages(sessionId, 2);
-  const cap = (s, n) => (String(s||"").length > n ? String(s).slice(0,n) : String(s||""));
-  const doc = cap(run?.result?.text || "", MAX_PAGE_CHARS);
+  const recent = getTrimmedHistory(sessionId, { omitAssistantTail: true });
+  const doc = cleanAndCapDoc(run?.result?.text || "", MAX_PAGE_CHARS);
 
   const messages = [
     { role:"system", content: systemPrompt },
     ...recent,
     { role:"system", content: `CALLRESULT {"tool":"web_get","ref":"${run.id}","url":"${run.result_summary.url}","title":"${(run.result_summary.title||"").replace(/"/g,'\"')}","chars":${doc.length}}` },
     { role:"system", content: `DOC:\n${doc}` },
-    { role:"user", content: "Write a 5-bullet summary of DOC. Start with the page title and include the URL in parentheses. If the content is evergreen, append a [[NOTE]] with ≤400-char summary and source ref." }
+    { role:"user", content: "Write five tight bullets about DOC. Start with the page title plus URL in parentheses. If it is evergreen, append one [[NOTE]] (≤400 chars) citing the source." }
   ];
 
   const { content: completion, usage } = await callOpenAI(messages);
@@ -713,7 +714,7 @@ async function callModelWithSearchResults(ws, meta, run) {
   const { userId, sessionId } = meta;
   const profile = getUserProfile(userId);
   const systemPrompt = buildSystemPrompt(profile);
-  const recent = getRecentMessages(sessionId, 2);
+  const recent = getTrimmedHistory(sessionId, { omitAssistantTail: true });
   const results = JSON.stringify(run?.result?.results || []);
 
   const messages = [
@@ -783,6 +784,43 @@ function handleAssistantResponse(ws, { completion, usage, userId, sessionId }) {
       }
     } catch {}
   }
+}
+
+function getTrimmedHistory(sessionId, { omitAssistantTail = false } = {}) {
+  const limit = Math.max(0, RECENT_N);
+  if (!limit) return [];
+  const history = getRecentMessages(sessionId, limit);
+  if (!history.length) return [];
+  const deduped = dedupeSequential(history);
+  if (!omitAssistantTail) return deduped;
+  const trimmed = deduped.slice();
+  while (trimmed.length && trimmed[trimmed.length - 1]?.role === "assistant") {
+    trimmed.pop();
+  }
+  return trimmed;
+}
+
+function dedupeSequential(list) {
+  const out = [];
+  for (const item of list) {
+    if (!item || typeof item.content !== "string") continue;
+    if (out.length) {
+      const prev = out[out.length - 1];
+      if (prev.role === item.role && prev.content === item.content) continue;
+    }
+    out.push({ role: item.role, content: item.content });
+  }
+  return out;
+}
+
+function cleanAndCapDoc(raw, limit) {
+  if (!limit) return "";
+  const text = typeof raw === "string" ? raw : "";
+  const normalized = text.replace(/\r\n/g, "\n");
+  const paragraphs = normalized.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  const filtered = paragraphs.filter(p => p.replace(/\s+/g, " ").trim().length >= 60);
+  const joined = (filtered.length ? filtered : paragraphs).join("\n\n");
+  return joined.slice(0, limit);
 }
 
 async function callOpenAI(messages) {
