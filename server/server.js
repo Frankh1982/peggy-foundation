@@ -872,7 +872,8 @@ function enforceSummaryText(raw, run) {
   while (limited.length < 5) limited.push("");
   const sanitized = limited.map(sanitizeBulletText);
   while (sanitized.length < 5) sanitized.push("Detail unavailable.");
-  const normalized = sanitized.map(finalizeBulletText);
+  const cleaned = sanitized.map(line => stripHeaderRepetitions(line, title, url));
+  const normalized = cleaned.map(finalizeBulletText);
   const bulletLines = normalized.map(line => `- ${line}`);
   return [header, ...bulletLines].join("\n");
 }
@@ -963,4 +964,38 @@ function finalizeBulletText(text) {
     line += ".";
   }
   return line;
+}
+
+function stripHeaderRepetitions(line, title, url) {
+  let out = String(line || "").trim();
+  if (!out) return out;
+
+  const collapse = (value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const normalizedTitle = collapse(title);
+  const normalizedUrl = collapse(url);
+
+  const removeFragment = (text, fragment) => {
+    if (!fragment) return text;
+    let working = text;
+    let lowerWorking = working.toLowerCase();
+    const fragLength = fragment.length;
+    while (lowerWorking.includes(fragment)) {
+      const idx = lowerWorking.indexOf(fragment);
+      working = working.slice(0, idx) + working.slice(idx + fragLength);
+      lowerWorking = working.toLowerCase();
+    }
+    return working;
+  };
+
+  out = removeFragment(out, normalizedUrl);
+  out = removeFragment(out, normalizedTitle);
+
+  out = out.replace(/\(\s*\)/g, "");
+  out = out.replace(/\s+/g, " ").trim();
+
+  if (out.toLowerCase() === normalizedTitle || out.toLowerCase() === normalizedUrl) {
+    out = "";
+  }
+
+  return out;
 }
