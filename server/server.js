@@ -552,24 +552,6 @@ async function executeTool(ws, meta, call_id="auto") {
       ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
 
       // Server-side list
-      const scoredResults = (result?.results || []).map((entry, idx) => {
-        const domain = extractDomain(entry?.url || "");
-        const prior = getSourcePrior(domain);
-        const recency = computeRecencyScore(entry);
-        const score = SCORE_PRIOR_WEIGHT * prior + SCORE_RECENCY_WEIGHT * recency;
-        return { ...entry, domain, prior, recency, score, idx };
-      }).filter(entry => entry && entry.url && !shouldExcludeDomain(entry.domain, entry.url, meta.requestText));
-
-      const uniqueResults = [];
-      const domainsInList = new Set();
-      scoredResults.forEach(entry => {
-        const key = entry.domain ? entry.domain.toLowerCase() : `__idx_${entry.idx}`;
-        if (domainsInList.has(key)) return;
-        domainsInList.add(key);
-        uniqueResults.push(entry);
-      });
-
-      const hasBraveKey = Boolean((process.env.BRAVE_API_KEY || "").trim());
       const { union: seenHostUnion } = getSeenHostUnion(meta.sessionId, topic);
       const rankWeight = (entry) => {
         let weight = 0;
@@ -577,7 +559,26 @@ async function executeTool(ws, meta, call_id="auto") {
         if (!entry.domain || !seenHostUnion.has(entry.domain)) weight += 1;
         return weight;
       };
-      const rankedResults = uniqueResults.slice().sort((a, b) => {
+
+      const scoreEntries = (entries, baseIdx = 0) => {
+        return (entries || []).map((entry, idx) => {
+          const domain = extractDomain(entry?.url || "");
+          const prior = getSourcePrior(domain);
+          const recency = computeRecencyScore(entry);
+          const score = SCORE_PRIOR_WEIGHT * prior + SCORE_RECENCY_WEIGHT * recency;
+          return { ...entry, domain, prior, recency, score, idx: baseIdx + idx };
+        }).filter(entry => entry && entry.url && !shouldExcludeDomain(entry.domain, entry.url, meta.requestText));
+      };
+
+      const hostKeyForEntry = (entry) => {
+        if (!entry) return null;
+        if (entry.domain) return entry.domain.toLowerCase();
+        if (entry.url) return entry.url.split("#")[0].toLowerCase();
+        if (Number.isFinite(entry.idx)) return `__idx_${entry.idx}`;
+        return null;
+      };
+
+      const compareEntries = (a, b) => {
         const wa = rankWeight(a);
         const wb = rankWeight(b);
         if (wa !== wb) return wb - wa;
@@ -585,117 +586,113 @@ async function executeTool(ws, meta, call_id="auto") {
         const scoreB = Number.isFinite(b.score) ? b.score : 0;
         if (scoreA !== scoreB) return scoreB - scoreA;
         return a.idx - b.idx;
-      });
+      };
 
-      const firstFour = [];
-      const usedHostKeys = new Set();
-      for (const entry of rankedResults) {
-        if (firstFour.length >= 4) break;
-        const key = entry.domain ? entry.domain.toLowerCase() : `__idx_${entry.idx}`;
-        if (usedHostKeys.has(key)) continue;
-        usedHostKeys.add(key);
-        firstFour.push(entry);
-      }
+      const rankEntries = (entries) => entries.slice().sort(compareEntries);
 
-      const usedHosts = new Set(firstFour.map(item => item.domain).filter(Boolean));
-      let slotFiveEntry = null;
+      const dedupeByHost = (entries) => {
+        const best = new Map();
+        for (const entry of entries) {
+          const key = hostKeyForEntry(entry);
+          if (!key) continue;
+          const prev = best.get(key);
+          if (!prev || compareEntries(entry, prev) < 0) {
+            best.set(key, entry);
+          }
+        }
+        return Array.from(best.values());
+      };
+
+      const candidatePool = new Map();
+      const mergeCandidates = (entries) => {
+        for (const entry of entries) {
+          const key = hostKeyForEntry(entry);
+          if (!key) continue;
+          const prev = candidatePool.get(key);
+          if (!prev || compareEntries(entry, prev) < 0) {
+            candidatePool.set(key, entry);
+          }
+        }
+      };
+
+      const selected = [];
+      const selectedHostKeys = new Set();
       let exploreReason = "none";
-      for (const entry of rankedResults) {
-        if (!entry.domain) continue;
-        if (usedHosts.has(entry.domain)) continue;
-        if (seenHostUnion.has(entry.domain)) continue;
-        slotFiveEntry = entry;
-        exploreReason = "unseen";
-        break;
-      }
+      const markExplore = (reason) => {
+        if (!reason) return;
+        if (exploreReason === "none") exploreReason = reason;
+      };
 
-      if (!slotFiveEntry && hasBraveKey) {
+      const tryAddEntry = (entry, opts = {}) => {
+        if (!entry || !entry.url) return false;
+        const hostKey = hostKeyForEntry(entry);
+        if (!hostKey) return false;
+        if (selectedHostKeys.has(hostKey)) return false;
+        const host = entry.domain;
+        if (!opts.allowSeen && host && seenHostUnion.has(host)) return false;
+        selected.push(entry);
+        selectedHostKeys.add(hostKey);
+        if (!host || !seenHostUnion.has(host)) {
+          const reason = opts.reason && opts.reason !== "seen_fallback" ? opts.reason : "unseen";
+          markExplore(reason);
+        } else if (opts.reason && opts.reason !== "seen_fallback") {
+          markExplore(opts.reason);
+        }
+        return true;
+      };
+
+      const addFromCandidates = (entries, opts = {}) => {
+        for (const entry of entries) {
+          if (selected.length >= 5) break;
+          tryAddEntry(entry, opts);
+        }
+      };
+
+      let idxCursor = 0;
+      const baseProcessed = scoreEntries(result?.results || [], idxCursor);
+      idxCursor += baseProcessed.length;
+      const baseCandidates = rankEntries(dedupeByHost(baseProcessed));
+      mergeCandidates(baseCandidates);
+      addFromCandidates(baseCandidates, { allowSeen: true });
+
+      if (selected.length < 5) {
         try {
           const baseOffsetRaw = Number(meta.spec.args.offset ?? 0);
           const baseOffset = Number.isFinite(baseOffsetRaw) ? baseOffsetRaw : 0;
           const offsetArgs = { ...meta.spec.args, offset: baseOffset + 5 };
           const offsetResult = await tool_web_search(offsetArgs, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
-          const offsetScored = (offsetResult?.results || []).map((entry, idx) => {
-            const domain = extractDomain(entry?.url || "");
-            const prior = getSourcePrior(domain);
-            const recency = computeRecencyScore(entry);
-            const score = SCORE_PRIOR_WEIGHT * prior + SCORE_RECENCY_WEIGHT * recency;
-            return { ...entry, domain, prior, recency, score, idx };
-          }).filter(entry => entry && entry.url && !shouldExcludeDomain(entry.domain, entry.url, meta.requestText));
-          const seenOffset = new Set();
-          const offsetUnique = [];
-          offsetScored.forEach(entry => {
-            const key = entry.domain ? entry.domain.toLowerCase() : `__idx_${entry.idx}`;
-            if (seenOffset.has(key)) return;
-            seenOffset.add(key);
-            offsetUnique.push(entry);
-          });
-          const offsetRanked = offsetUnique.slice().sort((a, b) => {
-            const wa = rankWeight(a);
-            const wb = rankWeight(b);
-            if (wa !== wb) return wb - wa;
-            const scoreA = Number.isFinite(a.score) ? a.score : 0;
-            const scoreB = Number.isFinite(b.score) ? b.score : 0;
-            if (scoreA !== scoreB) return scoreB - scoreA;
-            return a.idx - b.idx;
-          });
-          for (const entry of offsetRanked) {
-            if (!entry.domain) continue;
-            if (usedHosts.has(entry.domain)) continue;
-            if (seenHostUnion.has(entry.domain)) continue;
-            slotFiveEntry = entry;
-            exploreReason = "offset";
-            break;
-          }
+          const offsetProcessed = scoreEntries(offsetResult?.results || [], idxCursor);
+          idxCursor += offsetProcessed.length;
+          const offsetCandidates = rankEntries(dedupeByHost(offsetProcessed));
+          mergeCandidates(offsetCandidates);
+          addFromCandidates(offsetCandidates, { allowSeen: false, reason: "offset" });
         } catch (err) {
           console.error("offset_search_failed", err);
         }
       }
 
-      let selected = firstFour.slice();
-      if (slotFiveEntry) {
-        const already = selected.findIndex(item => item.domain === slotFiveEntry.domain && item.url === slotFiveEntry.url);
-        if (already !== -1) {
-          selected.splice(already, 1);
-        }
-        selected.push(slotFiveEntry);
-      }
-
-      for (const entry of rankedResults) {
-        if (selected.length >= 5) break;
-        if (!entry) continue;
-        if (selected.some(item => item.url === entry.url)) continue;
-        const host = entry.domain;
-        if (host && selected.some(item => item.domain === host)) continue;
-        selected.push(entry);
-      }
-
-      if (selected.length < 5 && slotFiveEntry) {
-        for (const entry of rankedResults) {
-          if (selected.length >= 5) break;
-          if (!entry) continue;
-          if (selected.some(item => item.url === entry.url)) continue;
-          selected.push(entry);
+      if (selected.length < 5) {
+        const qlist = Array.isArray(meta.spec.args.qlist) ? meta.spec.args.qlist.filter(Boolean) : [];
+        if (qlist.length > 1) {
+          try {
+            const rotated = rotateList(qlist, 1);
+            const variantArgs = { ...meta.spec.args, q: rotated[0], qlist: rotated, offset: 0 };
+            const variantResult = await tool_web_search(variantArgs, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
+            const variantProcessed = scoreEntries(variantResult?.results || [], idxCursor);
+            idxCursor += variantProcessed.length;
+            const variantCandidates = rankEntries(dedupeByHost(variantProcessed));
+            mergeCandidates(variantCandidates);
+            addFromCandidates(variantCandidates, { allowSeen: false, reason: "variant" });
+          } catch (err) {
+            console.error("variant_search_failed", err);
+          }
         }
       }
 
-      if (selected.length > 5) {
-        selected = selected.slice(0, 5);
+      if (selected.length < 5) {
+        const fallbackCandidates = rankEntries(Array.from(candidatePool.values()));
+        addFromCandidates(fallbackCandidates, { allowSeen: true, reason: "seen_fallback" });
       }
-
-      const uniqueSelected = [];
-      const finalHosts = new Set();
-      for (const entry of selected) {
-        if (!entry || !entry.url) continue;
-        const host = entry.domain;
-        if (host) {
-          if (finalHosts.has(host)) continue;
-          finalHosts.add(host);
-        }
-        uniqueSelected.push(entry);
-        if (uniqueSelected.length >= 5) break;
-      }
-      selected = uniqueSelected;
 
       const selectedHosts = selected.map(item => item?.domain || null);
       const exploreFlag = exploreReason !== "none";
