@@ -1,0 +1,19 @@
+{
+  "exclude": [
+    "reddit.com",
+    "quora.com",
+    "medium.com/@",
+    "gist.github.com"
+  ],
+  "prefer": [
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "washingtonpost.com",
+    "npr.org",
+    "theguardian.com",
+    "arstechnica.com",
+    "theverge.com"
+  ],
+  "neutral": []
+}

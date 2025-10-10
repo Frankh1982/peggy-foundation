@@ -50,6 +50,31 @@ export function recordEpisode({ userId, sessionId, topic, success, note_saved=fa
   appendJSONL(files.episodes, { ts: Date.now(), userId, sessionId, topic, success, note_saved, tokens_total, calls });
 }
 
+export function updateLastEpisode(patch = {}) {
+  if (!patch || typeof patch !== "object") return false;
+  try {
+    if (!fs.existsSync(files.episodes)) return false;
+    const raw = fs.readFileSync(files.episodes, "utf8").trim();
+    if (!raw) return false;
+    const lines = raw.split("\n");
+    const last = JSON.parse(lines[lines.length - 1]);
+    let changed = false;
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined) continue;
+      if (last[key] !== value) {
+        last[key] = value;
+        changed = true;
+      }
+    }
+    if (!changed) return false;
+    lines[lines.length - 1] = JSON.stringify(last);
+    fs.writeFileSync(files.episodes, lines.join("\n") + "\n");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---- Stats
 export function recentStats(N=20) {
   let rows = [];
