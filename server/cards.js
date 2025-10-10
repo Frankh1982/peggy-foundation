@@ -2,10 +2,75 @@ import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 
+const DAY_MS = 24 * 60 * 60 * 1000;
 const cardsDir = path.resolve("data", "cards");
 const indexDir = path.resolve("data", "index");
 const cardsFile = path.join(cardsDir, "cards.jsonl");
 const indexFile = path.join(indexDir, "cards_index.json");
+
+const clamp01 = value => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  if (num <= 0) return 0;
+  if (num >= 1) return 1;
+  return num;
+};
+
+export function scoreImportance({ explicitness = 0, recency = 0, frequency = 0, taskGain = 0 } = {}) {
+  const E = clamp01(explicitness);
+  const R = clamp01(recency);
+  const F = clamp01(frequency);
+  const G = clamp01(taskGain);
+  return 0.4 * E + 0.2 * R + 0.2 * F + 0.2 * G;
+}
+
+export function shouldSave(_card, metrics = {}) {
+  const score = scoreImportance(metrics);
+  return score >= 0.6;
+}
+
+export function applyTTL(card, { now = Date.now() } = {}) {
+  if (!card || typeof card !== "object") return card;
+  const copy = { ...card };
+  const type = (card.type || "").toLowerCase();
+
+  if (type === "profile" || type === "pref") {
+    copy.ttl_days = null;
+    copy.stale = false;
+    return copy;
+  }
+
+  let ttlDays = copy.ttl_days;
+  if (ttlDays === undefined || ttlDays === null) {
+    if (type === "note" || type === "claim") {
+      ttlDays = 30;
+    } else {
+      ttlDays = null;
+    }
+  }
+
+  if (ttlDays !== null) {
+    const numeric = Number(ttlDays);
+    ttlDays = Number.isFinite(numeric) && numeric > 0 ? numeric : 30;
+  }
+
+  copy.ttl_days = ttlDays === null ? null : ttlDays;
+
+  if (copy.ttl_days === null) {
+    copy.stale = false;
+    return copy;
+  }
+
+  const createdAt = Number(copy.created_at ?? copy.last_used ?? 0);
+  const ttlMs = copy.ttl_days * DAY_MS;
+  if (!Number.isFinite(createdAt) || createdAt <= 0) {
+    copy.stale = false;
+    return copy;
+  }
+
+  copy.stale = now - createdAt > ttlMs;
+  return copy;
+}
 
 export const ProfileCard = {
   type: "profile",
@@ -216,6 +281,7 @@ export function getTopByTopic(topic, { limit = 3 } = {}) {
   for (const id of ids) {
     const card = lookup.get(id);
     if (!card) continue;
+    const enriched = applyTTL(card);
     picked.push({
       id: card.id,
       type: card.type,
@@ -223,7 +289,9 @@ export function getTopByTopic(topic, { limit = 3 } = {}) {
       summary: card.summary,
       value: card.value,
       confidence: card.confidence,
-      last_used: card.last_used
+      last_used: card.last_used,
+      ttl_days: enriched?.ttl_days ?? null,
+      stale: Boolean(enriched?.stale)
     });
   }
   picked.sort((a, b) => (Number(b.last_used) || 0) - (Number(a.last_used) || 0));
