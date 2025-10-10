@@ -52,6 +52,7 @@ const wss = new WebSocketServer({ server, path: "/chat" });
 const sessionSearch = new Map();
 const sessionTopicState = new Map();
 const sessionTopicSeenHosts = new Map();
+const sessionLastSummary = new Map();
 
 function emitEventLog(ws, label, payload) {
   if (!ws || !label) return;
@@ -241,9 +242,11 @@ function buildCardContextBlock(cards, fallbackTopic) {
   for (const card of cards) {
     if (!card || !card.id) continue;
     const summary = formatCardOneLiner(card);
-    const topicLabel = normalizeTopic(card.topic || "") || fallbackTopic || "";
-    const typeLabel = (card.type || "card").trim() || "card";
-    const line = `\n- (${typeLabel}=${card.id}) topic=${topicLabel} :: ${summary}`;
+    const rawTopic = (card.topic || "").toString().trim();
+    const topicLabel = (rawTopic || fallbackTopic || "").slice(0, 160);
+    const topicValue = topicLabel || "[no topic]";
+    const typeLabel = (card.type || "card").toString().trim() || "card";
+    const line = `\n- (${typeLabel}) ${topicValue} :: ${summary}`;
     const candidate = `${block}${line}\n[/CARD_CONTEXT]`;
     if (candidate.length > 400) break;
     block += line;
@@ -767,6 +770,61 @@ function extractDirectNoteCommand(text) {
   return null;
 }
 
+function extractNoteShortcutCommand(text) {
+  if (typeof text !== "string") return null;
+  const raw = text.trim();
+  if (!raw) return null;
+
+  const listMatch = raw.match(/^save\s+note\s+#(\d+)\s*:\s*(.+)$/i);
+  if (listMatch) {
+    const summary = listMatch[2].trim();
+    if (!summary) return null;
+    const index = Number(listMatch[1]);
+    if (!Number.isFinite(index) || index < 1) return null;
+    return { kind: "list_item", index, summary };
+  }
+
+  const lastSummaryMatch = raw.match(/^save\s+note\s+from\s+last\s+summary\s*:\s*(.+)$/i);
+  if (lastSummaryMatch) {
+    const summary = lastSummaryMatch[1].trim();
+    if (!summary) return null;
+    return { kind: "last_summary", summary };
+  }
+
+  const linkMatch = raw.match(/^save\s+note\s*:\s*(.+)$/i);
+  if (linkMatch) {
+    const remainder = linkMatch[1];
+    const linkPhrase = remainder.match(/^(.*?)(?:;\s*)?source\s+is\s+that\s+link[\.!?]?$/i);
+    if (linkPhrase) {
+      const summary = linkPhrase[1].trim();
+      if (!summary) return null;
+      return { kind: "last_link", summary };
+    }
+  }
+
+  return null;
+}
+
+function rememberLastSummary(sessionId, info) {
+  if (!sessionId) return;
+  if (!info || !info.url) return;
+  const record = {
+    url: String(info.url).trim(),
+    title: String(info.title || "").trim(),
+    topic: String(info.topic || "").trim(),
+    ts: Date.now()
+  };
+  sessionLastSummary.set(sessionId, record);
+}
+
+function getLastSummary(sessionId) {
+  if (!sessionId) return null;
+  const stored = sessionLastSummary.get(sessionId);
+  if (!stored) return null;
+  if (!stored.url) return null;
+  return stored;
+}
+
 function sanitizeNoteSource(source) {
   if (!source || typeof source !== "object") return null;
   const url = String(source.url || source.href || "").trim();
@@ -881,7 +939,8 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
     return { saved: false, error: "persist_failed", score, metrics };
   }
 
-  logCardWrite({ ts: now, type: card.type, topic: card.topic, score, reason: reason || "" });
+  const logReason = reason || ((Number(explicitness) || 0) >= 1 ? "user_reply" : "");
+  logCardWrite({ ts: now, type: card.type, topic: card.topic, score, reason: logReason });
   return { saved: true, card: { ...card, id }, score, metrics };
 }
 
@@ -895,6 +954,7 @@ function isGreeting(s) { return /^\s*(hi|hello|hey|howdy|yo|sup|hiya|hellooo)\s*
 
 const LIST_INTENT_REGEX = /^\s*(find|show|list|look up)\s+(more\s+)?(web\s*sites|websites|sites|sources|articles)\b/i;
 const LIST_ABOUT_FALLBACK_REGEX = /^\s*(find|show|list)\s+.*\babout\b\s+(.+)/i;
+const LATEST_ON_REGEX = /^\s*(?:what(?:'s| is)?\s+)?(?:the\s+)?latest\s+(?:on|about)\s+(.+)/i;
 
 function detectListIntent(text) {
   const raw = String(text || "");
@@ -917,6 +977,13 @@ function detectListIntent(text) {
   if (aboutFallback) {
     const query = (aboutFallback[2] || "").trim();
     return { query: query || trimmed };
+  }
+
+  const latestOn = trimmed.match(LATEST_ON_REGEX);
+  if (latestOn) {
+    let remainder = (latestOn[1] || "").trim();
+    remainder = remainder.replace(/[?!.]+$/g, "").trim();
+    return { query: remainder || trimmed };
   }
 
   return null;
@@ -944,6 +1011,88 @@ wss.on("connection", (ws, req) => {
     const sessionId = msg.session_id || "default";
     const content = (msg.content || "").toString().slice(0, 8000);
     const inReplyToGap = msg.in_reply_to_gap || null;
+
+    const shortcutNote = extractNoteShortcutCommand(content);
+    if (shortcutNote) {
+      appendMessage(sessionId, { role: "user", content });
+      const summary = shortcutNote.summary.trim().slice(0, 400);
+      if (!summary) {
+        ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_summary" }));
+        const reply = "I need a short summary to save that note.";
+        appendMessage(sessionId, { role: "assistant", content: reply });
+        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+        return;
+      }
+
+      let payload = null;
+      let topicHint = summary;
+      let rejectMessage = "";
+
+      if (shortcutNote.kind === "list_item") {
+        const stored = sessionSearch.get(sessionId);
+        const idx = shortcutNote.index - 1;
+        const item = stored?.list?.[idx];
+        if (item && item.url) {
+          const topicCandidate = stored?.topic || item.title || summary;
+          const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
+          const topicFinal = topicValue || summary;
+          const source = { url: item.url };
+          if (item.title) source.title = item.title;
+          payload = { topic: topicFinal, summary, source };
+          topicHint = topicFinal;
+        } else {
+          rejectMessage = stored ? `I don't have a link for list item #${shortcutNote.index}.` : "I don't have a recent list to pull from.";
+        }
+      } else if (shortcutNote.kind === "last_summary" || shortcutNote.kind === "last_link") {
+        const last = getLastSummary(sessionId);
+        if (last && last.url) {
+          const topicCandidate = last.topic || last.title || summary;
+          const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
+          const topicFinal = topicValue || summary;
+          const source = { url: last.url };
+          if (last.title) source.title = last.title;
+          payload = { topic: topicFinal, summary, source };
+          topicHint = topicFinal;
+        } else {
+          rejectMessage = "I don't have a recent page to attach. Please open a link first or include the URL.";
+        }
+      }
+
+      if (!payload) {
+        const reason = rejectMessage ? "missing_source_url" : "invalid_note_command";
+        ws.send(JSON.stringify({ type: "note_rejected", reason }));
+        const reply = rejectMessage || "I couldn't save that note.";
+        appendMessage(sessionId, { role: "assistant", content: reply });
+        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+        return;
+      }
+
+      const result = saveNoteCardFromPayload({
+        payload,
+        explicitness: 1,
+        userId,
+        sessionId,
+        run: null,
+        reason: "user_reply",
+        topicHint
+      });
+
+      if (result.saved) {
+        ws.send(JSON.stringify({
+          type: "note_saved",
+          note: { topic: result.card.topic, score: Number(result.score ?? 0) }
+        }));
+        if (updateLastEpisode({ note_saved: true })) {
+          ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
+        }
+      } else {
+        ws.send(JSON.stringify({ type: "note_rejected", reason: result.error || "unknown" }));
+        const reply = "I couldn't save that note.";
+        appendMessage(sessionId, { role: "assistant", content: reply });
+        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      }
+      return;
+    }
 
     const directNote = extractDirectNoteCommand(content);
     if (directNote) {
@@ -1019,7 +1168,7 @@ wss.on("connection", (ws, req) => {
     const flushCardUsage = () => {
       if (cardsUsageLogged) return;
       if (touchedCardIds.size) {
-        emitEventLog(ws, "cards_used", { count: touchedCardIds.size });
+        emitEventLog(ws, `cards_used:${touchedCardIds.size}`, { count: touchedCardIds.size });
       }
       cardsUsageLogged = true;
     };
@@ -1211,6 +1360,12 @@ async function executeTool(ws, meta, call_id="auto") {
       // Learning: fetch ledger
       recordFetch({ userId: meta.userId, sessionId: meta.sessionId, url: result.url, title: result.title, chars: result.chars, latency_ms: result.latency_ms });
       ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
+
+      rememberLastSummary(meta.sessionId, {
+        url: result.url,
+        title: result.title,
+        topic: meta.topic || bucketTopic(meta.requestText || result.title || "")
+      });
 
       await callModelWithGetResult(ws, meta, run);
     } else if (meta.spec.tool === "web_search") {
