@@ -54,6 +54,47 @@ const sessionTopicState = new Map();
 const sessionTopicSeenHosts = new Map();
 const sessionLastSummary = new Map();
 
+function topicToSearchPhrase(topic) {
+  const raw = String(topic || "").trim();
+  if (!raw) return "";
+  const colon = raw.indexOf(":");
+  const body = colon >= 0 ? raw.slice(colon + 1) : raw;
+  const cleaned = body.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  return cleaned.split("/").map(part => part.trim()).filter(Boolean).join(" ");
+}
+
+function getStoredListContext(sessionId) {
+  if (!sessionId) return null;
+  const stored = sessionSearch.get(sessionId);
+  if (!stored) return null;
+  const normalizedQuery = stored.normalizedQuery || topicToSearchPhrase(stored.topic) || "";
+  const fallbackQuery = String(stored.query || "").trim();
+  return {
+    ...stored,
+    normalizedQuery,
+    fallbackQuery,
+    queryForReuse: normalizedQuery || fallbackQuery
+  };
+}
+
+function sendGapPrompt(ws, { userId, sessionId, prompt, q, why }) {
+  const question = (prompt || "Can you clarify?").trim();
+  if (!question) return;
+  const gap = {
+    q: q || question,
+    why: why || "clarification_needed",
+    next_probe: { tool: "ask_user", args: { prompt: question } },
+    est_cost: "~0t",
+    ig: 0.0
+  };
+  const gap_id = `gap_${Date.now()}`;
+  appendGap(userId, { gap_id, ...gap });
+  ws.send(JSON.stringify({ type: "gap", gap: { ...gap, gap_id, status: "open" } }));
+  appendMessage(sessionId, { role: "assistant", content: question });
+  ws.send(JSON.stringify({ type: "assistant_message", content: question }));
+}
+
 function emitEventLog(ws, label, payload) {
   if (!ws || !label) return;
   let data;
@@ -969,21 +1010,24 @@ function detectListIntent(text) {
       if (aboutMatch) remainder = aboutMatch[1].trim();
     }
     remainder = remainder.replace(/^(about|on|regarding)\s+/i, "").trim();
-    const query = remainder || raw.replace(LIST_INTENT_REGEX, "").trim();
-    return { query: query || trimmed };
+    const hasTopic = remainder.length > 0;
+    const fallback = raw.replace(LIST_INTENT_REGEX, "").trim();
+    const fallbackValid = fallback && fallback !== trimmed ? fallback : "";
+    const query = hasTopic ? remainder : fallbackValid;
+    return { query, topicless: !hasTopic };
   }
 
   const aboutFallback = trimmed.match(LIST_ABOUT_FALLBACK_REGEX);
   if (aboutFallback) {
     const query = (aboutFallback[2] || "").trim();
-    return { query: query || trimmed };
+    return { query: query || trimmed, topicless: false };
   }
 
   const latestOn = trimmed.match(LATEST_ON_REGEX);
   if (latestOn) {
     let remainder = (latestOn[1] || "").trim();
     remainder = remainder.replace(/[?!.]+$/g, "").trim();
-    return { query: remainder || trimmed };
+    return { query: remainder || trimmed, topicless: false };
   }
 
   return null;
@@ -1054,7 +1098,15 @@ wss.on("connection", (ws, req) => {
           payload = { topic: topicFinal, summary, source };
           topicHint = topicFinal;
         } else {
-          rejectMessage = "I don't have a recent page to attach. Please open a link first or include the URL.";
+          ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_source_url" }));
+          sendGapPrompt(ws, {
+            userId,
+            sessionId,
+            prompt: "Can you share the link you want me to cite?",
+            q: "Need a source URL for the note",
+            why: "User asked to save a note without an available link"
+          });
+          return;
         }
       }
 
@@ -1291,8 +1343,37 @@ wss.on("connection", (ws, req) => {
     // Search intents
     const listIntent = detectListIntent(content);
     if (listIntent) {
-      const topic = bucketTopic(content);
-      const base = listIntent.query || content;
+      const storedList = getStoredListContext(sessionId);
+      let base = String(listIntent.query || "").trim();
+      let topic = null;
+
+      if (listIntent.topicless) {
+        const reuse = storedList?.queryForReuse ? storedList.queryForReuse.trim() : "";
+        if (reuse) {
+          base = reuse;
+          topic = storedList?.topic || bucketTopic(base);
+        } else {
+          flushCardUsage();
+          sendGapPrompt(ws, {
+            userId,
+            sessionId,
+            prompt: "What topic do you want?",
+            q: "Need topic for list request",
+            why: "User asked for more sources without a topic"
+          });
+          return;
+        }
+      }
+
+      if (!base) {
+        base = content.trim() || content;
+      }
+
+      if (!topic) {
+        const topicSource = listIntent.topicless && storedList?.topic ? storedList.topic : null;
+        topic = topicSource || bucketTopic(base || content);
+      }
+
       const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
       const runNumber = touchTopicRun(sessionId, topic);
       const args = { q: base, qlist: qlist.slice(), k: 5 };
@@ -1544,9 +1625,15 @@ async function executeTool(ws, meta, call_id="auto") {
 
       if (selected.length) {
         updateSeenHosts(meta.sessionId, topic, selectedHosts.filter(Boolean));
+        const baseQuery = typeof meta.spec.args.q === "string" ? meta.spec.args.q : "";
+        const storedQlist = Array.isArray(meta.spec.args.qlist) ? meta.spec.args.qlist.filter(Boolean) : [];
+        const normalizedQuery = topicToSearchPhrase(topic);
         sessionSearch.set(meta.sessionId, {
           topic,
           runId: run?.id || null,
+          query: baseQuery,
+          qlist: storedQlist,
+          normalizedQuery,
           list: selected.map(r => ({ title: r.title || "", url: r.url, host: r.domain || null })),
           ts: Date.now()
         });
@@ -1655,9 +1742,23 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     const fallbackText = lastUser?.content ? String(lastUser.content) : "";
     if (!fallbackText) return false;
     const listIntent = detectListIntent(fallbackText);
-    const base = (listIntent?.query || fallbackText).trim();
+    const storedList = getStoredListContext(sessionId);
+    let base = String(listIntent?.query || "").trim();
+    let topic = null;
+    if (listIntent?.topicless) {
+      const reuse = storedList?.queryForReuse ? storedList.queryForReuse.trim() : "";
+      if (!reuse) return false;
+      base = reuse;
+      topic = storedList?.topic || bucketTopic(base);
+    }
+    if (!base) {
+      base = fallbackText.trim();
+    }
     if (!base) return false;
-    const topic = bucketTopic(fallbackText);
+    if (!topic) {
+      const topicSource = listIntent?.topicless && storedList?.topic ? storedList.topic : null;
+      topic = topicSource || bucketTopic(base || fallbackText);
+    }
     const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
     const runNumber = touchTopicRun(sessionId, topic);
     const args = { q: base, qlist: qlist.slice(), k: 5 };
