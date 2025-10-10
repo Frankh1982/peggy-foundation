@@ -27,14 +27,63 @@ function writeJSONSafe(file, obj) {
 }
 
 export function bucketTopic(text) {
-  const s = String(text||"").toLowerCase();
-  // crude topic bucketing: prefix by "news:" if query has news-ish verbs
-  const isNews = /(remove|pulled|taken down|ban|announce|launch|recall|sues|acquire|merger|investigation|policy)/i.test(text||"");
-  // strip URLs and punctuation
-  const t = s.replace(/https?:\/\/\S+/g," ").replace(/[^a-z0-9\s/]+/g," ").replace(/\s+/g," ").trim();
-  const words = t.split(" ").filter(w=>w.length>2).slice(0,6);
-  const slug = words.join("/");
-  return (isNews? "news:" : "topic:") + (slug || "misc");
+  const raw = String(text || "");
+  const isNews = /(remove|pulled|taken down|ban|announce|launch|recall|sues|acquire|merger|investigation|policy)/i.test(raw);
+
+  let normalized = raw.toLowerCase();
+  normalized = normalized.replace(/https?:\/\/\S+/g, " ");
+
+  const synonymReplacements = [
+    { pattern: /\badvanced[\s-]*micro[\s-]*devices\b/g, value: "amd" },
+    { pattern: /\bopen[\s-]*ai\b/g, value: "openai" }
+  ];
+  for (const { pattern, value } of synonymReplacements) {
+    normalized = normalized.replace(pattern, ` ${value} `);
+  }
+
+  normalized = normalized.replace(/[^a-z0-9\s]+/g, " ").replace(/\s+/g, " ").trim();
+
+  const stopwords = new Set(["find", "more", "sites", "sources", "articles", "websites", "about", "the", "a", "an", "and", "or", "news"]);
+  const synonymMap = new Map([
+    ["openai", "openai"],
+    ["deal", "deal"],
+    ["deals", "deal"],
+    ["agreement", "deal"],
+    ["agreements", "deal"],
+    ["partnership", "deal"],
+    ["partnerships", "deal"],
+    ["amd", "amd"]
+  ]);
+
+  const tokens = normalized.split(" ").filter(Boolean);
+  const counts = new Map();
+  const firstIndex = new Map();
+
+  tokens.forEach((token, idx) => {
+    if (!token) return;
+    if (stopwords.has(token)) return;
+    const mapped = synonymMap.get(token) || token;
+    if (!counts.has(mapped)) {
+      counts.set(mapped, 0);
+      firstIndex.set(mapped, idx);
+    }
+    counts.set(mapped, counts.get(mapped) + 1);
+  });
+
+  const uniques = Array.from(counts.keys()).sort((a, b) => {
+    const countDiff = (counts.get(b) || 0) - (counts.get(a) || 0);
+    if (countDiff !== 0) return countDiff;
+    const indexDiff = (firstIndex.get(a) || 0) - (firstIndex.get(b) || 0);
+    if (indexDiff !== 0) return indexDiff;
+    return a.localeCompare(b);
+  });
+
+  const take = Math.min(4, uniques.length);
+  const selected = uniques.slice(0, take);
+  if (!selected.length) selected.push("misc");
+
+  const prefix = isNews ? "news:" : "topic:";
+  return prefix + selected.join("/");
 }
 
 // ---- Ledgers
