@@ -797,7 +797,9 @@ function hasRecentServerList(sessionId, windowMs = 2500) {
 }
 
 async function handleAssistantResponse(ws, { completion, usage, userId, sessionId }) {
-  const { cleanText, memo, gap, evidence, kdn, call, note } = extractArtifactsTolerant(completion);
+  const artifacts = extractArtifactsTolerant(completion);
+  let cleanText = artifacts.cleanText;
+  const { memo, gap, evidence, kdn, call, note } = artifacts;
   if (usage) {
     ws.send(JSON.stringify({ type:"telemetry", usage }));
     if (usage.total_tokens && updateLastEpisode({ tokens_total: usage.total_tokens })) {
@@ -805,28 +807,38 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     }
   }
 
-  const wantsServerList = /here are\s+5\s+sources\b/i.test(cleanText || "");
-  if (wantsServerList && !hasRecentServerList(sessionId)) {
+  const triggerServerListFallback = async () => {
     const recentMessages = getRecentMessages(sessionId, 6) || [];
     const lastUser = [...recentMessages].reverse().find(msg => msg?.role === "user");
     const fallbackText = lastUser?.content ? String(lastUser.content) : "";
-    if (fallbackText) {
-      const listIntent = detectListIntent(fallbackText);
-      const base = (listIntent?.query || fallbackText).trim();
-      if (base) {
-        const topic = bucketTopic(fallbackText);
-        const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
-        const runNumber = touchTopicRun(sessionId, topic);
-        const args = { q: base, qlist: qlist.slice(), k: 5 };
-        const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
-        if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
-          args.qlist = rotateList(args.qlist, runNumber - 1);
-        }
-        const spec = { tool: "web_search", args };
-        await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber });
-        return;
-      }
+    if (!fallbackText) return false;
+    const listIntent = detectListIntent(fallbackText);
+    const base = (listIntent?.query || fallbackText).trim();
+    if (!base) return false;
+    const topic = bucketTopic(fallbackText);
+    const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
+    const runNumber = touchTopicRun(sessionId, topic);
+    const args = { q: base, qlist: qlist.slice(), k: 5 };
+    const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+    if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+      args.qlist = rotateList(args.qlist, runNumber - 1);
     }
+    const spec = { tool: "web_search", args };
+    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber });
+    return true;
+  };
+
+  const listHeaderRegex = /^\s*here\s+are\s+\d+\s+(?:sources?|links?|results?)\b/i;
+  const looksLikeListHeader = listHeaderRegex.test(cleanText || "");
+  if (looksLikeListHeader && !hasRecentServerList(sessionId, 2000)) {
+    emitEventLog(ws, "list_model_blocked", true);
+    if (await triggerServerListFallback()) return;
+    cleanText = "";
+  }
+
+  const wantsServerList = /here are\s+5\s+sources\b/i.test(cleanText || "");
+  if (wantsServerList && !hasRecentServerList(sessionId)) {
+    if (await triggerServerListFallback()) return;
   }
 
   if (kdn) {
