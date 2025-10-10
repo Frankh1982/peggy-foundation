@@ -5,10 +5,10 @@ import http from "http";
 import express from "express";
 import { WebSocketServer } from "ws";
 import { buildSystemPrompt } from "./prompt.js";
-import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap, appendNote } from "./memory.js";
+import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch } from "./cards.js";
+import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -32,6 +32,10 @@ const cardsDirPath = path.resolve("data", "cards");
 const indexDirPath = path.resolve("data", "index");
 fs.mkdirSync(cardsDirPath, { recursive: true });
 fs.mkdirSync(indexDirPath, { recursive: true });
+const cardWriteLogFile = path.join(cardsDirPath, "CardWriteLog.jsonl");
+if (!fs.existsSync(cardWriteLogFile)) {
+  fs.writeFileSync(cardWriteLogFile, "");
+}
 
 migrateLegacyCardData();
 
@@ -188,6 +192,22 @@ function persistCard(card) {
   if (!id) return null;
   updateIndex({ ...card, id });
   return id;
+}
+
+function logCardWrite(entry) {
+  if (!entry || typeof entry !== "object") return;
+  const record = {
+    ts: Number(entry.ts) || Date.now(),
+    type: entry.type || "unknown",
+    topic: entry.topic || "",
+    score: Number.isFinite(entry.score) ? entry.score : 0,
+    reason: entry.reason || ""
+  };
+  try {
+    fs.appendFileSync(cardWriteLogFile, JSON.stringify(record) + "\n");
+  } catch (err) {
+    console.warn("CardWriteLog append failed", err);
+  }
 }
 
 function formatCardOneLiner(card) {
@@ -534,6 +554,166 @@ function recencyFromAge(ageMs) {
   return RECENCY_FALLBACK;
 }
 
+function computeFrequencyScore(touches) {
+  const count = Number(touches);
+  if (!Number.isFinite(count) || count <= 0) return 0;
+  const normalized = count / 5;
+  if (normalized >= 1) return 1;
+  if (normalized <= 0) return 0;
+  return normalized;
+}
+
+function parseJsonish(text) {
+  if (typeof text !== "string") return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function extractDirectNoteCommand(text) {
+  if (!text) return null;
+  const raw = String(text);
+  const tagMatch = raw.match(/\[\[NOTE\]\]\s*({[\s\S]*})/i);
+  if (tagMatch) {
+    const payload = parseJsonish(tagMatch[1]);
+    if (payload && typeof payload === "object") {
+      return { payload, explicitness: 1, reason: "user_note_tag" };
+    }
+  }
+  const saveMatch = raw.match(/\bsave\s+note\b/i);
+  if (saveMatch) {
+    const braceStart = raw.indexOf("{", saveMatch.index);
+    const braceEnd = raw.lastIndexOf("}");
+    if (braceStart !== -1 && braceEnd > braceStart) {
+      const payload = parseJsonish(raw.slice(braceStart, braceEnd + 1));
+      if (payload && typeof payload === "object") {
+        return { payload, explicitness: 1, reason: "user_save_note" };
+      }
+    }
+  }
+  return null;
+}
+
+function sanitizeNoteSource(source) {
+  if (!source || typeof source !== "object") return null;
+  const url = String(source.url || source.href || "").trim();
+  if (!url) return null;
+  const sanitized = { url };
+  if (source.title) {
+    const title = String(source.title).replace(/[\r\n]+/g, " ").trim();
+    if (title) sanitized.title = title.slice(0, 200);
+  }
+  const ts = Number(source.ts ?? source.timestamp ?? source.accessed_at);
+  if (Number.isFinite(ts)) sanitized.ts = ts;
+  if (source.note_id) sanitized.note_id = String(source.note_id);
+  return sanitized;
+}
+
+function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run, reason, topicHint }) {
+  if (!payload || typeof payload !== "object") {
+    return { saved: false, error: "invalid_payload" };
+  }
+
+  const now = Date.now();
+  const rawTopic = typeof payload.topic === "string" && payload.topic.trim().length ? payload.topic : "";
+  const rawSummary = typeof payload.summary === "string" ? payload.summary : "";
+  const fallbackTopic = typeof topicHint === "string" ? topicHint : "";
+  let topic = rawTopic.trim();
+  if (!topic && fallbackTopic) topic = fallbackTopic.trim();
+  const summaryClean = rawSummary.replace(/[\r\n]+/g, " ").trim();
+  if (!topic && !summaryClean) {
+    return { saved: false, error: "missing_content" };
+  }
+  const finalTopic = (topic || summaryClean).slice(0, 200);
+  const trimmedSummary = (summaryClean || finalTopic).slice(0, 400);
+  if (!trimmedSummary) {
+    return { saved: false, error: "missing_summary" };
+  }
+
+  const sanitizedSource = sanitizeNoteSource(payload.source || payload);
+  if (!sanitizedSource) {
+    return { saved: false, error: "missing_source_url" };
+  }
+
+  let ttlDays = payload.ttl_days;
+  if (ttlDays !== undefined && ttlDays !== null) {
+    const ttlNum = Number(ttlDays);
+    ttlDays = Number.isFinite(ttlNum) && ttlNum > 0 ? ttlNum : 30;
+  } else {
+    ttlDays = 30;
+  }
+
+  const tsCandidate = Number(payload.ts ?? payload.timestamp ?? run?.ts);
+  const ageMs = Number.isFinite(tsCandidate) ? Math.max(0, Date.now() - tsCandidate) : null;
+  const recency = ageMs === null ? 1 : recencyFromAge(ageMs);
+
+  const topicKey = normalizeTopic(finalTopic);
+  let touches = 0;
+  if (topicKey) {
+    const state = getTopicState(sessionId, topicKey);
+    touches = Number(state?.runCount || 0);
+  }
+  const frequency = computeFrequencyScore(touches);
+
+  const docChars = Number(run?.result_summary?.chars ?? payload.source?.chars ?? 0);
+  const summaryChars = trimmedSummary.length;
+  let taskGain = 0;
+  if (docChars > 0 && summaryChars > 0) {
+    const reduction = Math.max(0, 1 - Math.min(1, summaryChars / docChars));
+    taskGain = docChars >= 800 ? Math.max(reduction, 0.8) : reduction;
+  }
+
+  const metrics = { explicitness: Number(explicitness) || 0, recency, frequency, taskGain };
+  const score = scoreImportance(metrics);
+
+  const entitiesRaw = Array.isArray(payload.entities) ? payload.entities : [];
+  const entities = entitiesRaw
+    .map(value => String(value || "").trim())
+    .filter(Boolean)
+    .slice(0, 6);
+
+  const card = {
+    type: "note",
+    topic: finalTopic,
+    summary: trimmedSummary,
+    value: {
+      source: sanitizedSource,
+      data: {
+        ...payload,
+        topic: finalTopic,
+        summary: trimmedSummary
+      },
+      metadata: {
+        saved_by: (Number(explicitness) || 0) >= 1 ? "user" : "model",
+        reason: reason || "",
+        run_id: run?.id || null,
+        metrics,
+        saved_at: now
+      }
+    },
+    tags: ["note"],
+    entities,
+    confidence: (Number(explicitness) || 0) >= 1 ? 0.7 : 0.6,
+    created_at: now,
+    last_used: now,
+    ttl_days: ttlDays
+  };
+
+  if (!shouldSave(card, metrics)) {
+    return { saved: false, error: "score_low", score, metrics };
+  }
+
+  const id = persistCard(card);
+  if (!id) {
+    return { saved: false, error: "persist_failed", score, metrics };
+  }
+
+  logCardWrite({ ts: now, type: card.type, topic: card.topic, score, reason: reason || "" });
+  return { saved: true, card: { ...card, id }, score, metrics };
+}
+
 function formatScore(score) {
   if (!Number.isFinite(score)) return "0.60";
   const clamped = Math.max(0, Math.min(1, score));
@@ -593,6 +773,35 @@ wss.on("connection", (ws, req) => {
     const sessionId = msg.session_id || "default";
     const content = (msg.content || "").toString().slice(0, 8000);
     const inReplyToGap = msg.in_reply_to_gap || null;
+
+    const directNote = extractDirectNoteCommand(content);
+    if (directNote) {
+      appendMessage(sessionId, { role: "user", content });
+      const result = saveNoteCardFromPayload({
+        payload: directNote.payload,
+        explicitness: directNote.explicitness,
+        userId,
+        sessionId,
+        run: null,
+        reason: directNote.reason,
+        topicHint: directNote.payload?.topic || content
+      });
+      if (result.saved) {
+        ws.send(JSON.stringify({
+          type: "note_saved",
+          note: { topic: result.card.topic, score: Number(result.score ?? 0) }
+        }));
+        if (updateLastEpisode({ note_saved: true })) {
+          ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
+        }
+      } else {
+        ws.send(JSON.stringify({
+          type: "note_rejected",
+          reason: result.error || "unknown"
+        }));
+      }
+      return;
+    }
 
     const topic = normalizeTopic(content);
     let cards = topic ? getTopByTopic(topic, { limit: 3 }) : [];
@@ -1075,7 +1284,7 @@ async function callModelWithGetResult(ws, meta, run) {
 
   const { content: completion, usage } = await callOpenAI(messages);
   const forced = enforceSummaryCompletionFormat(completion, run);
-  await handleAssistantResponse(ws, { completion: forced, usage, userId, sessionId });
+  await handleAssistantResponse(ws, { completion: forced, usage, userId, sessionId, origin: "web_get_summary", run, meta });
 }
 
 async function callModelWithSearchResults(ws, meta, run) {
@@ -1094,7 +1303,7 @@ async function callModelWithSearchResults(ws, meta, run) {
   ];
 
   const { content: completion, usage } = await callOpenAI(messages);
-  await handleAssistantResponse(ws, { completion, usage, userId, sessionId });
+  await handleAssistantResponse(ws, { completion, usage, userId, sessionId, meta });
 }
 
 function hasRecentServerList(sessionId, windowMs = 2500) {
@@ -1103,7 +1312,7 @@ function hasRecentServerList(sessionId, windowMs = 2500) {
   return (Date.now() - stored.ts) <= windowMs;
 }
 
-async function handleAssistantResponse(ws, { completion, usage, userId, sessionId }) {
+async function handleAssistantResponse(ws, { completion, usage, userId, sessionId, origin = null, run = null, meta = null }) {
   const artifacts = extractArtifactsTolerant(completion);
   let cleanText = artifacts.cleanText;
   const { memo, gap, evidence, kdn, call, note } = artifacts;
@@ -1177,22 +1386,33 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     }
   }
 
-  if (note) {
-    try {
-      const n = JSON.parse(note);
-      if (typeof n.topic === "string" && typeof n.summary === "string") {
-        const saved = appendNote(userId, {
-          note_id: "note_" + Date.now(),
-          topic: n.topic.slice(0,120),
-          summary: n.summary.slice(0,600),
-          source: n.source || null
-        });
-        ws.send(JSON.stringify({ type:"note_saved", note: { topic: saved.topic } }));
+  if (note && origin === "web_get_summary") {
+    let parsedNote = null;
+    try { parsedNote = JSON.parse(note); } catch {}
+    if (parsedNote && typeof parsedNote === "object") {
+      const result = saveNoteCardFromPayload({
+        payload: parsedNote,
+        explicitness: 0.6,
+        userId,
+        sessionId,
+        run,
+        reason: "web_get_note",
+        topicHint: parsedNote.topic || meta?.topic || run?.result_summary?.title || ""
+      });
+      if (result.saved) {
+        ws.send(JSON.stringify({
+          type: "note_saved",
+          note: { topic: result.card.topic, score: Number(result.score ?? 0) }
+        }));
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
         }
+      } else if (result.error === "missing_source_url") {
+        ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_source_url" }));
       }
-    } catch {}
+    } else {
+      ws.send(JSON.stringify({ type: "note_rejected", reason: "invalid_note_payload" }));
+    }
   }
 }
 
