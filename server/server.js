@@ -132,19 +132,34 @@ function shouldExcludeDomain(domain, url, requestText) {
     || /\bfrom\s+reddit\b/i.test(text)
     || /\breddit\s+(?:threads?|posts?|sources?|links?)\b/i.test(text)
     || /\br\/[a-z0-9_]+/i.test(text);
+  const wantsQuora = /\binclude\s+quora\b/i.test(text)
+    || /\bfrom\s+quora\b/i.test(text)
+    || /\bquora\s+(?:answers?|posts?|sources?|links?)\b/i.test(text)
+    || /\bquora\.com\//i.test(text);
+  const wantsMedium = /\binclude\s+medium(?:\.com)?\b/i.test(text)
+    || /\bfrom\s+medium(?:\.com)?\b/i.test(text)
+    || /\bmedium(?:\.com)?\s+(?:articles?|posts?|sources?|links?)\b/i.test(text)
+    || /\bmedium\.com\/@/i.test(text);
   for (const pattern of DOMAIN_PREFS.exclude || []) {
     if (!pattern) continue;
-    const isRedditPattern = pattern.includes("reddit");
+    const normalizedPattern = pattern.toLowerCase();
+    const isRedditPattern = normalizedPattern.includes("reddit");
+    const isQuoraPattern = normalizedPattern.includes("quora");
+    const isMediumPattern = normalizedPattern.includes("medium.com/@");
     if (pattern.includes("/")) {
       if (!urlLower) continue;
       if (urlLower.includes(pattern)) {
         if (isRedditPattern && wantsReddit) continue;
+        if (isQuoraPattern && wantsQuora) continue;
+        if (isMediumPattern && wantsMedium) continue;
         return true;
       }
       continue;
     }
     if (domainMatches(domain, pattern)) {
       if (isRedditPattern && wantsReddit) continue;
+      if (isQuoraPattern && wantsQuora) continue;
+      if (isMediumPattern && wantsMedium) continue;
       return true;
     }
   }
