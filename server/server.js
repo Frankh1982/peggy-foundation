@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap, appendNote } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { normalizeTopic, writeCard, updateIndex, readAllCards } from "./cards.js";
+import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -188,6 +188,60 @@ function persistCard(card) {
   if (!id) return null;
   updateIndex({ ...card, id });
   return id;
+}
+
+function formatCardOneLiner(card) {
+  if (!card) return "";
+  let summary = "";
+  if (typeof card.summary === "string" && card.summary.trim()) {
+    summary = card.summary;
+  } else if (card.value !== undefined && card.value !== null) {
+    if (typeof card.value === "string") {
+      summary = card.value;
+    } else {
+      try {
+        summary = JSON.stringify(card.value);
+      } catch {
+        summary = String(card.value);
+      }
+    }
+  }
+  summary = String(summary || "").replace(/\s+/g, " ").trim();
+  if (!summary) summary = "[no summary]";
+  if (summary.length > 160) summary = `${summary.slice(0, 157)}…`;
+  return summary;
+}
+
+function buildCardContextBlock(cards, fallbackTopic) {
+  if (!Array.isArray(cards) || !cards.length) {
+    return { block: "", included: [] };
+  }
+  let block = "[CARD_CONTEXT]";
+  const included = [];
+  for (const card of cards) {
+    if (!card || !card.id) continue;
+    const summary = formatCardOneLiner(card);
+    const topicLabel = normalizeTopic(card.topic || "") || fallbackTopic || "";
+    const typeLabel = (card.type || "card").trim() || "card";
+    const line = `\n- (${typeLabel}=${card.id}) topic=${topicLabel} :: ${summary}`;
+    const candidate = `${block}${line}\n[/CARD_CONTEXT]`;
+    if (candidate.length > 400) break;
+    block += line;
+    included.push(card);
+  }
+  if (!included.length) return { block: "", included: [] };
+  block += "\n[/CARD_CONTEXT]";
+  return { block, included };
+}
+
+function extractPrefKey(text) {
+  if (!text) return null;
+  const match = String(text).match(/(favorite\s+[a-z0-9][a-z0-9\s-]{0,60}?)(?:[\?!.]|$)/i);
+  if (!match) return null;
+  const raw = match[1].trim();
+  if (!raw) return null;
+  const normalized = raw.toLowerCase();
+  return { raw, normalized };
 }
 
 function buildNoteFingerprint(note) {
@@ -540,6 +594,56 @@ wss.on("connection", (ws, req) => {
     const content = (msg.content || "").toString().slice(0, 8000);
     const inReplyToGap = msg.in_reply_to_gap || null;
 
+    const topic = normalizeTopic(content);
+    let cards = topic ? getTopByTopic(topic, { limit: 3 }) : [];
+    const cardsById = new Map();
+    for (const card of cards) {
+      if (card && card.id) {
+        cardsById.set(card.id, card);
+      }
+    }
+    const wantsNameAnswer = /\bwhat(?:'|’)?s my name\b/i.test(content) || /\bwho am i\b/i.test(content);
+    const prefKeyInfo = extractPrefKey(content);
+    const profileTopicNormalized = normalizeTopic(`profile:${userId}`);
+    const touchedCardIds = new Set();
+    let cardsUsageLogged = false;
+    const touchCardOnce = (card) => {
+      if (!card || !card.id) return;
+      if (touchedCardIds.has(card.id)) return;
+      touch(card.id);
+      touchedCardIds.add(card.id);
+    };
+    const tryAddCardsFromTopic = (topicKey) => {
+      if (!topicKey || cards.length >= 3) return;
+      if (topicKey === topic) return;
+      const extras = getTopByTopic(topicKey, { limit: 3 });
+      for (const extra of extras) {
+        if (!extra || !extra.id || cardsById.has(extra.id)) continue;
+        cards.push(extra);
+        cardsById.set(extra.id, extra);
+        if (cards.length >= 3) break;
+      }
+    };
+    if (cards.length < 3 && wantsNameAnswer) {
+      tryAddCardsFromTopic(profileTopicNormalized);
+    }
+    if (cards.length < 3 && prefKeyInfo?.normalized) {
+      const prefTopicNormalized = normalizeTopic(`pref:${prefKeyInfo.normalized}`);
+      tryAddCardsFromTopic(prefTopicNormalized);
+    }
+
+    const { block: cardContextBlock, included: contextCards } = buildCardContextBlock(cards, topic);
+    for (const card of contextCards) {
+      touchCardOnce(card);
+    }
+    const flushCardUsage = () => {
+      if (cardsUsageLogged) return;
+      if (touchedCardIds.size) {
+        emitEventLog(ws, "cards_used", { count: touchedCardIds.size });
+      }
+      cardsUsageLogged = true;
+    };
+
     appendMessage(sessionId, { role: "user", content });
 
     if (isGreeting(content) && !inReplyToGap) {
@@ -547,6 +651,55 @@ wss.on("connection", (ws, req) => {
       appendMessage(sessionId, { role:"assistant", content: reply });
       ws.send(JSON.stringify({ type:"assistant_message", content: reply }));
       ws.send(JSON.stringify({ type:"kdn", kdn: { state:"DK", reason:"greeting/ambiguous", ambiguous:true } }));
+      flushCardUsage();
+      return;
+    }
+
+    let fastPathReply = "";
+    let fastPathUsedCard = null;
+
+    if (!inReplyToGap && wantsNameAnswer) {
+      const profileCard = cards.find(card => card?.type === "profile");
+      const profileName = profileCard?.value?.profile?.name || profileCard?.value?.name;
+      if (profileCard && profileName) {
+        fastPathReply = `Your name is ${profileName}.`;
+        fastPathUsedCard = profileCard;
+      }
+    }
+
+    if (!fastPathReply && !inReplyToGap && prefKeyInfo) {
+      const targetTopic = normalizeTopic(`pref:${prefKeyInfo.normalized}`);
+      const prefCard = cards.find(card => {
+        if (!card || card.type !== "pref") return false;
+        const cardKey = String(card.value?.key || "").toLowerCase();
+        if (cardKey && cardKey === prefKeyInfo.normalized) return true;
+        const cardTopic = normalizeTopic(card.topic || "");
+        return cardTopic && targetTopic && cardTopic === targetTopic;
+      });
+      if (prefCard) {
+        let prefValue = "";
+        const rawValue = prefCard.value?.value ?? prefCard.value?.pref ?? prefCard.value?.answer;
+        if (typeof rawValue === "string") {
+          prefValue = rawValue.trim();
+        } else if (rawValue !== undefined && rawValue !== null) {
+          prefValue = JSON.stringify(rawValue);
+        } else if (typeof prefCard.summary === "string") {
+          const summaryMatch = prefCard.summary.match(/:\s*(.+)$/);
+          if (summaryMatch) prefValue = summaryMatch[1].trim();
+        }
+        if (prefValue) {
+          const prefLabel = prefKeyInfo.raw.replace(/\s+/g, " ").trim();
+          fastPathReply = `Your ${prefLabel} is ${prefValue}.`;
+          fastPathUsedCard = prefCard;
+        }
+      }
+    }
+
+    if (fastPathReply) {
+      if (fastPathUsedCard) touchCardOnce(fastPathUsedCard);
+      appendMessage(sessionId, { role:"assistant", content: fastPathReply });
+      ws.send(JSON.stringify({ type:"assistant_message", content: fastPathReply }));
+      flushCardUsage();
       return;
     }
 
@@ -555,6 +708,7 @@ wss.on("connection", (ws, req) => {
       const urlMatch = content.match(/https?:\/\/\S+/i);
       if (urlMatch) {
         const spec = { tool: "web_get", args: { url: urlMatch[0] } };
+        flushCardUsage();
         await executeTool(ws, { userId, sessionId, spec, requestText: content });
         return;
       }
@@ -573,6 +727,7 @@ wss.on("connection", (ws, req) => {
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
         ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+        flushCardUsage();
         return;
       }
 
@@ -582,6 +737,7 @@ wss.on("connection", (ws, req) => {
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
         ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+        flushCardUsage();
         return;
       }
 
@@ -591,12 +747,14 @@ wss.on("connection", (ws, req) => {
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
         ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+        flushCardUsage();
         return;
       }
 
       const target = items[idx - 1];
       emitEventLog(ws, "summarize_pick", { n: idx, ok: true, reason: "ok", host: target.host || null });
       const spec = { tool: "web_get", args: { url: target.url } };
+      flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic: stored.topic }, "auto");
       return;
     }
@@ -614,6 +772,7 @@ wss.on("connection", (ws, req) => {
         args.qlist = rotateList(args.qlist, runNumber - 1);
       }
       const spec = { tool: "web_search", args };
+      flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
       return;
     }
@@ -629,13 +788,17 @@ wss.on("connection", (ws, req) => {
         args.qlist = rotateList(args.qlist, runNumber - 1);
       }
       const spec = { tool: "web_search", args };
+      flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
       return;
     }
 
     // Default → model
     const profile = getUserProfile(userId);
-    const systemPrompt = buildSystemPrompt(profile);
+    let systemPrompt = buildSystemPrompt(profile);
+    if (cardContextBlock) {
+      systemPrompt = `${systemPrompt}\n\n${cardContextBlock}`;
+    }
     const recent = getTrimmedHistory(sessionId);
     const messages = [
       { role: "system", content: systemPrompt },
@@ -644,6 +807,7 @@ wss.on("connection", (ws, req) => {
     ];
 
     try {
+      flushCardUsage();
       const { content: completion, usage } = await callOpenAI(messages);
       await handleAssistantResponse(ws, { completion, usage, userId, sessionId });
     } catch (err) {
