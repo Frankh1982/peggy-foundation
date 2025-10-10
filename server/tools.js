@@ -25,22 +25,29 @@ export async function tool_web_search(args, env={}) {
   const qlist = Array.isArray(args?.qlist) ? args.qlist.filter(Boolean) : [];
   if (!q && !qlist.length) throw new Error("Empty query");
   const K = Math.min(Math.max(Number(args?.k || 5), 1), 8);
+  const offset = Math.max(0, Math.floor(Number(args?.offset) || 0));
 
   const queries = (qlist.length ? qlist : [q]).filter(Boolean);
   const braveKey = (env.BRAVE_API_KEY || process.env.BRAVE_API_KEY || "").trim();
   const seen = new Set();
   const out = [];
   const t0 = Date.now();
+  let skipped = 0;
 
   for (const query of queries) {
     let batch = [];
+    let remoteOffsetApplied = false;
     if (braveKey) {
       try {
         const u = new URL("https://api.search.brave.com/res/v1/web/search");
         u.searchParams.set("q", query);
         u.searchParams.set("count", String(K));
+        if (offset) {
+          u.searchParams.set("offset", String(offset));
+        }
         const res = await fetch(u, { headers: { "X-Subscription-Token": braveKey, "User-Agent": "Mozilla/5.0" } });
         if (res.ok) {
+          remoteOffsetApplied = offset > 0;
           const json = await res.json();
           batch = (json?.web?.results || []).map(r => ({
             title: r.title || "",
@@ -99,7 +106,12 @@ export async function tool_web_search(args, env={}) {
         }
       } catch {}
     }
+    const applyLocalOffset = offset > 0 && !remoteOffsetApplied;
     for (const r of batch) {
+      if (applyLocalOffset && skipped < offset) {
+        skipped++;
+        continue;
+      }
       const key = (r.title||"").toLowerCase().slice(0,140) + "||" + (r.url||"").split("#")[0];
       if (!seen.has(key)) {
         seen.add(key);

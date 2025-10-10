@@ -15,7 +15,7 @@
   .msg.user { background: rgba(90,169,230,.08); }
   .msg.assistant { background: rgba(255,255,255,.04); }
   .role { font-weight: 600; color: var(--muted); min-width: 84px; }
-  .content { white-space: pre-wrap; }
+  .content { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; }
   .row { display:flex; gap:10px; margin-top:12px; }
   textarea { flex:1; resize: vertical; min-height: 56px; padding: 12px; border-radius: 12px; border: 1px solid #2a2f36; background: #0f1216; color: var(--text); }
   button { padding: 0 18px; border-radius: 12px; border: 0; background: var(--accent); color: #0b0c10; font-weight: 700; cursor: pointer; }
@@ -52,9 +52,9 @@
         <div class="kv"><b>Server build</b><div id="build" class="monosmall">—</div></div>
         <div class="kv"><b>Call policy</b><div id="policy" class="monosmall">—</div></div>
         <div style="margin-top:8px;"><b>Learning (last 20)</b></div>
-        <pre id="learn" class="monosmall" style="white-space:pre-wrap;background:#0f1216;padding:8px;border-radius:8px;min-height:60px;">—</pre>
+        <pre id="learn" class="monosmall" style="white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;background:#0f1216;padding:8px;border-radius:8px;min-height:60px;">—</pre>
         <div style="margin-top:8px;"><b>Events</b></div>
-        <pre id="events" class="monosmall" style="white-space:pre-wrap;background:#0f1216;padding:8px;border-radius:8px;min-height:60px;">—</pre>
+        <pre id="events" class="monosmall" style="white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;background:#0f1216;padding:8px;border-radius:8px;min-height:60px;">—</pre>
       </div>
     </div>
   </div>
