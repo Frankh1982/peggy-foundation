@@ -21,9 +21,9 @@ const DEFAULT_SOURCE_PRIOR = 0.45;
 const SCORE_PRIOR_WEIGHT = 0.45;
 const SCORE_RECENCY_WEIGHT = 0.55;
 const RECENCY_FALLBACK = 0.6;
-const EXPLORATION_RATE = 0.15;
 const SOURCE_PRIORS = loadSourcePriors();
 const DOMAIN_PREFS = loadDomainPrefs();
+const SEEN_HOST_TTL = 15 * 60 * 1000;
 
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY in .env");
@@ -37,6 +37,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/chat" });
 const sessionSearch = new Map();
 const sessionTopicState = new Map();
+const sessionTopicSeenHosts = new Map();
 
 function emitEventLog(ws, label, payload) {
   if (!ws || !label) return;
@@ -177,27 +178,44 @@ function touchTopicRun(sessionId, topic) {
   return state.runCount;
 }
 
-function getSeenDomains(sessionId, topic) {
-  const state = getTopicState(sessionId, topic);
-  const seen = new Set();
-  for (const list of state.history || []) {
-    if (!Array.isArray(list)) continue;
-    for (const domain of list) {
-      if (domain) seen.add(domain);
-    }
+function getSeenHostState(sessionId, topic) {
+  const now = Date.now();
+  let sessionState = sessionTopicSeenHosts.get(sessionId);
+  if (!sessionState) {
+    sessionState = { topics: new Map(), lastTopic: topic };
+    sessionTopicSeenHosts.set(sessionId, sessionState);
   }
-  return seen;
+  if (sessionState.lastTopic !== topic) {
+    sessionState.lastTopic = topic;
+    sessionState.topics = new Map();
+  }
+  let state = sessionState.topics.get(topic);
+  if (!state || !Array.isArray(state.sets) || state.expiresAt <= now) {
+    state = { sets: [new Set(), new Set()], expiresAt: now + SEEN_HOST_TTL };
+    sessionState.topics.set(topic, state);
+  }
+  return state;
 }
 
-function rememberSeenDomains(sessionId, topic, domains = []) {
-  const state = getTopicState(sessionId, topic);
-  const normalized = Array.from(new Set(domains.filter(Boolean).map(d => d.toLowerCase())));
-  state.history = state.history || [];
-  state.history.push(normalized);
-  const maxHistory = 3;
-  if (state.history.length > maxHistory) {
-    state.history = state.history.slice(-maxHistory);
+function getSeenHostUnion(sessionId, topic) {
+  const state = getSeenHostState(sessionId, topic);
+  const union = new Set();
+  for (const bucket of state.sets || []) {
+    if (!(bucket instanceof Set)) continue;
+    for (const host of bucket) {
+      if (host) union.add(host);
+    }
   }
+  return { state, union };
+}
+
+function updateSeenHosts(sessionId, topic, hosts = []) {
+  const { state } = getSeenHostUnion(sessionId, topic);
+  const normalized = Array.from(new Set(hosts.filter(Boolean).map(h => h.toLowerCase())));
+  const fresh = new Set(normalized);
+  const tail = Array.isArray(state.sets) ? state.sets.filter(bucket => bucket instanceof Set && bucket.size > 0) : [];
+  state.sets = [fresh, ...(tail.slice(0, 1))];
+  state.expiresAt = Date.now() + SEEN_HOST_TTL;
 }
 
 function rotateList(list, shift) {
@@ -398,11 +416,7 @@ wss.on("connection", (ws, req) => {
       const runNumber = touchTopicRun(sessionId, topic);
       const args = { q: base, qlist: qlist.slice(), k: 5 };
       const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
-      if (hasBrave) {
-        if (runNumber > 1 && Math.random() < 0.5) {
-          args.offset = 5;
-        }
-      } else if (runNumber > 1 && args.qlist.length > 1) {
+      if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
         args.qlist = rotateList(args.qlist, runNumber - 1);
       }
       const spec = { tool: "web_search", args };
@@ -483,74 +497,148 @@ async function executeTool(ws, meta, call_id="auto") {
         return { ...entry, domain, prior, recency, score, idx };
       }).filter(entry => entry && entry.url && !shouldExcludeDomain(entry.domain, entry.url, meta.requestText));
 
-      const seenDomains = getSeenDomains(meta.sessionId, topic);
       const uniqueResults = [];
       const domainsInList = new Set();
       scoredResults.forEach(entry => {
-        const key = entry.domain ? entry.domain.toLowerCase() : null;
-        if (key && domainsInList.has(key)) return;
-        if (key) domainsInList.add(key);
+        const key = entry.domain ? entry.domain.toLowerCase() : `__idx_${entry.idx}`;
+        if (domainsInList.has(key)) return;
+        domainsInList.add(key);
         uniqueResults.push(entry);
       });
 
-      const selectedEntries = [];
-      const selectedIndexSet = new Set();
-      const buckets = [[], [], [], []];
-      uniqueResults.forEach((entry, index) => {
-        const seen = entry.domain ? seenDomains.has(entry.domain) : false;
-        const preferred = isPreferredDomain(entry.domain);
-        const bucketIndex = seen ? (preferred ? 2 : 3) : (preferred ? 0 : 1);
-        buckets[bucketIndex].push({ entry, index });
+      const hasBraveKey = Boolean((process.env.BRAVE_API_KEY || "").trim());
+      const { union: seenHostUnion } = getSeenHostUnion(meta.sessionId, topic);
+      const rankWeight = (entry) => {
+        let weight = 0;
+        if (isPreferredDomain(entry.domain)) weight += 2;
+        if (!entry.domain || !seenHostUnion.has(entry.domain)) weight += 1;
+        return weight;
+      };
+      const rankedResults = uniqueResults.slice().sort((a, b) => {
+        const wa = rankWeight(a);
+        const wb = rankWeight(b);
+        if (wa !== wb) return wb - wa;
+        const scoreA = Number.isFinite(a.score) ? a.score : 0;
+        const scoreB = Number.isFinite(b.score) ? b.score : 0;
+        if (scoreA !== scoreB) return scoreB - scoreA;
+        return a.idx - b.idx;
       });
 
-      for (const bucket of buckets) {
-        for (const candidate of bucket) {
-          if (selectedEntries.length >= 5) break;
-          selectedEntries.push(candidate);
-          selectedIndexSet.add(candidate.index);
-        }
-        if (selectedEntries.length >= 5) break;
+      const firstFour = [];
+      const usedHostKeys = new Set();
+      for (const entry of rankedResults) {
+        if (firstFour.length >= 4) break;
+        const key = entry.domain ? entry.domain.toLowerCase() : `__idx_${entry.idx}`;
+        if (usedHostKeys.has(key)) continue;
+        usedHostKeys.add(key);
+        firstFour.push(entry);
       }
 
-      if (selectedEntries.length < 5) {
-        for (let i = 0; i < uniqueResults.length && selectedEntries.length < 5; i++) {
-          if (selectedIndexSet.has(i)) continue;
-          const entry = uniqueResults[i];
-          selectedEntries.push({ entry, index: i });
-          selectedIndexSet.add(i);
-        }
+      const usedHosts = new Set(firstFour.map(item => item.domain).filter(Boolean));
+      let slotFiveEntry = null;
+      let exploreReason = "none";
+      for (const entry of rankedResults) {
+        if (!entry.domain) continue;
+        if (usedHosts.has(entry.domain)) continue;
+        if (seenHostUnion.has(entry.domain)) continue;
+        slotFiveEntry = entry;
+        exploreReason = "unseen";
+        break;
       }
 
-      if (selectedEntries.length && Math.random() < EXPLORATION_RATE) {
-        const usedDomains = new Set(selectedEntries.map(se => se.entry.domain).filter(Boolean));
-        const lastEntry = selectedEntries[selectedEntries.length - 1];
-        const lastScore = lastEntry?.entry?.score ?? Infinity;
-        const candidates = uniqueResults
-          .map((entry, idx) => ({ entry, index: idx }))
-          .filter(({ entry, index }) => {
-            if (selectedIndexSet.has(index)) return false;
-            if (entry.domain && usedDomains.has(entry.domain)) return false;
-            if (!Number.isFinite(entry.score)) return false;
-            if (!Number.isFinite(lastScore)) return true;
-            return entry.score < lastScore;
+      if (!slotFiveEntry && hasBraveKey) {
+        try {
+          const baseOffsetRaw = Number(meta.spec.args.offset ?? 0);
+          const baseOffset = Number.isFinite(baseOffsetRaw) ? baseOffsetRaw : 0;
+          const offsetArgs = { ...meta.spec.args, offset: baseOffset + 5 };
+          const offsetResult = await tool_web_search(offsetArgs, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
+          const offsetScored = (offsetResult?.results || []).map((entry, idx) => {
+            const domain = extractDomain(entry?.url || "");
+            const prior = getSourcePrior(domain);
+            const recency = computeRecencyScore(entry);
+            const score = SCORE_PRIOR_WEIGHT * prior + SCORE_RECENCY_WEIGHT * recency;
+            return { ...entry, domain, prior, recency, score, idx };
+          }).filter(entry => entry && entry.url && !shouldExcludeDomain(entry.domain, entry.url, meta.requestText));
+          const seenOffset = new Set();
+          const offsetUnique = [];
+          offsetScored.forEach(entry => {
+            const key = entry.domain ? entry.domain.toLowerCase() : `__idx_${entry.idx}`;
+            if (seenOffset.has(key)) return;
+            seenOffset.add(key);
+            offsetUnique.push(entry);
           });
-        if (candidates.length) {
-          const freshCandidates = candidates.filter(({ entry }) => !entry.domain || !seenDomains.has(entry.domain));
-          const pool = freshCandidates.length ? freshCandidates : candidates;
-          let pick = pool[0];
-          for (const option of pool) {
-            if (option.entry.score < pick.entry.score) pick = option;
+          const offsetRanked = offsetUnique.slice().sort((a, b) => {
+            const wa = rankWeight(a);
+            const wb = rankWeight(b);
+            if (wa !== wb) return wb - wa;
+            const scoreA = Number.isFinite(a.score) ? a.score : 0;
+            const scoreB = Number.isFinite(b.score) ? b.score : 0;
+            if (scoreA !== scoreB) return scoreB - scoreA;
+            return a.idx - b.idx;
+          });
+          for (const entry of offsetRanked) {
+            if (!entry.domain) continue;
+            if (usedHosts.has(entry.domain)) continue;
+            if (seenHostUnion.has(entry.domain)) continue;
+            slotFiveEntry = entry;
+            exploreReason = "offset";
+            break;
           }
-          selectedIndexSet.delete(lastEntry.index);
-          selectedEntries[selectedEntries.length - 1] = pick;
-          selectedIndexSet.add(pick.index);
+        } catch (err) {
+          console.error("offset_search_failed", err);
         }
       }
 
-      const selected = selectedEntries.map(se => se.entry).filter(item => item && item.url);
+      let selected = firstFour.slice();
+      if (slotFiveEntry) {
+        const already = selected.findIndex(item => item.domain === slotFiveEntry.domain && item.url === slotFiveEntry.url);
+        if (already !== -1) {
+          selected.splice(already, 1);
+        }
+        selected.push(slotFiveEntry);
+      }
+
+      for (const entry of rankedResults) {
+        if (selected.length >= 5) break;
+        if (!entry) continue;
+        if (selected.some(item => item.url === entry.url)) continue;
+        const host = entry.domain;
+        if (host && selected.some(item => item.domain === host)) continue;
+        selected.push(entry);
+      }
+
+      if (selected.length < 5 && slotFiveEntry) {
+        for (const entry of rankedResults) {
+          if (selected.length >= 5) break;
+          if (!entry) continue;
+          if (selected.some(item => item.url === entry.url)) continue;
+          selected.push(entry);
+        }
+      }
+
+      if (selected.length > 5) {
+        selected = selected.slice(0, 5);
+      }
+
+      const uniqueSelected = [];
+      const finalHosts = new Set();
+      for (const entry of selected) {
+        if (!entry || !entry.url) continue;
+        const host = entry.domain;
+        if (host) {
+          if (finalHosts.has(host)) continue;
+          finalHosts.add(host);
+        }
+        uniqueSelected.push(entry);
+        if (uniqueSelected.length >= 5) break;
+      }
+      selected = uniqueSelected;
+
+      const selectedHosts = selected.map(item => item?.domain || null);
+      const exploreFlag = exploreReason !== "none";
 
       if (selected.length) {
-        rememberSeenDomains(meta.sessionId, topic, selected.map(item => item.domain).filter(Boolean));
+        updateSeenHosts(meta.sessionId, topic, selectedHosts.filter(Boolean));
         sessionSearch.set(meta.sessionId, {
           topic,
           runId: run?.id || null,
@@ -564,7 +652,8 @@ async function executeTool(ws, meta, call_id="auto") {
         const msg = `Here are ${selected.length} sources:\n${lines}`;
         appendMessage(meta.sessionId, { role:"assistant", content: msg });
         ws.send(JSON.stringify({ type:"assistant_message", content: msg }));
-        emitEventLog(ws, "list_posted", { runId: run?.id || null, items: selected.length, hosts: selected.map(item => item.domain || null) });
+        ws.send(JSON.stringify({ type: "list_posted", explore: exploreFlag, reason: exploreReason, hosts: selectedHosts }));
+        emitEventLog(ws, "list_posted", { runId: run?.id || null, items: selected.length, hosts: selectedHosts, explore: exploreFlag, reason: exploreReason });
       } else {
         const pb = playbookFor(topic);
         const hint = (pb?.if_k0 && pb.if_k0.length) ? `Tried variants. Consider: ${pb.if_k0.slice(0,3).join(", ")}` : "Try adding org names or dates.";
