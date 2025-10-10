@@ -274,75 +274,114 @@ function buildNoteFingerprint(note) {
 }
 
 function migrateLegacyCardData() {
+  let profileCount = 0;
+  let prefCount = 0;
+  let noteCount = 0;
+
+  const canonicalPrefKey = (value) => {
+    if (value === undefined || value === null) return "";
+    const raw = String(value).trim();
+    if (!raw) return "";
+    return raw.toLowerCase();
+  };
+
   try {
     const existingCards = readAllCards();
-    const hasProfileCard = existingCards.some(card => card?.type === "profile");
-    const existingPrefTopics = new Set(
-      existingCards
-        .filter(card => card?.type === "pref")
-        .map(card => card?.topic)
-        .filter(Boolean)
-    );
+    const existingPrefKeys = new Set();
     const existingNoteFingerprints = new Set();
+
     for (const card of existingCards) {
-      if (!card || card.type !== "note") continue;
-      const fp = card.value?.legacy?.fingerprint || buildNoteFingerprint(card.value?.note || card.value);
-      if (fp) existingNoteFingerprints.add(fp);
+      if (!card || typeof card !== "object") continue;
+      if (card.type === "profile") {
+        profileCount += 1;
+      } else if (card.type === "pref") {
+        const keyFromValue = canonicalPrefKey(card?.value?.key);
+        if (keyFromValue) {
+          existingPrefKeys.add(keyFromValue);
+        } else {
+          const topicKey = canonicalPrefKey(String(card.topic || "").replace(/^pref:/i, ""));
+          if (topicKey) existingPrefKeys.add(topicKey);
+        }
+      } else if (card.type === "note") {
+        noteCount += 1;
+        const fingerprint = card.value?.legacy?.fingerprint || buildNoteFingerprint(card.value?.note || card.value);
+        if (fingerprint) existingNoteFingerprints.add(fingerprint);
+      }
     }
 
+    prefCount = existingPrefKeys.size;
+
     const profilePath = path.resolve("data", "profile.json");
-    if (fs.existsSync(profilePath) && !hasProfileCard) {
+    if (fs.existsSync(profilePath)) {
       try {
         const raw = fs.readFileSync(profilePath, "utf8");
         const profile = JSON.parse(raw);
-        const profileId = String(profile?.id || profile?.user_id || "default").trim() || "default";
-        const topic = `profile:${profileId}`;
-        const name = String(profile?.name || "").trim();
-        const summaryParts = [];
-        if (name) summaryParts.push(`Profile for ${name}`);
-        if (profile?.bio) summaryParts.push(String(profile.bio));
-        const summary = summaryParts.join(" — ") || `Profile ${profileId}`;
-        const entities = [];
-        if (name) entities.push(name);
-        const profileCard = {
-          type: "profile",
-          topic,
-          summary,
-          value: {
-            profile,
-            legacy: { source: "profile.json" }
-          },
-          tags: ["profile"],
-          entities,
-          confidence: 0.7
-        };
-        persistCard(profileCard);
+        const profileId = String(profile?.id || profile?.user_id || profile?.userId || "default").trim() || "default";
+        if (profileCount === 0) {
+          const topic = `profile:${profileId}`;
+          const name = String(profile?.name || "").trim();
+          const summaryParts = [];
+          if (name) summaryParts.push(`Profile for ${name}`);
+          if (profile?.bio) summaryParts.push(String(profile.bio));
+          const summary = summaryParts.join(" — ") || `Profile ${profileId}`;
+          const entities = [];
+          if (name) entities.push(name);
+          const profileCard = {
+            type: "profile",
+            topic,
+            summary,
+            value: {
+              profile,
+              legacy: { source: "profile.json" }
+            },
+            tags: ["profile"],
+            entities,
+            confidence: 0.75
+          };
+          persistCard(profileCard);
+          profileCount += 1;
+        }
 
         if (profile && typeof profile.prefs === "object" && profile.prefs !== null) {
-          for (const [key, value] of Object.entries(profile.prefs)) {
-            const cleanKey = String(key || "").trim();
+          for (const [rawKey, value] of Object.entries(profile.prefs)) {
+            const cleanKey = String(rawKey || "").trim();
             if (!cleanKey) continue;
-            const prefTopic = `pref:${cleanKey.toLowerCase()}`;
-            if (existingPrefTopics.has(prefTopic)) continue;
-            const prefValue = typeof value === "string" ? value : JSON.stringify(value);
-            const prefSummary = `Preference for ${cleanKey}: ${prefValue}`;
+            const prefKey = canonicalPrefKey(cleanKey);
+            if (!prefKey || existingPrefKeys.has(prefKey)) continue;
+
+            let renderedValue = "";
+            if (typeof value === "string") {
+              renderedValue = value;
+            } else {
+              try {
+                renderedValue = JSON.stringify(value);
+              } catch {
+                renderedValue = String(value);
+              }
+            }
+            const topic = `pref:${prefKey}`;
+            const summary = `Preference for ${cleanKey}: ${renderedValue}`.trim();
+            const tags = Array.from(new Set(["pref", cleanKey, prefKey].map(tag => String(tag || "").trim()).filter(Boolean)));
             const prefCard = {
               type: "pref",
-              topic: prefTopic,
-              summary: prefSummary,
+              topic,
+              summary,
               value: {
                 key: cleanKey,
                 value,
                 legacy: { source: "profile.json" }
               },
-              tags: ["pref", cleanKey],
+              tags,
               entities: [],
               confidence: 0.6
             };
             persistCard(prefCard);
-            existingPrefTopics.add(prefTopic);
+            existingPrefKeys.add(prefKey);
+            prefCount = existingPrefKeys.size;
           }
         }
+
+        prefCount = existingPrefKeys.size;
       } catch (err) {
         console.warn("Failed to migrate profile.json", err);
       }
@@ -352,45 +391,90 @@ function migrateLegacyCardData() {
     if (fs.existsSync(notesPath)) {
       try {
         const raw = fs.readFileSync(notesPath, "utf8");
-        const lines = raw.split("\n").filter(Boolean);
-        for (const line of lines) {
+        const lines = raw.split("\n");
+        for (let idx = 0; idx < lines.length; idx += 1) {
+          const line = lines[idx];
+          if (!line || !line.trim()) continue;
           let note;
           try {
             note = JSON.parse(line);
-          } catch {
+          } catch (err) {
+            console.warn(`Failed to parse notes.jsonl row ${idx + 1}`, err);
             continue;
           }
           if (!note || typeof note !== "object") continue;
-          const topicRaw = note.topic || note.title || "";
-          const summaryRaw = note.summary || note.content || "";
-          if (!topicRaw && !summaryRaw) continue;
+
           const fingerprint = buildNoteFingerprint(note);
           if (fingerprint && existingNoteFingerprints.has(fingerprint)) continue;
-          const tsRaw = note.ts ?? note.timestamp;
+
+          const topicRaw = String(note.topic || note.title || "").trim();
+          const summaryRaw = String(note.summary || note.content || note.body || note.text || "").trim();
+          if (!topicRaw && !summaryRaw) continue;
+
+          const topic = topicRaw || summaryRaw;
+          let summary = summaryRaw || topicRaw;
+          summary = summary.replace(/\s+/g, " ").trim();
+          if (summary.length > 400) {
+            summary = `${summary.slice(0, 397)}…`;
+          }
+
+          const tsRaw = note.ts ?? note.timestamp ?? note.date ?? null;
           const tsNumber = Number(tsRaw);
           const lastUsed = Number.isFinite(tsNumber) ? tsNumber : Date.now();
+
+          const tagSet = new Set(["note"]);
+          if (Array.isArray(note.tags)) {
+            for (const tag of note.tags) {
+              const clean = String(tag || "").trim();
+              if (clean) tagSet.add(clean);
+            }
+          }
+
+          const entitySet = new Set();
+          if (Array.isArray(note.entities)) {
+            for (const entity of note.entities) {
+              const clean = String(entity || "").trim();
+              if (clean) entitySet.add(clean);
+            }
+          }
+
+          const sourceUrl = String(note?.source?.url || note?.url || "").trim();
+          const value = {
+            note,
+            legacy: { source: "notes.jsonl", fingerprint }
+          };
+          if (sourceUrl) {
+            value.source = { url: sourceUrl };
+          }
+
           const noteCard = {
             type: "note",
-            topic: topicRaw || summaryRaw,
-            summary: summaryRaw || topicRaw,
-            value: {
-              note,
-              legacy: { source: "notes.jsonl", fingerprint }
-            },
-            tags: ["note"],
-            entities: [],
-            confidence: 0.5,
+            topic,
+            summary,
+            value,
+            tags: Array.from(tagSet),
+            entities: Array.from(entitySet),
+            confidence: (() => {
+              const numeric = Number(note.confidence);
+              return Number.isFinite(numeric) ? numeric : 0.5;
+            })(),
             last_used: lastUsed
           };
+
           persistCard(noteCard);
           if (fingerprint) existingNoteFingerprints.add(fingerprint);
+          noteCount += 1;
         }
       } catch (err) {
         console.warn("Failed to migrate notes.jsonl", err);
       }
     }
+
+    prefCount = Math.max(prefCount, existingPrefKeys.size);
   } catch (err) {
     console.warn("Card migration failed", err);
+  } finally {
+    console.log(`cards_boot {profile:${profileCount}, prefs:${prefCount}, notes:${noteCount}}`);
   }
 }
 
