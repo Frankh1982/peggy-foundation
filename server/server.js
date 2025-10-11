@@ -816,7 +816,7 @@ function extractNoteShortcutCommand(text) {
   const raw = text.trim();
   if (!raw) return null;
 
-  const listMatch = raw.match(/^save\s+note\s+#(\d+)\s*:\s*(.+)$/i);
+  const listMatch = raw.match(/^save\s+note\s+#(\d+)(?::|\s)+(.+)$/i);
   if (listMatch) {
     const summary = listMatch[2].trim();
     if (!summary) return null;
@@ -1071,11 +1071,14 @@ wss.on("connection", (ws, req) => {
       let payload = null;
       let topicHint = summary;
       let rejectMessage = "";
+      let rejectReason = "invalid_note_command";
+      let savedListIndex = null;
 
       if (shortcutNote.kind === "list_item") {
         const stored = sessionSearch.get(sessionId);
         const idx = shortcutNote.index - 1;
-        const item = stored?.list?.[idx];
+        const listItems = Array.isArray(stored?.list) ? stored.list : [];
+        const item = listItems[idx];
         if (item && item.url) {
           const topicCandidate = stored?.topic || item.title || summary;
           const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
@@ -1084,8 +1087,18 @@ wss.on("connection", (ws, req) => {
           if (item.title) source.title = item.title;
           payload = { topic: topicFinal, summary, source };
           topicHint = topicFinal;
+          savedListIndex = shortcutNote.index;
         } else {
-          rejectMessage = stored ? `I don't have a link for list item #${shortcutNote.index}.` : "I don't have a recent list to pull from.";
+          if (!stored || !listItems.length) {
+            rejectMessage = "I don't have a recent list to pull from.";
+            rejectReason = "no_list";
+          } else if (!Number.isFinite(idx) || idx < 0 || idx >= listItems.length) {
+            rejectMessage = "unknown with current context.";
+            rejectReason = "out_of_range";
+          } else {
+            rejectMessage = `I don't have a link for list item #${shortcutNote.index}.`;
+            rejectReason = "missing_source_url";
+          }
         }
       } else if (shortcutNote.kind === "last_summary" || shortcutNote.kind === "last_link") {
         const last = getLastSummary(sessionId);
@@ -1111,11 +1124,14 @@ wss.on("connection", (ws, req) => {
       }
 
       if (!payload) {
-        const reason = rejectMessage ? "missing_source_url" : "invalid_note_command";
+        const reason = rejectMessage ? rejectReason : "invalid_note_command";
         ws.send(JSON.stringify({ type: "note_rejected", reason }));
         const reply = rejectMessage || "I couldn't save that note.";
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+        if (reason === "out_of_range") {
+          ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+        }
         return;
       }
 
@@ -1134,6 +1150,11 @@ wss.on("connection", (ws, req) => {
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
+        const successMsg = savedListIndex !== null
+          ? `note_saved: "${result.card.topic}" (#${savedListIndex})`
+          : `note_saved: "${result.card.topic}"`;
+        appendMessage(sessionId, { role: "assistant", content: successMsg });
+        ws.send(JSON.stringify({ type: "assistant_message", content: successMsg }));
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
         }
