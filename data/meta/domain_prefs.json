@@ -3,17 +3,20 @@
     "reddit.com",
     "quora.com",
     "medium.com/@",
-    "gist.github.com"
+    "finance.yahoo.com",
+    "investopedia.com"
   ],
   "prefer": [
     "reuters.com",
     "apnews.com",
     "bbc.com",
-    "washingtonpost.com",
-    "npr.org",
-    "theguardian.com",
-    "arstechnica.com",
-    "theverge.com"
+    "bloomberg.com",
+    "cnbc.com",
+    "ft.com",
+    "nytimes.com",
+    "openai.com",
+    "ir.amd.com",
+    "techcrunch.com"
   ],
   "neutral": []
 }
