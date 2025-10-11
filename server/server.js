@@ -70,11 +70,20 @@ function getStoredListContext(sessionId) {
   if (!stored) return null;
   const normalizedQuery = stored.normalizedQuery || topicToSearchPhrase(stored.topic) || "";
   const fallbackQuery = String(stored.query || "").trim();
+  const normalizedTopic = (() => {
+    if (typeof stored.normalizedTopic === "string" && stored.normalizedTopic.trim()) {
+      return stored.normalizedTopic.trim();
+    }
+    const source = normalizedQuery || fallbackQuery || stored.topic || "";
+    const normalized = normalizeTopic(source);
+    return normalized ? normalized.trim() : "";
+  })();
   return {
     ...stored,
     normalizedQuery,
     fallbackQuery,
-    queryForReuse: normalizedQuery || fallbackQuery
+    normalizedTopic,
+    queryForReuse: normalizedTopic || normalizedQuery || fallbackQuery
   };
 }
 
@@ -1369,10 +1378,10 @@ wss.on("connection", (ws, req) => {
       let topic = null;
 
       if (listIntent.topicless) {
-        const reuse = storedList?.queryForReuse ? storedList.queryForReuse.trim() : "";
+        const reuseTopic = storedList?.normalizedTopic ? storedList.normalizedTopic.trim() : "";
+        const reuse = reuseTopic || (storedList?.queryForReuse ? storedList.queryForReuse.trim() : "");
         if (reuse) {
           base = reuse;
-          topic = storedList?.topic || bucketTopic(base);
         } else {
           flushCardUsage();
           sendGapPrompt(ws, {
@@ -1649,12 +1658,18 @@ async function executeTool(ws, meta, call_id="auto") {
         const baseQuery = typeof meta.spec.args.q === "string" ? meta.spec.args.q : "";
         const storedQlist = Array.isArray(meta.spec.args.qlist) ? meta.spec.args.qlist.filter(Boolean) : [];
         const normalizedQuery = topicToSearchPhrase(topic);
+        const normalizedTopic = (() => {
+          const phrase = normalizedQuery || baseQuery || meta.requestText || "";
+          const normalized = normalizeTopic(phrase);
+          return normalized ? normalized.trim() : "";
+        })();
         sessionSearch.set(meta.sessionId, {
           topic,
           runId: run?.id || null,
           query: baseQuery,
           qlist: storedQlist,
           normalizedQuery,
+          normalizedTopic,
           list: selected.map(r => ({ title: r.title || "", url: r.url, host: r.domain || null })),
           ts: Date.now()
         });
