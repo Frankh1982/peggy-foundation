@@ -294,11 +294,16 @@ function isPreferredDomain(domain) {
 }
 
 function persistCard(card) {
-  const result = writeCard(card);
-  const id = result?.id;
-  if (!id) return null;
-  updateIndex({ ...card, id });
-  return id;
+  try {
+    const result = writeCard(card);
+    const id = result?.id;
+    if (!id) return null;
+    updateIndex({ ...card, id });
+    return id;
+  } catch (err) {
+    console.warn("persistCard failed", err);
+    return null;
+  }
 }
 
 function logCardWrite(entry) {
@@ -881,7 +886,7 @@ function extractNoteShortcutCommand(text) {
   const raw = text.trim();
   if (!raw) return null;
 
-  const listMatch = raw.match(/^save\s+note\s+#(\d+)(?::|\s)+(.+)$/i);
+  const listMatch = raw.match(/^save\s+note\s+#(\d+)[:\s]+(.+)$/i);
   if (listMatch) {
     const summary = listMatch[2].trim();
     if (!summary) return null;
