@@ -360,3 +360,64 @@ export function touch(cardId) {
     writeLines(cardsFile, lines);
   }
 }
+
+export function repairAmdOpenaiDealIndex({ logger = console } = {}) {
+  const index = loadIndex();
+  const topicIndex = index.topics || {};
+  const destinationKey = "news:openai/amd/deal";
+  const patterns = [
+    /^topic\s+openai\s+amd\s+deal$/i,
+    /^amd\s+openai\s+deal$/i,
+    /^topic\s+what\s+s\s+latest\s+on$/i
+  ];
+
+  const fromKeys = [];
+  const movedIds = new Set();
+  let modified = false;
+
+  for (const key of Object.keys(topicIndex)) {
+    if (!key) continue;
+    if (!patterns.some(pattern => pattern.test(key))) continue;
+
+    const ids = Array.isArray(topicIndex[key]) ? topicIndex[key] : [];
+    for (const id of ids) {
+      if (id) {
+        movedIds.add(id);
+      }
+    }
+    fromKeys.push(key);
+    delete topicIndex[key];
+    modified = true;
+  }
+
+  const destination = Array.isArray(topicIndex[destinationKey]) ? [...topicIndex[destinationKey]] : [];
+  const seen = new Set(destination);
+  for (const id of movedIds) {
+    if (id && !seen.has(id)) {
+      destination.push(id);
+      seen.add(id);
+      modified = true;
+    }
+  }
+
+  if (destination.length) {
+    topicIndex[destinationKey] = destination;
+  } else if (!topicIndex[destinationKey]) {
+    delete topicIndex[destinationKey];
+  }
+
+  if (modified) {
+    saveIndex(index);
+  }
+
+  const logPayload = { moved: movedIds.size, from: fromKeys, to: destinationKey };
+  if (logger && typeof logger.info === "function") {
+    logger.info("cards_reindex", logPayload);
+  } else if (logger && typeof logger.log === "function") {
+    logger.log("cards_reindex", logPayload);
+  } else {
+    console.log("cards_reindex", logPayload);
+  }
+
+  return logPayload;
+}

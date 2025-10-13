@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale } from "./cards.js";
+import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, repairAmdOpenaiDealIndex } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -46,6 +46,7 @@ if (!fs.existsSync(cardWriteLogFile)) {
 }
 
 migrateLegacyCardData();
+repairAmdOpenaiDealIndex();
 
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY in .env");
