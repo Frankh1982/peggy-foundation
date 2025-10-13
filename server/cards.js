@@ -72,6 +72,25 @@ export function applyTTL(card, { now = Date.now() } = {}) {
   return copy;
 }
 
+export function isStale(card, ttlDays, now = Date.now()) {
+  if (!card || typeof card !== "object") return false;
+  const ts = Number(card.ts ?? card.last_used ?? card.created_at ?? 0);
+  if (!Number.isFinite(ts) || ts <= 0) return false;
+  const diff = now - ts;
+  if (diff <= 0) return false;
+  const ownTtl = Number(card.ttl_days);
+  if (Number.isFinite(ownTtl) && ownTtl > 0) {
+    return diff > ownTtl * DAY_MS;
+  }
+  if (ttlDays && card.type !== "profile" && card.type !== "pref") {
+    const fallback = Number(ttlDays);
+    if (Number.isFinite(fallback) && fallback > 0) {
+      return diff > fallback * DAY_MS;
+    }
+  }
+  return false;
+}
+
 export const ProfileCard = {
   type: "profile",
   topic: "",
@@ -282,6 +301,19 @@ export function getTopByTopic(topic, { limit = 3 } = {}) {
     const card = lookup.get(id);
     if (!card) continue;
     const enriched = applyTTL(card);
+    const tsCandidates = [
+      card.value?.source?.ts,
+      card.last_used,
+      card.created_at
+    ];
+    let ts = null;
+    for (const candidate of tsCandidates) {
+      const numeric = Number(candidate);
+      if (Number.isFinite(numeric) && numeric > 0) {
+        ts = numeric;
+        break;
+      }
+    }
     picked.push({
       id: card.id,
       type: card.type,
@@ -290,6 +322,7 @@ export function getTopByTopic(topic, { limit = 3 } = {}) {
       value: card.value,
       confidence: card.confidence,
       last_used: card.last_used,
+      ts,
       ttl_days: enriched?.ttl_days ?? null,
       stale: Boolean(enriched?.stale)
     });
