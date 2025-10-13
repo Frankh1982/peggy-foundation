@@ -33,7 +33,8 @@ const RECENCY_FALLBACK = 0.6;
 const SOURCE_PRIORS = loadSourcePriors();
 const DOMAIN_PREFS = loadDomainPrefs();
 const SEEN_HOST_TTL = 15 * 60 * 1000;
-const FRESH_CUE_REGEX = /\b(latest|today|tonight|this\s*week|this\s*morning|breaking|recent|update\s*(now)?|new\s+(info|details|update))\b/i;
+const FRESH_CUE_REGEX = /\b(latest|breaking|today|tonight|this\s*week|refresh)\b|\bupdate\b.*\b(now|today)\b|\b(now|today)\b.*\bupdate\b/i;
+const TWO_SENTENCE_REGEX = /\b(?:two|2)[-\s]?sentence\b/i;
 
 const cardsDirPath = path.resolve("data", "cards");
 const indexDirPath = path.resolve("data", "index");
@@ -1075,8 +1076,12 @@ wss.on("connection", (ws, req) => {
     const trimmedContent = content.trim();
     const refreshMatch = trimmedContent.match(/^refresh(?:\s+(.+))?$/i);
     const refreshArg = refreshMatch ? (refreshMatch[1] || "").trim() : "";
-    let freshCue = FRESH_CUE_REGEX.test(content);
+    const freshRegexCue = FRESH_CUE_REGEX.test(content);
+    let freshCue = freshRegexCue;
     if (refreshMatch) freshCue = true;
+    if (TWO_SENTENCE_REGEX.test(content) && !freshRegexCue) {
+      freshCue = false;
+    }
     let freshnessAction = "none";
     let note = null;
     let stale = false;
