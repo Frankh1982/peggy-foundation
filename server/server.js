@@ -94,7 +94,7 @@ const TOPIC_TOKEN_TITLE_OVERRIDES = new Map([
 function detokenizeTopicKey(topicKey) {
   const raw = String(topicKey || "").trim();
   if (!raw) return "";
-  return raw.split(/\s+/).map(token => {
+  return raw.split(/[\s/]+/).map(token => {
     const mapped = TOPIC_TOKEN_TITLE_OVERRIDES.get(token);
     if (mapped) return mapped;
     if (/^[a-z]{1,3}$/.test(token)) return token.toUpperCase();
@@ -1187,17 +1187,25 @@ wss.on("connection", (ws, req) => {
     }
     let freshnessAction = "none";
     let freshnessTopic = topic;
+    let freshnessTopicSource = "message";
     let note = null;
     let stale = false;
     let freshnessEventSent = false;
     const sendFreshnessEvent = () => {
       if (freshnessEventSent) return;
+      const canonicalTopic = (() => {
+        if (!freshnessTopic) return "";
+        if (freshnessTopicSource === "list") {
+          return normalizeTopic(freshnessTopic, { prefix: "news" });
+        }
+        return normalizeTopic(freshnessTopic);
+      })();
       emitEventLog(ws, "freshness_gate", {
         cue: Boolean(freshCue),
         note: Boolean(note),
         stale: Boolean(stale),
         action: freshnessAction,
-        topic: freshnessTopic
+        topic: canonicalTopic
       });
       freshnessEventSent = true;
     };
@@ -1480,10 +1488,12 @@ wss.on("connection", (ws, req) => {
       const lastList = getLastListContext(sessionId);
       let requestBase = refreshArg;
       let targetTopicKey = refreshArg ? normalizeTopic(refreshArg) : "";
+      let usedLastListTopic = false;
 
       if (!targetTopicKey && lastList?.lastTopicKey) {
         targetTopicKey = lastList.lastTopicKey;
         requestBase = lastList.lastQBase || requestBase;
+        usedLastListTopic = Boolean(targetTopicKey);
       }
 
       if (!targetTopicKey) {
@@ -1509,7 +1519,13 @@ wss.on("connection", (ws, req) => {
       }
       const spec = { tool: "web_search", args };
       freshnessAction = "search";
-      freshnessTopic = targetTopicKey || normalizeTopic(base);
+      const fallbackTopic = normalizeTopic(base);
+      freshnessTopic = targetTopicKey || fallbackTopic;
+      if (usedLastListTopic && freshnessTopic) {
+        freshnessTopicSource = "list";
+      } else if (fallbackTopic) {
+        freshnessTopicSource = "message";
+      }
       sendFreshnessEvent();
       flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: base, topic: topicForSearch, banditKeys: keysUsed, runNumber });
@@ -1649,6 +1665,11 @@ wss.on("connection", (ws, req) => {
       }
       const spec = { tool: "web_search", args };
       if (freshCue) freshnessAction = "search";
+      const canonicalListTopic = normalizeTopic(base);
+      if (canonicalListTopic) {
+        freshnessTopic = canonicalListTopic;
+        freshnessTopicSource = "list";
+      }
       sendFreshnessEvent();
       flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
@@ -1667,6 +1688,11 @@ wss.on("connection", (ws, req) => {
       }
       const spec = { tool: "web_search", args };
       if (freshCue) freshnessAction = "search";
+      const canonicalSearchTopic = normalizeTopic(base);
+      if (canonicalSearchTopic) {
+        freshnessTopic = canonicalSearchTopic;
+        freshnessTopicSource = "list";
+      }
       sendFreshnessEvent();
       flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
@@ -1930,7 +1956,21 @@ async function executeTool(ws, meta, call_id="auto") {
         appendMessage(meta.sessionId, { role:"assistant", content: msg });
         ws.send(JSON.stringify({ type:"assistant_message", content: msg }));
         ws.send(JSON.stringify({ type: "list_posted", explore: exploreFlag, reason: exploreReason, hosts: selectedHosts }));
-        emitEventLog(ws, "list_posted", { runId: run?.id || null, items: selected.length, hosts: selectedHosts, explore: exploreFlag, reason: exploreReason });
+        const canonicalListTopic = (() => {
+          if (normalizedTopic) return normalizeTopic(normalizedTopic, { prefix: "news" });
+          const fromHuman = normalizeTopic(humanQuery, { prefix: "news" });
+          if (fromHuman) return fromHuman;
+          const fromBucket = normalizeTopic(topicToSearchPhrase(topic), { prefix: "news" });
+          return fromBucket;
+        })();
+        emitEventLog(ws, "list_posted", {
+          runId: run?.id || null,
+          items: selected.length,
+          hosts: selectedHosts,
+          explore: exploreFlag,
+          reason: exploreReason,
+          topic: canonicalListTopic
+        });
       } else {
         const pb = playbookFor(topic);
         const hint = (pb?.if_k0 && pb.if_k0.length) ? `Tried variants. Consider: ${pb.if_k0.slice(0,3).join(", ")}` : "Try adding org names or dates.";
@@ -2059,7 +2099,14 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
   const listHeaderRegex = /^\s*here\s+are\s+\d+\s+(?:sources?|links?|results?)\b/i;
   const looksLikeListHeader = listHeaderRegex.test(cleanText || "");
   if (looksLikeListHeader && !hasRecentServerList(sessionId, 2000)) {
-    emitEventLog(ws, "list_model_blocked", true);
+    const storedList = getStoredListContext(sessionId);
+    const canonicalListTopic = (() => {
+      if (!storedList) return "";
+      if (storedList.normalizedTopic) return normalizeTopic(storedList.normalizedTopic, { prefix: "news" });
+      if (storedList.topic) return normalizeTopic(storedList.topic, { prefix: "news" });
+      return "";
+    })();
+    emitEventLog(ws, "list_model_blocked", { topic: canonicalListTopic, reason: "model_block" });
     if (await triggerServerListFallback()) return;
     cleanText = "";
   }

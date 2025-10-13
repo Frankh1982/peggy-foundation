@@ -140,25 +140,29 @@ export const ClaimCard = {
 };
 
 const stopwords = new Set([
+  "what",
+  "s",
+  "the",
+  "latest",
+  "on",
   "find",
   "more",
+  "about",
   "sites",
   "sources",
   "articles",
   "websites",
-  "about",
-  "the",
+  "news",
   "a",
   "an",
   "and",
-  "or",
-  "news"
+  "or"
 ]);
 
 const synonymPatterns = [
   { pattern: /\bopen\s*ai\b/g, replacement: "openai" },
-  { pattern: /\bopenai\b/g, replacement: "openai" },
   { pattern: /\badvanced\s+micro\s+devices\b/g, replacement: "amd" },
+  { pattern: /\bopenai\b/g, replacement: "openai" },
   { pattern: /\bamd\b/g, replacement: "amd" },
   { pattern: /\bdeal\b|\bagreement\b|\bpartnership\b/g, replacement: "deal" }
 ];
@@ -186,7 +190,7 @@ function writeLines(file, lines) {
   fs.writeFileSync(file, content + (content.endsWith("\n") || !content ? "" : "\n"));
 }
 
-export function normalizeTopic(text) {
+export function normalizeTopic(text, { prefix = "" } = {}) {
   const raw = String(text || "").toLowerCase();
   if (!raw.trim()) return "";
   let normalized = raw;
@@ -196,12 +200,21 @@ export function normalizeTopic(text) {
   normalized = normalized.replace(/[^a-z0-9\s]+/g, " ");
   normalized = normalized.replace(/\s+/g, " ").trim();
   if (!normalized) return "";
+  const seen = new Set();
   const tokens = normalized
     .split(" ")
     .map(t => t.trim())
     .filter(Boolean)
-    .filter(token => !stopwords.has(token));
-  return tokens.join(" ");
+    .filter(token => !stopwords.has(token))
+    .filter(token => {
+      if (seen.has(token)) return false;
+      seen.add(token);
+      return true;
+    });
+  if (!tokens.length) return "";
+  const body = tokens.join("/");
+  if (!body) return "";
+  return prefix ? `${prefix}:${body}` : body;
 }
 
 export function writeCard(card) {
