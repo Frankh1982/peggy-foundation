@@ -121,9 +121,9 @@ function resolveListTopicLabel(sessionId, storedList, fallbackText) {
     const reuseTopic = preferBucketedTopicLabel(storedList.queryForReuse);
     if (reuseTopic) candidates.push(reuseTopic);
   }
-  const lastList = getLastListContext(sessionId);
-  if (lastList) {
-    const lastTopic = preferBucketedTopicLabel(lastList.lastTopicKey);
+  const lastCtx = getLastListContext(sessionId);
+  if (lastCtx) {
+    const lastTopic = preferBucketedTopicLabel(lastCtx.lastTopicKey);
     if (lastTopic) candidates.push(lastTopic);
   }
   const fallback = preferBucketedTopicLabel(fallbackText);
@@ -135,16 +135,33 @@ function resolveListTopicLabel(sessionId, storedList, fallbackText) {
   return "";
 }
 
-function setLastListContext(sessionId, { topicKey, qBase }) {
+function normalizeListItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map(item => {
+    const url = item?.url ? String(item.url).trim() : "";
+    const title = item?.title ? String(item.title).trim() : "";
+    const host = item?.host ? String(item.host).trim() : null;
+    const normalized = { title, url };
+    if (host) normalized.host = host;
+    return normalized;
+  });
+}
+
+function setLastListContext(sessionId, { topicKey, qBase, items }) {
   if (!sessionId) return;
   let normalizedTopicKey = normalizeTopic(topicKey || "");
   const lastQBase = String(qBase || "").trim();
   if (!normalizedTopicKey && lastQBase) {
     normalizedTopicKey = normalizeTopic(lastQBase);
   }
+  const listItems = normalizeListItems(items);
   sessionLastList.set(sessionId, {
     lastTopicKey: normalizedTopicKey || "",
-    lastQBase
+    lastQBase,
+    lastList: {
+      items: listItems,
+      ts: Date.now()
+    }
   });
 }
 
@@ -1206,31 +1223,31 @@ wss.on("connection", (ws, req) => {
       let noteTopicLabel = "";
 
       if (shortcutNote.kind === "list_item") {
-        const stored = getStoredListContext(sessionId);
+        const sessionCtx = getLastListContext(sessionId);
         const idx = shortcutNote.index - 1;
-        const listItems = Array.isArray(stored?.list) ? stored.list : [];
+        const listItems = Array.isArray(sessionCtx?.lastList?.items) ? sessionCtx.lastList.items : [];
+        const topicKey = sessionCtx?.lastTopicKey ? String(sessionCtx.lastTopicKey).trim() : "";
         const item = listItems[idx];
-        if (item && item.url) {
-          const topicCandidate = stored?.topic || item.title || summary;
-          const topicValue = topicCandidate ? String(topicCandidate).trim() : "";
-          const resolvedTopic = resolveListTopicLabel(sessionId, stored, topicValue || summary);
-          const topicFinal = (resolvedTopic || topicValue || summary || "").trim();
-          noteTopicLabel = topicFinal;
+        if (item && item.url && topicKey) {
+          noteTopicLabel = topicKey;
           const source = { url: item.url };
           if (item.title) source.title = item.title;
-          payload = { topic: topicFinal, summary, source };
-          topicHint = topicFinal;
+          payload = { topic: topicKey, summary, source };
+          topicHint = topicKey;
           savedListIndex = shortcutNote.index;
         } else {
-          if (!stored || !listItems.length) {
+          if (!sessionCtx || !Array.isArray(sessionCtx?.lastList?.items) || !sessionCtx.lastList.items.length) {
             rejectMessage = "I don't have a recent list to pull from.";
             rejectReason = "no_list";
           } else if (!Number.isFinite(idx) || idx < 0 || idx >= listItems.length) {
             rejectMessage = "unknown with current context.";
             rejectReason = "out_of_range";
-          } else {
+          } else if (!item?.url) {
             rejectMessage = `I don't have a link for list item #${shortcutNote.index}.`;
             rejectReason = "missing_source_url";
+          } else {
+            rejectMessage = "I don't have a topic saved for that list.";
+            rejectReason = "missing_topic";
           }
         }
       } else if (shortcutNote.kind === "last_summary" || shortcutNote.kind === "last_link") {
@@ -1282,14 +1299,21 @@ wss.on("connection", (ws, req) => {
       });
 
       if (result.saved) {
-        const ackTopicRaw = noteTopicLabel || result.card.topic || "";
-        const ackTopic = typeof ackTopicRaw === "string" ? ackTopicRaw.trim() : String(ackTopicRaw);
+        const sessionAckTopic = savedListIndex !== null
+          ? getLastListContext(sessionId)?.lastTopicKey || noteTopicLabel
+          : null;
+        const fallbackAck = noteTopicLabel || result.card.topic || "";
+        const ackTopic = (() => {
+          const raw = savedListIndex !== null ? sessionAckTopic : fallbackAck;
+          if (typeof raw === "string") return raw.trim();
+          return String(raw || "");
+        })();
         ws.send(JSON.stringify({
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
         const successMsg = savedListIndex !== null
-          ? `note_saved: "${ackTopic || result.card.topic}" (#${savedListIndex})`
+          ? `note_saved: "${ackTopic}" (#${savedListIndex})`
           : `note_saved: "${ackTopic || result.card.topic}"`;
         appendMessage(sessionId, { role: "assistant", content: successMsg });
         ws.send(JSON.stringify({ type: "assistant_message", content: successMsg }));
@@ -1882,9 +1906,11 @@ async function executeTool(ws, meta, call_id="auto") {
           return normalized ? normalized.trim() : "";
         })();
         const humanQuery = String(meta.requestText || baseQuery || "").trim();
+        const listItems = selected.map(r => ({ title: r.title || "", url: r.url, host: r.domain || null }));
         setLastListContext(meta.sessionId, {
           topicKey: normalizedTopic || normalizeTopic(humanQuery) || normalizeTopic(topicToSearchPhrase(topic)) || topic,
-          qBase: humanQuery
+          qBase: humanQuery,
+          items: listItems
         });
         sessionSearch.set(meta.sessionId, {
           topic,
@@ -1893,7 +1919,7 @@ async function executeTool(ws, meta, call_id="auto") {
           qlist: storedQlist,
           normalizedQuery,
           normalizedTopic,
-          list: selected.map(r => ({ title: r.title || "", url: r.url, host: r.domain || null })),
+          list: listItems,
           ts: Date.now()
         });
       }
