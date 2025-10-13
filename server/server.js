@@ -61,6 +61,7 @@ const sessionSearch = new Map();
 const sessionTopicState = new Map();
 const sessionTopicSeenHosts = new Map();
 const sessionLastSummary = new Map();
+const sessionLastList = new Map();
 
 function topicToSearchPhrase(topic) {
   const raw = String(topic || "").trim();
@@ -70,6 +71,53 @@ function topicToSearchPhrase(topic) {
   const cleaned = body.replace(/\s+/g, " ").trim();
   if (!cleaned) return "";
   return cleaned.split("/").map(part => part.trim()).filter(Boolean).join(" ");
+}
+
+const TOPIC_TOKEN_TITLE_OVERRIDES = new Map([
+  ["ai", "AI"],
+  ["usa", "USA"],
+  ["us", "US"],
+  ["uk", "UK"],
+  ["eu", "EU"],
+  ["nasa", "NASA"],
+  ["nvidia", "NVIDIA"],
+  ["amd", "AMD"],
+  ["ibm", "IBM"],
+  ["ftx", "FTX"],
+  ["gpt", "GPT"],
+  ["openai", "OpenAI"],
+  ["google", "Google"],
+  ["meta", "Meta"],
+  ["tesla", "Tesla"]
+]);
+
+function detokenizeTopicKey(topicKey) {
+  const raw = String(topicKey || "").trim();
+  if (!raw) return "";
+  return raw.split(/\s+/).map(token => {
+    const mapped = TOPIC_TOKEN_TITLE_OVERRIDES.get(token);
+    if (mapped) return mapped;
+    if (/^[a-z]{1,3}$/.test(token)) return token.toUpperCase();
+    return token.charAt(0).toUpperCase() + token.slice(1);
+  }).join(" ");
+}
+
+function setLastListContext(sessionId, { topicKey, qBase }) {
+  if (!sessionId) return;
+  let normalizedTopicKey = normalizeTopic(topicKey || "");
+  const lastQBase = String(qBase || "").trim();
+  if (!normalizedTopicKey && lastQBase) {
+    normalizedTopicKey = normalizeTopic(lastQBase);
+  }
+  sessionLastList.set(sessionId, {
+    lastTopicKey: normalizedTopicKey || "",
+    lastQBase
+  });
+}
+
+function getLastListContext(sessionId) {
+  if (!sessionId) return null;
+  return sessionLastList.get(sessionId) || null;
 }
 
 function getStoredListContext(sessionId) {
@@ -1083,6 +1131,7 @@ wss.on("connection", (ws, req) => {
       freshCue = false;
     }
     let freshnessAction = "none";
+    let freshnessTopic = topic;
     let note = null;
     let stale = false;
     let freshnessEventSent = false;
@@ -1093,7 +1142,7 @@ wss.on("connection", (ws, req) => {
         note: Boolean(note),
         stale: Boolean(stale),
         action: freshnessAction,
-        topic
+        topic: freshnessTopic
       });
       freshnessEventSent = true;
     };
@@ -1360,29 +1409,29 @@ wss.on("connection", (ws, req) => {
     const isSearchCommand = /^\s*(search|look up)\b/i.test(content);
 
     if (!inReplyToGap && refreshMatch) {
-      let base = refreshArg;
-      let refreshTopic = null;
-      if (!base && note) {
-        base = note.topic || note.summary || "";
-        refreshTopic = note.topic ? bucketTopic(note.topic) : null;
+      const lastList = getLastListContext(sessionId);
+      let requestBase = refreshArg;
+      let targetTopicKey = refreshArg ? normalizeTopic(refreshArg) : "";
+
+      if (!targetTopicKey && lastList?.lastTopicKey) {
+        targetTopicKey = lastList.lastTopicKey;
+        requestBase = lastList.lastQBase || requestBase;
       }
-      if (!base) {
-        const stored = getStoredListContext(sessionId);
-        if (stored) {
-          base = stored.queryForReuse || stored.normalizedQuery || stored.fallbackQuery || stored.topic || "";
-          refreshTopic = stored.topic || stored.normalizedTopic || null;
-        }
-      }
-      if (!base) {
-        const reply = "I need a topic to refresh.";
-        appendMessage(sessionId, { role: "assistant", content: reply });
-        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        freshnessAction = "none";
+
+      if (!targetTopicKey) {
+        freshnessAction = "gap";
         sendFreshnessEvent();
         flushCardUsage();
+        sendGapPrompt(ws, { userId, sessionId, prompt: "Refresh what topic?" });
         return;
       }
-      const topicForSearch = refreshTopic || bucketTopic(base);
+
+      if (!requestBase) {
+        requestBase = detokenizeTopicKey(targetTopicKey);
+      }
+
+      const base = String(requestBase || "").trim();
+      const topicForSearch = bucketTopic(base || targetTopicKey);
       const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
       const runNumber = touchTopicRun(sessionId, topicForSearch);
       const args = { q: base, qlist: qlist.slice(), k: 5 };
@@ -1392,6 +1441,7 @@ wss.on("connection", (ws, req) => {
       }
       const spec = { tool: "web_search", args };
       freshnessAction = "search";
+      freshnessTopic = targetTopicKey || normalizeTopic(base);
       sendFreshnessEvent();
       flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: base, topic: topicForSearch, banditKeys: keysUsed, runNumber });
@@ -1787,6 +1837,11 @@ async function executeTool(ws, meta, call_id="auto") {
           const normalized = normalizeTopic(phrase);
           return normalized ? normalized.trim() : "";
         })();
+        const humanQuery = String(meta.requestText || baseQuery || "").trim();
+        setLastListContext(meta.sessionId, {
+          topicKey: normalizedTopic || normalizeTopic(humanQuery) || normalizeTopic(topicToSearchPhrase(topic)) || topic,
+          qBase: humanQuery
+        });
         sessionSearch.set(meta.sessionId, {
           topic,
           runId: run?.id || null,
