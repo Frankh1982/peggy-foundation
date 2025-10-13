@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave } from "./cards.js";
+import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -19,6 +19,12 @@ const envDocCap = (process.env.MAX_PAGE_CHARS ?? "").trim();
 const RECENT_N = Math.max(0, Number(envRecent || 3));
 const MAX_PAGE_CHARS = Math.max(0, Number(envDocCap || 8000));
 const CALL_POLICY = (process.env.CALL_POLICY || "auto").trim().toLowerCase();
+const envFreshTtl = (process.env.FRESH_TTL_DAYS ?? "").trim();
+const FRESH_TTL_DAYS = (() => {
+  const num = Number(envFreshTtl);
+  if (Number.isFinite(num) && num > 0) return num;
+  return 7;
+})();
 const PEG_BUILD = "2025-10-04-v3j-learn";
 const DEFAULT_SOURCE_PRIOR = 0.45;
 const SCORE_PRIOR_WEIGHT = 0.45;
@@ -27,6 +33,7 @@ const RECENCY_FALLBACK = 0.6;
 const SOURCE_PRIORS = loadSourcePriors();
 const DOMAIN_PREFS = loadDomainPrefs();
 const SEEN_HOST_TTL = 15 * 60 * 1000;
+const FRESH_CUE_REGEX = /\b(latest|today|tonight|this\s*week|this\s*morning|breaking|recent|update\s*(now)?|new\s+(info|details|update))\b/i;
 
 const cardsDirPath = path.resolve("data", "cards");
 const indexDirPath = path.resolve("data", "index");
@@ -1064,6 +1071,27 @@ wss.on("connection", (ws, req) => {
     const sessionId = msg.session_id || "default";
     const content = (msg.content || "").toString().slice(0, 8000);
     const inReplyToGap = msg.in_reply_to_gap || null;
+    const topic = normalizeTopic(content);
+    const trimmedContent = content.trim();
+    const refreshMatch = trimmedContent.match(/^refresh(?:\s+(.+))?$/i);
+    const refreshArg = refreshMatch ? (refreshMatch[1] || "").trim() : "";
+    let freshCue = FRESH_CUE_REGEX.test(content);
+    if (refreshMatch) freshCue = true;
+    let freshnessAction = "none";
+    let note = null;
+    let stale = false;
+    let freshnessEventSent = false;
+    const sendFreshnessEvent = () => {
+      if (freshnessEventSent) return;
+      emitEventLog(ws, "freshness_gate", {
+        cue: Boolean(freshCue),
+        note: Boolean(note),
+        stale: Boolean(stale),
+        action: freshnessAction,
+        topic
+      });
+      freshnessEventSent = true;
+    };
 
     const shortcutNote = extractNoteShortcutCommand(content);
     if (shortcutNote) {
@@ -1074,6 +1102,7 @@ wss.on("connection", (ws, req) => {
         const reply = "I need a short summary to save that note.";
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+        sendFreshnessEvent();
         return;
       }
 
@@ -1128,6 +1157,7 @@ wss.on("connection", (ws, req) => {
             q: "Need a source URL for the note",
             why: "User asked to save a note without an available link"
           });
+          sendFreshnessEvent();
           return;
         }
       }
@@ -1141,6 +1171,7 @@ wss.on("connection", (ws, req) => {
         if (reason === "out_of_range") {
           ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
         }
+        sendFreshnessEvent();
         return;
       }
 
@@ -1173,6 +1204,7 @@ wss.on("connection", (ws, req) => {
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
       }
+      sendFreshnessEvent();
       return;
     }
 
@@ -1202,10 +1234,10 @@ wss.on("connection", (ws, req) => {
           reason: result.error || "unknown"
         }));
       }
+      sendFreshnessEvent();
       return;
     }
 
-    const topic = normalizeTopic(content);
     let cards = topic ? getTopByTopic(topic, { limit: 3 }) : [];
     const cardsById = new Map();
     for (const card of cards) {
@@ -1213,7 +1245,10 @@ wss.on("connection", (ws, req) => {
         cardsById.set(card.id, card);
       }
     }
+    note = cards.find(card => card?.type === "note") || null;
+    stale = note ? isStale(note, FRESH_TTL_DAYS) : false;
     const wantsNameAnswer = /\bwhat(?:'|’)?s my name\b/i.test(content) || /\bwho am i\b/i.test(content);
+    let listIntent = detectListIntent(content);
     const prefKeyInfo = extractPrefKey(content);
     const profileTopicNormalized = normalizeTopic(`profile:${userId}`);
     const touchedCardIds = new Set();
@@ -1263,6 +1298,7 @@ wss.on("connection", (ws, req) => {
       ws.send(JSON.stringify({ type:"assistant_message", content: reply }));
       ws.send(JSON.stringify({ type:"kdn", kdn: { state:"DK", reason:"greeting/ambiguous", ambiguous:true } }));
       flushCardUsage();
+      sendFreshnessEvent();
       return;
     }
 
@@ -1311,6 +1347,78 @@ wss.on("connection", (ws, req) => {
       appendMessage(sessionId, { role:"assistant", content: fastPathReply });
       ws.send(JSON.stringify({ type:"assistant_message", content: fastPathReply }));
       flushCardUsage();
+      sendFreshnessEvent();
+      return;
+    }
+
+    const wantsBriefUpdate = /\b(update|summary|two sentences|2-?sentence)\b/i.test(content);
+    const isSearchCommand = /^\s*(search|look up)\b/i.test(content);
+
+    if (!inReplyToGap && refreshMatch) {
+      let base = refreshArg;
+      let refreshTopic = null;
+      if (!base && note) {
+        base = note.topic || note.summary || "";
+        refreshTopic = note.topic ? bucketTopic(note.topic) : null;
+      }
+      if (!base) {
+        const stored = getStoredListContext(sessionId);
+        if (stored) {
+          base = stored.queryForReuse || stored.normalizedQuery || stored.fallbackQuery || stored.topic || "";
+          refreshTopic = stored.topic || stored.normalizedTopic || null;
+        }
+      }
+      if (!base) {
+        const reply = "I need a topic to refresh.";
+        appendMessage(sessionId, { role: "assistant", content: reply });
+        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+        freshnessAction = "none";
+        sendFreshnessEvent();
+        flushCardUsage();
+        return;
+      }
+      const topicForSearch = refreshTopic || bucketTopic(base);
+      const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
+      const runNumber = touchTopicRun(sessionId, topicForSearch);
+      const args = { q: base, qlist: qlist.slice(), k: 5 };
+      const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+      if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+        args.qlist = rotateList(args.qlist, runNumber - 1);
+      }
+      const spec = { tool: "web_search", args };
+      freshnessAction = "search";
+      sendFreshnessEvent();
+      flushCardUsage();
+      await executeTool(ws, { userId, sessionId, spec, requestText: base, topic: topicForSearch, banditKeys: keysUsed, runNumber });
+      return;
+    }
+
+    if (freshCue && !listIntent) {
+      listIntent = { query: trimmedContent || content, topicless: false, forceFresh: true };
+    }
+
+    const summarizeCommand = /^\s*summarize\s*#\d+\s*$/i.test(content);
+
+    if (!freshCue && !inReplyToGap && note && !stale && wantsBriefUpdate && !listIntent && !isSearchCommand && !summarizeCommand) {
+      const reply = note.summary || "I don't have an update saved.";
+      freshnessAction = "note";
+      if (note) touchCardOnce(note);
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      sendFreshnessEvent();
+      flushCardUsage();
+      return;
+    }
+
+    if (!freshCue && !inReplyToGap && note && stale && !listIntent && !isSearchCommand && !summarizeCommand) {
+      const base = note.summary || "Here's the last note I saved.";
+      const reply = `${base}\n\nThis note may be stale. Say 'refresh' to update.`;
+      freshnessAction = "note+hint";
+      if (note) touchCardOnce(note);
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      sendFreshnessEvent();
+      flushCardUsage();
       return;
     }
 
@@ -1319,6 +1427,7 @@ wss.on("connection", (ws, req) => {
       const urlMatch = content.match(/https?:\/\/\S+/i);
       if (urlMatch) {
         const spec = { tool: "web_get", args: { url: urlMatch[0] } };
+        sendFreshnessEvent();
         flushCardUsage();
         await executeTool(ws, { userId, sessionId, spec, requestText: content });
         return;
@@ -1339,6 +1448,7 @@ wss.on("connection", (ws, req) => {
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
         ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
         flushCardUsage();
+        sendFreshnessEvent();
         return;
       }
 
@@ -1349,6 +1459,7 @@ wss.on("connection", (ws, req) => {
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
         ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
         flushCardUsage();
+        sendFreshnessEvent();
         return;
       }
 
@@ -1359,19 +1470,20 @@ wss.on("connection", (ws, req) => {
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
         ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
         flushCardUsage();
+        sendFreshnessEvent();
         return;
       }
 
       const target = items[idx - 1];
       emitEventLog(ws, "summarize_pick", { n: idx, ok: true, reason: "ok", host: target.host || null });
       const spec = { tool: "web_get", args: { url: target.url } };
+      sendFreshnessEvent();
       flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic: stored.topic }, "auto");
       return;
     }
 
     // Search intents
-    const listIntent = detectListIntent(content);
     if (listIntent) {
       const storedList = getStoredListContext(sessionId);
       let base = String(listIntent.query || "").trim();
@@ -1391,6 +1503,7 @@ wss.on("connection", (ws, req) => {
             q: "Need topic for list request",
             why: "User asked for more sources without a topic"
           });
+          sendFreshnessEvent();
           return;
         }
       }
@@ -1412,6 +1525,8 @@ wss.on("connection", (ws, req) => {
         args.qlist = rotateList(args.qlist, runNumber - 1);
       }
       const spec = { tool: "web_search", args };
+      if (freshCue) freshnessAction = "search";
+      sendFreshnessEvent();
       flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
       return;
@@ -1428,6 +1543,8 @@ wss.on("connection", (ws, req) => {
         args.qlist = rotateList(args.qlist, runNumber - 1);
       }
       const spec = { tool: "web_search", args };
+      if (freshCue) freshnessAction = "search";
+      sendFreshnessEvent();
       flushCardUsage();
       await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
       return;
@@ -1447,10 +1564,12 @@ wss.on("connection", (ws, req) => {
     ];
 
     try {
+      sendFreshnessEvent();
       flushCardUsage();
       const { content: completion, usage } = await callOpenAI(messages);
       await handleAssistantResponse(ws, { completion, usage, userId, sessionId });
     } catch (err) {
+      sendFreshnessEvent();
       ws.send(JSON.stringify({ type: "assistant_message", content: "unknown with current context (API error)." }));
       console.error(err);
     }
