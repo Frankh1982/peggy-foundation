@@ -102,6 +102,39 @@ function detokenizeTopicKey(topicKey) {
   }).join(" ");
 }
 
+const TOPIC_PREFIX_PATTERN = /^[a-z]{3,10}:/i;
+
+function preferBucketedTopicLabel(text) {
+  const raw = typeof text === "string" ? text.trim() : "";
+  if (!raw) return "";
+  if (TOPIC_PREFIX_PATTERN.test(raw)) return raw;
+  return bucketTopic(raw);
+}
+
+function resolveListTopicLabel(sessionId, storedList, fallbackText) {
+  const candidates = [];
+  if (storedList) {
+    const storedTopic = typeof storedList.topic === "string" ? storedList.topic.trim() : "";
+    if (storedTopic) candidates.push(storedTopic);
+    const normalizedTopic = preferBucketedTopicLabel(storedList.normalizedTopic);
+    if (normalizedTopic) candidates.push(normalizedTopic);
+    const reuseTopic = preferBucketedTopicLabel(storedList.queryForReuse);
+    if (reuseTopic) candidates.push(reuseTopic);
+  }
+  const lastList = getLastListContext(sessionId);
+  if (lastList) {
+    const lastTopic = preferBucketedTopicLabel(lastList.lastTopicKey);
+    if (lastTopic) candidates.push(lastTopic);
+  }
+  const fallback = preferBucketedTopicLabel(fallbackText);
+  if (fallback) candidates.push(fallback);
+  for (const value of candidates) {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
 function setLastListContext(sessionId, { topicKey, qBase }) {
   if (!sessionId) return;
   let normalizedTopicKey = normalizeTopic(topicKey || "");
@@ -1170,16 +1203,19 @@ wss.on("connection", (ws, req) => {
       let rejectMessage = "";
       let rejectReason = "invalid_note_command";
       let savedListIndex = null;
+      let noteTopicLabel = "";
 
       if (shortcutNote.kind === "list_item") {
-        const stored = sessionSearch.get(sessionId);
+        const stored = getStoredListContext(sessionId);
         const idx = shortcutNote.index - 1;
         const listItems = Array.isArray(stored?.list) ? stored.list : [];
         const item = listItems[idx];
         if (item && item.url) {
           const topicCandidate = stored?.topic || item.title || summary;
-          const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
-          const topicFinal = topicValue || summary;
+          const topicValue = topicCandidate ? String(topicCandidate).trim() : "";
+          const resolvedTopic = resolveListTopicLabel(sessionId, stored, topicValue || summary);
+          const topicFinal = (resolvedTopic || topicValue || summary || "").trim();
+          noteTopicLabel = topicFinal;
           const source = { url: item.url };
           if (item.title) source.title = item.title;
           payload = { topic: topicFinal, summary, source };
@@ -1203,6 +1239,7 @@ wss.on("connection", (ws, req) => {
           const topicCandidate = last.topic || last.title || summary;
           const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
           const topicFinal = topicValue || summary;
+          noteTopicLabel = topicFinal;
           const source = { url: last.url };
           if (last.title) source.title = last.title;
           payload = { topic: topicFinal, summary, source };
@@ -1245,13 +1282,15 @@ wss.on("connection", (ws, req) => {
       });
 
       if (result.saved) {
+        const ackTopicRaw = noteTopicLabel || result.card.topic || "";
+        const ackTopic = typeof ackTopicRaw === "string" ? ackTopicRaw.trim() : String(ackTopicRaw);
         ws.send(JSON.stringify({
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
         const successMsg = savedListIndex !== null
-          ? `note_saved: "${result.card.topic}" (#${savedListIndex})`
-          : `note_saved: "${result.card.topic}"`;
+          ? `note_saved: "${ackTopic || result.card.topic}" (#${savedListIndex})`
+          : `note_saved: "${ackTopic || result.card.topic}"`;
         appendMessage(sessionId, { role: "assistant", content: successMsg });
         ws.send(JSON.stringify({ type: "assistant_message", content: successMsg }));
         if (updateLastEpisode({ note_saved: true })) {
