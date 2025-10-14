@@ -207,6 +207,87 @@ export function inferConceptMetadata(key) {
   return { key: raw, entities, tags, confidence };
 }
 
+function collectNoteEntities(note) {
+  if (!note || typeof note !== "object") return [];
+  const sources = [
+    note.entities,
+    note.value?.entities,
+    note.value?.data?.entities,
+    note.value?.data?.parties,
+    note.value?.source?.entities,
+    note.value?.source?.parties
+  ];
+  const seen = new Set();
+  const entities = [];
+  for (const source of sources) {
+    if (!Array.isArray(source)) continue;
+    for (const entry of source) {
+      const raw = String(entry || "").trim();
+      if (!raw) continue;
+      const normalized = raw.toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      entities.push(raw);
+    }
+  }
+  return entities;
+}
+
+export function inferConceptKey(note) {
+  if (!note || typeof note !== "object") return "";
+
+  const candidateMap = new Map();
+  const addCandidate = (value, weight = 1) => {
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (!raw) return;
+    const normalized = normalizeTopicKey(raw, "news");
+    if (!normalized) return;
+    const colonIdx = normalized.indexOf(":");
+    const body = colonIdx >= 0 ? normalized.slice(colonIdx + 1) : normalized;
+    if (!body) return;
+    const tokens = body.split("/").filter(Boolean);
+    if (!tokens.length) return;
+    const tokenScore = tokens.length + (tokens.length >= 3 ? 0.5 : 0);
+    const score = tokenScore * weight;
+    const prev = candidateMap.get(normalized);
+    if (!prev || score > prev.score) {
+      candidateMap.set(normalized, { key: normalized, score, tokens });
+    }
+  };
+
+  addCandidate(note.topic, 5);
+  addCandidate(note.value?.topic, 4);
+  addCandidate(note.value?.data?.topic, 4);
+  addCandidate(note.summary, 1.5);
+  addCandidate(note.value?.data?.summary, 1.25);
+  addCandidate(note.value?.source?.title, 1.75);
+
+  const entities = collectNoteEntities(note);
+  if (entities.length) {
+    const lowered = entities.map(value => value.toLowerCase());
+    if (lowered.length >= 3) {
+      addCandidate(lowered.slice(0, 3).join(" "), 3.5);
+    }
+    if (lowered.length >= 2) {
+      addCandidate(lowered.slice(0, 2).join(" "), 3.75);
+    }
+    addCandidate(lowered[0], 1);
+  }
+
+  if (!candidateMap.size) {
+    return "";
+  }
+
+  const best = Array.from(candidateMap.values())
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.tokens.length !== a.tokens.length) return b.tokens.length - a.tokens.length;
+      return a.key.localeCompare(b.key);
+    })[0];
+
+  return best?.key || "";
+}
+
 const stopwords = new Set([
   "what",
   "s",
