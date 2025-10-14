@@ -25,6 +25,24 @@ const FRESH_TTL_DAYS = (() => {
   if (Number.isFinite(num) && num > 0) return num;
   return 7;
 })();
+const envAutoSearchTurn = (process.env.MAX_AUTO_SEARCHES_PER_TURN ?? "").trim();
+const envAutoNotesSession = (process.env.MAX_AUTO_NOTES_PER_SESSION ?? "").trim();
+const MAX_AUTO_SEARCHES_PER_TURN = (() => {
+  const num = Number(envAutoSearchTurn);
+  if (!Number.isFinite(num) || num < 0) return 1;
+  return Math.max(0, Math.floor(num));
+})();
+const MAX_AUTO_NOTES_PER_SESSION = (() => {
+  const num = Number(envAutoNotesSession);
+  if (!Number.isFinite(num) || num < 0) return 3;
+  return Math.max(0, Math.floor(num));
+})();
+const AUTO_RESEARCH_CONFIG = {
+  max_searches_per_turn: MAX_AUTO_SEARCHES_PER_TURN,
+  max_notes_per_session: MAX_AUTO_NOTES_PER_SESSION,
+  note_confidence: 0.6,
+  note_ttl_days: 30
+};
 const PEG_BUILD = "2025-10-04-v3j-learn";
 const DEFAULT_SOURCE_PRIOR = 0.45;
 const SCORE_PRIOR_WEIGHT = 0.45;
@@ -63,6 +81,9 @@ const sessionTopicState = new Map();
 const sessionTopicSeenHosts = new Map();
 const sessionLastSummary = new Map();
 const sessionLastList = new Map();
+const sessionAutoResearchContext = new Map();
+const sessionAutoResearchNoteCount = new Map();
+const sessionLastKdnState = new Map();
 
 function topicToSearchPhrase(topic) {
   const raw = String(topic || "").trim();
@@ -242,6 +263,224 @@ function emitEventLog(ws, label, payload) {
       run: { tool: "event_log", result_summary: { title: "", url: "", latency_ms: "" } }
     }));
   } catch {}
+}
+
+function sendKdn(ws, sessionId, payload) {
+  if (!ws) return;
+  let normalized = payload;
+  if (!normalized) return;
+  if (typeof normalized === "string") {
+    try { normalized = JSON.parse(normalized); }
+    catch { normalized = null; }
+  }
+  if (!normalized || typeof normalized !== "object") return;
+  const safe = { ...normalized };
+  if (safe.state === undefined || safe.state === null) safe.state = "DK";
+  if (safe.reason === undefined || safe.reason === null) safe.reason = "";
+  safe.ambiguous = Boolean(safe.ambiguous);
+  try { ws.send(JSON.stringify({ type: "kdn", kdn: safe })); } catch {}
+  if (sessionId) {
+    sessionLastKdnState.set(sessionId, { ...safe, ts: Date.now() });
+  }
+}
+
+function getLastKdn(sessionId) {
+  if (!sessionId) return null;
+  return sessionLastKdnState.get(sessionId) || null;
+}
+
+function setAutoResearchContext(sessionId, context) {
+  if (!sessionId) return;
+  sessionAutoResearchContext.set(sessionId, context);
+}
+
+function getAutoResearchContext(sessionId) {
+  if (!sessionId) return null;
+  return sessionAutoResearchContext.get(sessionId) || null;
+}
+
+function clearAutoResearchContext(sessionId) {
+  if (!sessionId) return;
+  sessionAutoResearchContext.delete(sessionId);
+}
+
+function getAutoResearchNoteCount(sessionId) {
+  if (!sessionId) return 0;
+  const stored = sessionAutoResearchNoteCount.get(sessionId);
+  const num = Number(stored);
+  return Number.isFinite(num) && num > 0 ? num : 0;
+}
+
+function incrementAutoResearchNoteCount(sessionId) {
+  if (!sessionId) return 0;
+  const next = getAutoResearchNoteCount(sessionId) + 1;
+  sessionAutoResearchNoteCount.set(sessionId, next);
+  return next;
+}
+
+function finalizeAutoResearchEvent(ws, sessionId, context) {
+  if (!context || !context.trigger) {
+    clearAutoResearchContext(sessionId);
+    return;
+  }
+  const topic = typeof context.topic === "string" ? context.topic : "";
+  emitEventLog(ws, "auto_research", {
+    trigger: context.trigger,
+    searched: Boolean(context.searched),
+    wrote: Boolean(context.wrote),
+    topic
+  });
+  if (context.lastError === "score_low" && context.candidate) {
+    const summary = String(context.candidate.summary || "").slice(0, 200);
+    emitEventLog(ws, "auto_research_candidate", {
+      topic,
+      url: context.candidate.url || "",
+      score: context.candidate.score,
+      summary
+    });
+  }
+  clearAutoResearchContext(sessionId);
+}
+
+const ENTITY_STOPWORDS = new Set([
+  "the", "a", "an", "and", "but", "for", "nor", "or", "so", "yet",
+  "what", "whats", "what's", "latest", "update", "deal", "about",
+  "with", "from", "have", "that", "this", "when", "where", "which",
+  "who", "whose", "beyond", "regarding", "btw", "please", "pls"
+]);
+
+function detectNamedEntityPair(text) {
+  const raw = typeof text === "string" ? text : "";
+  if (!raw) return false;
+  const cleaned = raw.replace(/[\r\n]+/g, " ").replace(/[–—]/g, " ");
+  const matches = cleaned.match(/\b[A-Z][\w&.-]{1,}\b/g);
+  if (!matches) return false;
+  const seen = new Set();
+  for (const match of matches) {
+    const token = match.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "");
+    if (!token) continue;
+    const lower = token.toLowerCase();
+    if (ENTITY_STOPWORDS.has(lower)) continue;
+    seen.add(lower);
+    if (seen.size >= 2) return true;
+  }
+  return false;
+}
+
+function cleanAutoResearchQuery(text, topicKey, listQuery) {
+  const baseText = typeof text === "string" ? text : "";
+  const trimmed = baseText.replace(/[\r\n]+/g, " ").trim();
+  let base = typeof listQuery === "string" ? listQuery.trim() : "";
+  if (!base) {
+    const fromTopic = topicToSearchPhrase(topicKey || "");
+    if (fromTopic) base = fromTopic;
+  }
+  if (!base) base = trimmed;
+  if (!base) return "";
+  let working = base;
+  working = working.replace(/\b(?:what(?:'|’)?s|what is|tell me|give me|any|please|pls|btw)\b/gi, " ");
+  working = working.replace(/\b(?:the\s+)?latest\s+(?:on|about)\b/gi, " ");
+  working = working.replace(/\bupdate(?:\s+(?:on|about))?\b/gi, " ");
+  working = working.replace(/\?+$/g, "");
+  working = working.replace(/\s+/g, " ").trim();
+  if (!working) working = base.trim();
+  return working.slice(0, 200);
+}
+
+function hasCardsForTopic(topicKey) {
+  const key = typeof topicKey === "string" ? topicKey.trim() : "";
+  if (!key) return false;
+  const cards = getTopByTopic(key, { limit: 1 }) || [];
+  return cards.length > 0;
+}
+
+async function maybeRunAutoResearch({
+  ws,
+  userId,
+  sessionId,
+  content,
+  topic,
+  note,
+  stale,
+  freshCue,
+  listIntent,
+  isSearchCommand,
+  summarizeCommand,
+  hasUrl,
+  inReplyToGap
+}) {
+  if (!sessionId || !userId) return null;
+  if (inReplyToGap) return null;
+  if (MAX_AUTO_SEARCHES_PER_TURN <= 0) return null;
+  if (isSearchCommand || summarizeCommand || hasUrl) return null;
+  if (listIntent && !freshCue) return null;
+
+  const lastKdn = getLastKdn(sessionId);
+  const rawText = typeof content === "string" ? content : "";
+  const trimmed = rawText.trim();
+  if (!trimmed) return null;
+
+  const normalizedTopic = topic ? topic : normalizeTopic(trimmed);
+  const canonicalTopic = normalizeTopicKey(normalizedTopic || trimmed, "news");
+
+  let trigger = null;
+  if (freshCue && (!note || stale)) {
+    trigger = "fresh";
+  } else if (lastKdn && lastKdn.state === "DK") {
+    trigger = "dk";
+  } else if (!note && detectNamedEntityPair(trimmed)) {
+    const candidateKey = canonicalTopic || normalizeTopicKey(trimmed, "news");
+    if (candidateKey && !hasCardsForTopic(candidateKey)) {
+      trigger = "new_topic";
+    }
+  }
+
+  if (!trigger) return null;
+
+  const topicKey = canonicalTopic || normalizeTopicKey(trimmed, "news") || "";
+  const query = cleanAutoResearchQuery(trimmed, topicKey, listIntent?.query);
+  const context = {
+    trigger,
+    topic: topicKey,
+    searched: false,
+    wrote: false,
+    candidate: null,
+    lastError: null
+  };
+  setAutoResearchContext(sessionId, context);
+
+  if (!query) {
+    return { triggered: true, handled: false, context };
+  }
+
+  context.searched = true;
+  const { qlist, keysUsed } = buildQueryList(query, { max: 8 });
+  const topicForSearch = bucketTopic(query);
+  const runNumber = touchTopicRun(sessionId, topicForSearch);
+  const args = { q: query, qlist: qlist.slice(), k: 5 };
+  const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+  if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+    args.qlist = rotateList(args.qlist, runNumber - 1);
+  }
+
+  try {
+    const spec = { tool: "web_search", args };
+    await executeTool(ws, {
+      userId,
+      sessionId,
+      spec,
+      requestText: query,
+      topic: topicForSearch,
+      banditKeys: keysUsed,
+      runNumber,
+      autoResearch: true
+    }, "auto_research");
+    return { triggered: true, handled: true, context };
+  } catch (err) {
+    context.lastError = "search_error";
+    console.error("auto_research_error", err);
+    return { triggered: true, handled: false, context };
+  }
 }
 
 function loadSourcePriors() {
@@ -1007,7 +1246,7 @@ function sanitizeNoteSource(source) {
   return sanitized;
 }
 
-function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run, reason, topicHint }) {
+function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run, reason, topicHint, autoResearch = false }) {
   if (!payload || typeof payload !== "object") {
     return { saved: false, error: "invalid_payload" };
   }
@@ -1067,6 +1306,25 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
   const metrics = { explicitness: Number(explicitness) || 0, recency, frequency, taskGain };
   const score = scoreImportance(metrics);
 
+  const autoContext = autoResearch ? getAutoResearchContext(sessionId) : null;
+  if (autoContext) {
+    autoContext.lastScore = score;
+    autoContext.lastSummary = trimmedSummary;
+    autoContext.lastUrl = sanitizedSource.url;
+    autoContext.candidate = null;
+    autoContext.lastError = null;
+  }
+
+  if (autoResearch) {
+    const currentCount = getAutoResearchNoteCount(sessionId);
+    if (currentCount >= MAX_AUTO_NOTES_PER_SESSION) {
+      if (autoContext) {
+        autoContext.lastError = "auto_limit";
+      }
+      return { saved: false, error: "auto_note_limit", score, metrics };
+    }
+  }
+
   const entitiesRaw = Array.isArray(payload.entities) ? payload.entities : [];
   const entities = entitiesRaw
     .map(value => String(value || "").trim())
@@ -1101,12 +1359,27 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
   };
 
   if (!shouldSave(card, metrics)) {
+    if (autoContext) {
+      autoContext.lastError = "score_low";
+      autoContext.candidate = { summary: trimmedSummary, url: sanitizedSource.url, score };
+    }
     return { saved: false, error: "score_low", score, metrics };
   }
 
   const id = persistCard(card);
   if (!id) {
+    if (autoContext) {
+      autoContext.lastError = "persist_failed";
+    }
     return { saved: false, error: "persist_failed", score, metrics };
+  }
+
+  if (autoResearch) {
+    incrementAutoResearchNoteCount(sessionId);
+    if (autoContext) {
+      autoContext.wrote = true;
+      autoContext.lastError = null;
+    }
   }
 
   const logReason = reason || ((Number(explicitness) || 0) >= 1 ? "user_reply" : "");
@@ -1293,7 +1566,7 @@ wss.on("connection", (ws, req) => {
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
         if (reason === "out_of_range") {
-          ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+          sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
         }
         sendFreshnessEvent();
         return;
@@ -1429,7 +1702,7 @@ wss.on("connection", (ws, req) => {
       const reply = "Hi! What do you need help with?";
       appendMessage(sessionId, { role:"assistant", content: reply });
       ws.send(JSON.stringify({ type:"assistant_message", content: reply }));
-      ws.send(JSON.stringify({ type:"kdn", kdn: { state:"DK", reason:"greeting/ambiguous", ambiguous:true } }));
+      sendKdn(ws, sessionId, { state:"DK", reason:"greeting/ambiguous", ambiguous:true });
       flushCardUsage();
       sendFreshnessEvent();
       return;
@@ -1540,6 +1813,43 @@ wss.on("connection", (ws, req) => {
     }
 
     const summarizeCommand = /^\s*summarize\s*#\d+\s*$/i.test(content);
+    const hasUrl = /https?:\/\/\S+/i.test(content);
+
+    let autoResearchOutcome = null;
+    try {
+      autoResearchOutcome = await maybeRunAutoResearch({
+        ws,
+        userId,
+        sessionId,
+        content,
+        topic,
+        note,
+        stale,
+        freshCue,
+        listIntent,
+        isSearchCommand,
+        summarizeCommand,
+        hasUrl,
+        inReplyToGap
+      });
+    } catch (err) {
+      console.error("auto_research_invoke_error", err);
+    }
+
+    if (autoResearchOutcome?.triggered) {
+      const context = autoResearchOutcome.context || null;
+      if (context?.topic) {
+        freshnessTopic = context.topic;
+        freshnessTopicSource = "auto";
+      }
+      finalizeAutoResearchEvent(ws, sessionId, context);
+      if (autoResearchOutcome.handled) {
+        freshnessAction = "search";
+        sendFreshnessEvent();
+        flushCardUsage();
+        return;
+      }
+    }
 
     if (!freshCue && !inReplyToGap && note && !stale && wantsBriefUpdate && !listIntent && !isSearchCommand && !summarizeCommand) {
       const reply = note.summary || "I don't have an update saved.";
@@ -1588,7 +1898,7 @@ wss.on("connection", (ws, req) => {
         const reply = "unknown with current context.";
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+        sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
         flushCardUsage();
         sendFreshnessEvent();
         return;
@@ -1599,7 +1909,7 @@ wss.on("connection", (ws, req) => {
         const reply = "unknown with current context.";
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+        sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
         flushCardUsage();
         sendFreshnessEvent();
         return;
@@ -1610,7 +1920,7 @@ wss.on("connection", (ws, req) => {
         const reply = "unknown with current context.";
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        ws.send(JSON.stringify({ type: "kdn", kdn: { state: "DK", reason: "explicit unknown", ambiguous: false } }));
+        sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
         flushCardUsage();
         sendFreshnessEvent();
         return;
@@ -2134,16 +2444,23 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
   }
 
   if (kdn) {
-    try { ws.send(JSON.stringify({ type:"kdn", kdn: JSON.parse(kdn) })); } catch {}
+    try {
+      const parsed = JSON.parse(kdn);
+      sendKdn(ws, sessionId, parsed);
+    } catch {
+      // ignore parse errors
+    }
   } else {
     const state = computeKDNFallback(cleanText, !!gap);
-    ws.send(JSON.stringify({ type:"kdn", kdn: state }));
+    sendKdn(ws, sessionId, state);
   }
 
   if (call) {
     let spec; try { spec = JSON.parse(call); } catch {}
     if (spec && (spec.tool === "web_get" || spec.tool === "web_search")) {
-      executeTool(ws, { userId, sessionId, spec }, "auto");
+      const nextMeta = { userId, sessionId, spec };
+      if (meta?.autoResearch) nextMeta.autoResearch = true;
+      executeTool(ws, nextMeta, meta?.autoResearch ? "auto_research" : "auto");
       return;
     }
   }
@@ -2173,7 +2490,8 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
         sessionId,
         run,
         reason: "web_get_note",
-        topicHint: parsedNote.topic || meta?.topic || run?.result_summary?.title || ""
+        topicHint: parsedNote.topic || meta?.topic || run?.result_summary?.title || "",
+        autoResearch: Boolean(meta?.autoResearch)
       });
       if (result.saved) {
         ws.send(JSON.stringify({
