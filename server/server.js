@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys } from "./cards.js";
+import { ConceptCard, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -62,6 +62,10 @@ const cardWriteLogFile = path.join(cardsDirPath, "CardWriteLog.jsonl");
 if (!fs.existsSync(cardWriteLogFile)) {
   fs.writeFileSync(cardWriteLogFile, "");
 }
+const conceptEdgesFile = path.join(cardsDirPath, "edges.jsonl");
+if (!fs.existsSync(conceptEdgesFile)) {
+  fs.writeFileSync(conceptEdgesFile, "");
+}
 
 migrateLegacyCardData();
 reindexTopicKeys();
@@ -84,6 +88,7 @@ const sessionLastList = new Map();
 const sessionAutoResearchContext = new Map();
 const sessionAutoResearchNoteCount = new Map();
 const sessionLastKdnState = new Map();
+const sessionConceptSuggestions = new Map();
 
 function topicToSearchPhrase(topic) {
   const raw = String(topic || "").trim();
@@ -615,6 +620,433 @@ function logCardWrite(entry) {
   } catch (err) {
     console.warn("CardWriteLog append failed", err);
   }
+}
+
+function normalizeConceptKey(key) {
+  return String(key || "").trim().toLowerCase();
+}
+
+function readConceptEdges() {
+  try {
+    const raw = fs.readFileSync(conceptEdgesFile, "utf8");
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const edges = [];
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line);
+        const noteId = parsed?.note_id ? String(parsed.note_id).trim() : "";
+        const conceptKey = parsed?.concept_key ? normalizeConceptKey(parsed.concept_key) : "";
+        if (!noteId || !conceptKey) continue;
+        const ts = Number(parsed.ts);
+        edges.push({ note_id: noteId, concept_key: conceptKey, ts: Number.isFinite(ts) ? ts : 0 });
+      } catch {
+        continue;
+      }
+    }
+    return edges;
+  } catch {
+    return [];
+  }
+}
+
+function writeConceptEdges(edges) {
+  const lines = edges.map(edge => JSON.stringify(edge));
+  const payload = lines.join("\n");
+  fs.writeFileSync(conceptEdgesFile, payload + (payload.endsWith("\n") || !payload ? "" : "\n"));
+}
+
+function addConceptEdge(noteId, conceptKey) {
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  const cleanNoteId = String(noteId || "").trim();
+  if (!cleanNoteId || !normalizedKey) return { added: false, edge: null };
+  const edges = readConceptEdges();
+  if (edges.some(edge => edge.note_id === cleanNoteId && edge.concept_key === normalizedKey)) {
+    return { added: false, edge: edges.find(edge => edge.note_id === cleanNoteId && edge.concept_key === normalizedKey) };
+  }
+  const entry = { note_id: cleanNoteId, concept_key: normalizedKey, ts: Date.now() };
+  edges.push(entry);
+  writeConceptEdges(edges);
+  return { added: true, edge: entry };
+}
+
+function removeConceptEdge(noteId, conceptKey) {
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  const cleanNoteId = String(noteId || "").trim();
+  if (!cleanNoteId || !normalizedKey) return false;
+  const edges = readConceptEdges();
+  const next = edges.filter(edge => !(edge.note_id === cleanNoteId && edge.concept_key === normalizedKey));
+  if (next.length === edges.length) {
+    return false;
+  }
+  writeConceptEdges(next);
+  return true;
+}
+
+function listConceptEdgesForKey(conceptKey) {
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  if (!normalizedKey) return [];
+  return readConceptEdges().filter(edge => edge.concept_key === normalizedKey);
+}
+
+function isNoteLinkedToConcept(noteId, conceptKey) {
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  const cleanNoteId = String(noteId || "").trim();
+  if (!cleanNoteId || !normalizedKey) return false;
+  return readConceptEdges().some(edge => edge.note_id === cleanNoteId && edge.concept_key === normalizedKey);
+}
+
+let conceptCardCache = null;
+
+function getConceptCards({ refresh = false } = {}) {
+  if (!conceptCardCache || refresh) {
+    const all = readAllCards();
+    conceptCardCache = all.filter(card => card?.type === "concept");
+  }
+  return conceptCardCache.slice();
+}
+
+function invalidateConceptCache() {
+  conceptCardCache = null;
+}
+
+function findConceptCard(key) {
+  const normalizedKey = normalizeConceptKey(key);
+  if (!normalizedKey) return null;
+  const cards = getConceptCards();
+  return cards.find(card => normalizeConceptKey(card?.key) === normalizedKey) || null;
+}
+
+function findNoteCard(noteId) {
+  const cleanNoteId = String(noteId || "").trim();
+  if (!cleanNoteId) return null;
+  const all = readAllCards();
+  return all.find(card => card?.type === "note" && card?.id === cleanNoteId) || null;
+}
+
+function noteTimestamp(note) {
+  const candidates = [
+    note?.last_used,
+    note?.created_at,
+    note?.value?.metadata?.saved_at,
+    note?.value?.source?.ts,
+    note?.ts
+  ];
+  for (const candidate of candidates) {
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric;
+    }
+  }
+  return null;
+}
+
+function formatAgeLabel(ts) {
+  const numeric = Number(ts);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "?";
+  const diff = Date.now() - numeric;
+  if (!Number.isFinite(diff) || diff < 0) return "0m";
+  const minutes = Math.floor(diff / (60 * 1000));
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 90) return `${days}d`;
+  const months = Math.floor(days / 30);
+  if (months < 24) return `${months}mo`;
+  const years = Math.floor(days / 365);
+  return `${years}y`;
+}
+
+function resolveNoteHost(note) {
+  const url = note?.value?.source?.url;
+  if (!url || typeof url !== "string") return "";
+  try {
+    const parsed = new URL(url);
+    return parsed.host || "";
+  } catch {
+    return "";
+  }
+}
+
+function maybeSuggestConceptLink(ws, sessionId, noteCard) {
+  if (!ws || !noteCard || !noteCard.id) return;
+  const entities = Array.isArray(noteCard.entities) ? noteCard.entities : [];
+  const normalizedEntities = new Set(
+    entities
+      .map(value => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (normalizedEntities.size < 2) return;
+
+  const concepts = getConceptCards();
+  let best = null;
+  for (const concept of concepts) {
+    const conceptKey = normalizeConceptKey(concept?.key);
+    if (!conceptKey) continue;
+    if (isNoteLinkedToConcept(noteCard.id, conceptKey)) continue;
+    const conceptEntities = Array.isArray(concept?.entities) ? concept.entities : [];
+    const normalizedConceptEntities = new Set(
+      conceptEntities
+        .map(value => String(value || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+    if (normalizedConceptEntities.size < 2) continue;
+    let matches = 0;
+    for (const entity of normalizedConceptEntities) {
+      if (normalizedEntities.has(entity)) {
+        matches += 1;
+      }
+    }
+    if (matches >= 2) {
+      if (!best || matches > best.matches) {
+        best = { concept, matches };
+      }
+    }
+  }
+
+  if (!best) return;
+
+  const conceptKey = normalizeConceptKey(best.concept.key);
+  if (!conceptKey) return;
+  const existing = sessionConceptSuggestions.get(sessionId);
+  if (existing && existing.noteId === noteCard.id && existing.conceptKey === conceptKey) {
+    return;
+  }
+
+  const suggestion = {
+    noteId: noteCard.id,
+    conceptKey,
+    title: best.concept.title || conceptKey,
+    ts: Date.now()
+  };
+  sessionConceptSuggestions.set(sessionId, suggestion);
+  const text = `suggest_link: note ${suggestion.noteId} -> concept ${conceptKey} (yes/no)`;
+  appendMessage(sessionId, { role: "assistant", content: text });
+  ws.send(JSON.stringify({ type: "assistant_message", content: text }));
+}
+
+function handleConceptSuggestionResponse(ws, sessionId, content) {
+  const suggestion = sessionConceptSuggestions.get(sessionId);
+  if (!suggestion) return false;
+  const normalized = String(content || "").trim().toLowerCase();
+  if (!normalized) return false;
+  const positive = normalized === "yes" || normalized === "y";
+  const negative = normalized === "no" || normalized === "n";
+  if (!positive && !negative) return false;
+
+  sessionConceptSuggestions.delete(sessionId);
+
+  if (positive) {
+    const note = findNoteCard(suggestion.noteId);
+    const concept = findConceptCard(suggestion.conceptKey);
+    if (!note || !concept) {
+      const reply = `I couldn't complete that link for note ${suggestion.noteId}.`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      emitEventLog(ws, "concept_link", { noteId: suggestion.noteId, key: suggestion.conceptKey, accepted: false, reason: "missing_note_or_concept" });
+      return true;
+    }
+    const result = addConceptEdge(note.id, suggestion.conceptKey);
+    const title = concept.title || suggestion.conceptKey;
+    const reply = result.added
+      ? `Linked note ${note.id} to concept "${title}".`
+      : `Note ${note.id} is already linked to concept "${title}".`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "concept_link", { noteId: note.id, key: suggestion.conceptKey, accepted: true });
+    return true;
+  }
+
+  if (negative) {
+    const reply = `Okay, not linking note ${suggestion.noteId} to concept ${suggestion.conceptKey}.`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "concept_link", { noteId: suggestion.noteId, key: suggestion.conceptKey, accepted: false });
+    return true;
+  }
+
+  return false;
+}
+
+function handleConceptCommand(ws, sessionId, content) {
+  const raw = String(content || "").trim();
+  if (!raw) return false;
+
+  const promoteMatch = raw.match(/^promote\s+concept\s+([^:]+):\s*(.+)$/i);
+  if (promoteMatch) {
+    const keyRaw = promoteMatch[1].trim();
+    let title = promoteMatch[2].trim();
+    if ((title.startsWith("\"") && title.endsWith("\"")) || (title.startsWith("'") && title.endsWith("'"))) {
+      title = title.slice(1, -1).trim();
+    }
+    const normalizedKey = normalizeConceptKey(keyRaw);
+    if (!normalizedKey || !title) {
+      const reply = "I need a concept key and title to promote it.";
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const existing = findConceptCard(normalizedKey);
+    if (existing) {
+      const reply = `Concept "${existing.title || normalizedKey}" already exists.`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+
+    const metadata = inferConceptMetadata(normalizedKey);
+    const now = Date.now();
+    const conceptCard = {
+      ...ConceptCard,
+      key: normalizedKey,
+      title,
+      tags: metadata.tags,
+      entities: metadata.entities,
+      confidence: metadata.confidence,
+      ts: now,
+      last_used: null,
+      created_at: now,
+      ttl_days: null
+    };
+
+    const id = persistCard(conceptCard);
+    if (!id) {
+      const reply = "I couldn't save that concept.";
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+
+    invalidateConceptCache();
+    logCardWrite({ ts: now, type: "concept", topic: normalizedKey, score: metadata.confidence, reason: "promote" });
+    const reply = `Promoted concept "${title}" (${normalizedKey}).`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply, concept: { key: normalizedKey, title, id } }));
+    return true;
+  }
+
+  const linkMatch = raw.match(/^link\s+note\s+([a-z0-9-]+)\s*->\s*concept\s+([\w\-./:]+)$/i);
+  if (linkMatch) {
+    const noteId = linkMatch[1].trim();
+    const conceptKeyRaw = linkMatch[2].trim();
+    const conceptKey = normalizeConceptKey(conceptKeyRaw);
+    const note = findNoteCard(noteId);
+    if (!note) {
+      const reply = `I couldn't find note ${noteId}.`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const concept = findConceptCard(conceptKey);
+    if (!concept) {
+      const reply = `I don't have concept ${conceptKeyRaw}.`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const result = addConceptEdge(noteId, conceptKey);
+    const suggestion = sessionConceptSuggestions.get(sessionId);
+    if (suggestion && suggestion.noteId === noteId && suggestion.conceptKey === conceptKey) {
+      sessionConceptSuggestions.delete(sessionId);
+    }
+    const title = concept.title || conceptKey;
+    const reply = result.added
+      ? `Linked note ${noteId} to concept "${title}".`
+      : `Note ${noteId} is already linked to concept "${title}".`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "concept_link", { noteId, key: conceptKey, accepted: true, via: "command" });
+    return true;
+  }
+
+  const unlinkMatch = raw.match(/^unlink\s+note\s+([a-z0-9-]+)\s*->\s*concept\s+([\w\-./:]+)$/i);
+  if (unlinkMatch) {
+    const noteId = unlinkMatch[1].trim();
+    const conceptKeyRaw = unlinkMatch[2].trim();
+    const conceptKey = normalizeConceptKey(conceptKeyRaw);
+    const concept = findConceptCard(conceptKey);
+    if (!concept) {
+      const reply = `I don't have concept ${conceptKeyRaw}.`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const removed = removeConceptEdge(noteId, conceptKey);
+    const reply = removed
+      ? `Unlinked note ${noteId} from concept "${concept.title || conceptKey}".`
+      : `Note ${noteId} wasn't linked to concept "${concept.title || conceptKey}".`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "concept_link", { noteId, key: conceptKey, accepted: false, via: "command" });
+    return true;
+  }
+
+  if (/^concepts\s*$/i.test(raw)) {
+    const concepts = getConceptCards();
+    if (!concepts.length) {
+      const reply = "No concepts saved.";
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const lines = concepts
+      .map(card => {
+        const key = card?.key || "";
+        const title = card?.title || key;
+        return `- ${title} (${key})`;
+      })
+      .join("\n");
+    const reply = `Concepts:\n${lines}`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    return true;
+  }
+
+  const notesMatch = raw.match(/^notes\s+([\w\-./:]+)\s*$/i);
+  if (notesMatch) {
+    const conceptKeyRaw = notesMatch[1].trim();
+    const conceptKey = normalizeConceptKey(conceptKeyRaw);
+    const concept = findConceptCard(conceptKey);
+    if (!concept) {
+      const reply = `I don't have concept ${conceptKeyRaw}.`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const edges = listConceptEdgesForKey(conceptKey);
+    if (!edges.length) {
+      const reply = `No notes linked to concept "${concept.title || conceptKey}".`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const all = readAllCards();
+    const noteLookup = new Map();
+    for (const card of all) {
+      if (card?.type === "note" && card?.id) {
+        noteLookup.set(card.id, card);
+      }
+    }
+    const lines = [];
+    const sorted = edges.slice().sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
+    for (const edge of sorted) {
+      const note = noteLookup.get(edge.note_id);
+      if (!note) continue;
+      const host = resolveNoteHost(note) || "(no host)";
+      const age = formatAgeLabel(noteTimestamp(note) ?? edge.ts);
+      const summary = formatCardOneLiner(note);
+      lines.push(`- ${note.id} | ${host} | ${age} | ${summary}`);
+    }
+    const reply = lines.length
+      ? `Notes for concept "${concept.title || conceptKey}" (${conceptKey}):\n${lines.join("\n")}`
+      : `No notes linked to concept "${concept.title || conceptKey}".`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    return true;
+  }
+
+  return false;
 }
 
 function formatCardOneLiner(card) {
@@ -1601,6 +2033,7 @@ wss.on("connection", (ws, req) => {
           : `note_saved: "${ackTopic || result.card.topic}"`;
         appendMessage(sessionId, { role: "assistant", content: successMsg });
         ws.send(JSON.stringify({ type: "assistant_message", content: successMsg }));
+        maybeSuggestConceptLink(ws, sessionId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
         }
@@ -1631,6 +2064,7 @@ wss.on("connection", (ws, req) => {
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
+        maybeSuggestConceptLink(ws, sessionId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
         }
@@ -1697,6 +2131,18 @@ wss.on("connection", (ws, req) => {
     };
 
     appendMessage(sessionId, { role: "user", content });
+
+    if (handleConceptSuggestionResponse(ws, sessionId, trimmedContent)) {
+      flushCardUsage();
+      sendFreshnessEvent();
+      return;
+    }
+
+    if (handleConceptCommand(ws, sessionId, trimmedContent)) {
+      flushCardUsage();
+      sendFreshnessEvent();
+      return;
+    }
 
     if (isGreeting(content) && !inReplyToGap) {
       const reply = "Hi! What do you need help with?";
@@ -2498,6 +2944,7 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
+        maybeSuggestConceptLink(ws, meta.sessionId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
         }
