@@ -150,6 +150,25 @@ export const ConceptCard = {
   last_used: null
 };
 
+export const AnalogyCard = {
+  type: "analogy",
+  from: "",
+  to: "",
+  topic: "",
+  mapping: { partyA: "", partyB: "", facet: [] },
+  why: [],
+  watchout: [],
+  status: "proposed",
+  ts: 0,
+  summary: "",
+  tags: [],
+  entities: [],
+  confidence: 0.6,
+  last_used: 0,
+  created_at: 0,
+  value: {}
+};
+
 const conceptPresets = new Map([
   ["openai/amd/deal", {
     entities: ["openai", "amd"],
