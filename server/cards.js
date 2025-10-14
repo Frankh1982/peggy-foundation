@@ -951,6 +951,18 @@ export function getLinkedNotes(key, { limit = 5 } = {}) {
   return notes.slice(0, limited.length);
 }
 
+export function getConceptSignature(key, { limit = 5, minNotes = 1 } = {}) {
+  const normalizedKey = normalizeParty(key);
+  if (!normalizedKey) {
+    return { key: "", notes: [], signature: { parties: [], facets: [] } };
+  }
+  const noteLimit = Math.max(1, Number(limit) || 5);
+  const notes = getLinkedNotes(normalizedKey, { limit: noteLimit });
+  const minimum = Math.max(1, Number(minNotes) || 1);
+  const signature = notes.length >= minimum ? extractFacetsFromNotes(notes) : { parties: [], facets: [] };
+  return { key: normalizedKey, notes, signature };
+}
+
 export function scoreAnalogy(sourceSig = {}, targetSig = {}) {
   const sourceFacets = new Set(Array.isArray(sourceSig.facets) ? sourceSig.facets : []);
   const targetFacets = new Set(Array.isArray(targetSig.facets) ? targetSig.facets : []);
