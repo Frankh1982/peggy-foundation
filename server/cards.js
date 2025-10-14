@@ -156,16 +156,73 @@ const stopwords = new Set([
   "a",
   "an",
   "and",
-  "or"
+  "or",
+  "give",
+  "me",
+  "update",
+  "sentence",
+  "two"
 ]);
 
 const synonymPatterns = [
   { pattern: /\bopen\s*ai\b/g, replacement: "openai" },
   { pattern: /\badvanced\s+micro\s+devices\b/g, replacement: "amd" },
-  { pattern: /\bopenai\b/g, replacement: "openai" },
-  { pattern: /\bamd\b/g, replacement: "amd" },
-  { pattern: /\bdeal\b|\bagreement\b|\bpartnership\b/g, replacement: "deal" }
+  { pattern: /\bagreement\b|\bpartnership\b/g, replacement: "deal" }
 ];
+
+function sanitizeKind(kind, fallback = "news") {
+  const raw = String(kind ?? "").toLowerCase();
+  const cleaned = raw.replace(/[^a-z0-9]+/g, "");
+  if (cleaned) return cleaned;
+  return String(fallback ?? "news").replace(/[^a-z0-9]+/g, "") || "news";
+}
+
+function canonicalTopicTokens(text) {
+  if (text === undefined || text === null) return [];
+  let working = String(text).toLowerCase();
+  if (!working.trim()) return [];
+
+  working = working.replace(/^[^a-z0-9]+/, "");
+  working = working.replace(/[\/]+/g, " ");
+  working = working.replace(/[^a-z0-9\s]+/g, " ");
+
+  for (const { pattern, replacement } of synonymPatterns) {
+    working = working.replace(pattern, ` ${replacement} `);
+  }
+
+  working = working.replace(/\s+/g, " ").trim();
+  if (!working) return [];
+
+  const seen = new Set();
+  const tokens = [];
+  for (const token of working.split(" ")) {
+    const trimmed = token.trim();
+    if (!trimmed || stopwords.has(trimmed)) continue;
+    if (/^\d+$/.test(trimmed)) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    tokens.push(trimmed);
+  }
+  return tokens;
+}
+
+export function normalizeTopicKey(text, kind = "news") {
+  const raw = String(text ?? "");
+  if (!raw.trim()) return "";
+
+  let inferredKind = kind;
+  let body = raw;
+  const match = raw.match(/^\s*([a-z0-9]+):/i);
+  if (match) {
+    inferredKind = match[1];
+    body = raw.slice(match[0].length);
+  }
+
+  const tokens = canonicalTopicTokens(body);
+  if (!tokens.length) return "";
+  const topicKind = sanitizeKind(inferredKind);
+  return `${topicKind}:${tokens.join("/")}`;
+}
 
 function ensureStorage() {
   fs.mkdirSync(cardsDir, { recursive: true });
@@ -191,30 +248,33 @@ function writeLines(file, lines) {
 }
 
 export function normalizeTopic(text, { prefix = "" } = {}) {
-  const raw = String(text || "").toLowerCase();
+  const raw = String(text ?? "");
   if (!raw.trim()) return "";
-  let normalized = raw;
-  for (const { pattern, replacement } of synonymPatterns) {
-    normalized = normalized.replace(pattern, ` ${replacement} `);
+
+  let body = raw;
+  let existingKind = "";
+  const match = raw.match(/^\s*([a-z0-9]+):/i);
+  if (match) {
+    existingKind = match[1];
+    body = raw.slice(match[0].length);
   }
-  normalized = normalized.replace(/[^a-z0-9\s]+/g, " ");
-  normalized = normalized.replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  const seen = new Set();
-  const tokens = normalized
-    .split(" ")
-    .map(t => t.trim())
-    .filter(Boolean)
-    .filter(token => !stopwords.has(token))
-    .filter(token => {
-      if (seen.has(token)) return false;
-      seen.add(token);
-      return true;
-    });
+
+  const tokens = canonicalTopicTokens(body);
   if (!tokens.length) return "";
-  const body = tokens.join("/");
-  if (!body) return "";
-  return prefix ? `${prefix}:${body}` : body;
+
+  if (prefix) {
+    const sanitized = sanitizeKind(prefix);
+    return sanitized ? `${sanitized}:${tokens.join("/")}` : tokens.join("/");
+  }
+
+  if (existingKind) {
+    const sanitized = sanitizeKind(existingKind);
+    if (sanitized) {
+      return `${sanitized}:${tokens.join("/")}`;
+    }
+  }
+
+  return tokens.join("/");
 }
 
 export function writeCard(card) {
@@ -267,7 +327,7 @@ function addToIndex(map, key, id) {
 export function updateIndex(card) {
   if (!card || !card.id) return;
   const index = loadIndex();
-  const topicKey = normalizeTopic(card.topic || "");
+  const topicKey = normalizeTopicKey(card.topic || "");
   if (topicKey) addToIndex(index.topics, topicKey, card.id);
   if (Array.isArray(card.tags)) {
     for (const tag of card.tags) {
@@ -302,7 +362,7 @@ export function readAllCards() {
 }
 
 export function getTopByTopic(topic, { limit = 3 } = {}) {
-  const normalizedTopic = normalizeTopic(topic);
+  const normalizedTopic = normalizeTopicKey(topic);
   if (!normalizedTopic) return [];
   const index = loadIndex();
   const ids = index.topics[normalizedTopic] || [];
@@ -361,63 +421,57 @@ export function touch(cardId) {
   }
 }
 
-export function repairAmdOpenaiDealIndex({ logger = console } = {}) {
+export function reindexTopicKeys({ logger = console } = {}) {
   const index = loadIndex();
   const topicIndex = index.topics || {};
-  const destinationKey = "news:openai/amd/deal";
-  const patterns = [
-    /^topic\s+openai\s+amd\s+deal$/i,
-    /^amd\s+openai\s+deal$/i,
-    /^topic\s+what\s+s\s+latest\s+on$/i
-  ];
-
-  const fromKeys = [];
-  const movedIds = new Set();
-  let modified = false;
+  const moves = new Map();
 
   for (const key of Object.keys(topicIndex)) {
-    if (!key) continue;
-    if (!patterns.some(pattern => pattern.test(key))) continue;
-
+    const canonical = normalizeTopicKey(key || "");
+    if (!canonical || canonical === key) continue;
+    const bucket = moves.get(canonical) || { from: [], ids: new Set() };
+    bucket.from.push(key);
     const ids = Array.isArray(topicIndex[key]) ? topicIndex[key] : [];
     for (const id of ids) {
-      if (id) {
-        movedIds.add(id);
+      if (id) bucket.ids.add(id);
+    }
+    moves.set(canonical, bucket);
+  }
+
+  if (!moves.size) return [];
+
+  const logs = [];
+  let modified = false;
+
+  for (const [canonical, info] of moves.entries()) {
+    const destination = Array.isArray(topicIndex[canonical]) ? new Set(topicIndex[canonical]) : new Set();
+    for (const id of info.ids) {
+      if (!id) continue;
+      if (!destination.has(id)) {
+        destination.add(id);
       }
     }
-    fromKeys.push(key);
-    delete topicIndex[key];
-    modified = true;
-  }
-
-  const destination = Array.isArray(topicIndex[destinationKey]) ? [...topicIndex[destinationKey]] : [];
-  const seen = new Set(destination);
-  for (const id of movedIds) {
-    if (id && !seen.has(id)) {
-      destination.push(id);
-      seen.add(id);
-      modified = true;
+    topicIndex[canonical] = Array.from(destination);
+    for (const fromKey of info.from) {
+      if (fromKey !== canonical) {
+        delete topicIndex[fromKey];
+      }
     }
-  }
-
-  if (destination.length) {
-    topicIndex[destinationKey] = destination;
-  } else if (!topicIndex[destinationKey]) {
-    delete topicIndex[destinationKey];
+    modified = true;
+    const payload = { moved: info.ids.size, from: info.from, to: canonical };
+    logs.push(payload);
+    if (logger && typeof logger.info === "function") {
+      logger.info("cards_reindex", payload);
+    } else if (logger && typeof logger.log === "function") {
+      logger.log("cards_reindex", payload);
+    } else {
+      console.log("cards_reindex", payload);
+    }
   }
 
   if (modified) {
     saveIndex(index);
   }
 
-  const logPayload = { moved: movedIds.size, from: fromKeys, to: destinationKey };
-  if (logger && typeof logger.info === "function") {
-    logger.info("cards_reindex", logPayload);
-  } else if (logger && typeof logger.log === "function") {
-    logger.log("cards_reindex", logPayload);
-  } else {
-    console.log("cards_reindex", logPayload);
-  }
-
-  return logPayload;
+  return logs;
 }
