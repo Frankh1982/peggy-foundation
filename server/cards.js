@@ -139,6 +139,54 @@ export const ClaimCard = {
   created_at: 0
 };
 
+export const ConceptCard = {
+  type: "concept",
+  key: "",
+  title: "",
+  tags: [],
+  entities: [],
+  confidence: 0.7,
+  ts: 0,
+  last_used: null
+};
+
+const conceptPresets = new Map([
+  ["openai/amd/deal", {
+    entities: ["openai", "amd"],
+    tags: ["deal", "ai-chips"],
+    confidence: 0.7
+  }]
+]);
+
+function dedupeStrings(values = []) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) continue;
+    const lower = trimmed.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+export function inferConceptMetadata(key) {
+  const raw = String(key || "").trim().toLowerCase();
+  if (!raw) {
+    return { key: "", entities: [], tags: [], confidence: 0.6 };
+  }
+  const preset = conceptPresets.get(raw) || {};
+  const segments = raw.split(/[\/]+/).map(part => part.trim()).filter(Boolean);
+  const defaultEntities = segments.slice(0, Math.max(0, segments.length - 1));
+  const defaultTags = segments.length ? [segments[segments.length - 1]] : [];
+  const entities = dedupeStrings(Array.isArray(preset.entities) ? preset.entities : defaultEntities);
+  const tags = dedupeStrings(Array.isArray(preset.tags) ? preset.tags : defaultTags);
+  const confidence = Number.isFinite(preset.confidence) ? preset.confidence : 0.6;
+  return { key: raw, entities, tags, confidence };
+}
+
 const stopwords = new Set([
   "what",
   "s",
@@ -284,8 +332,8 @@ export function writeCard(card) {
   const record = {
     ...card,
     id,
-    created_at: card.created_at ?? now,
-    last_used: card.last_used ?? now
+    created_at: Object.prototype.hasOwnProperty.call(card, "created_at") ? card.created_at : now,
+    last_used: Object.prototype.hasOwnProperty.call(card, "last_used") ? card.last_used : now
   };
   fs.appendFileSync(cardsFile, JSON.stringify(record) + "\n");
   return { id };
