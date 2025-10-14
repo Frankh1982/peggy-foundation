@@ -148,6 +148,9 @@ const sessionTopicState = new Map();
 const sessionTopicSeenHosts = new Map();
 const sessionLastSummary = new Map();
 const sessionLastList = new Map();
+const sessionLastSavedNote = new Map();
+const sessionNoteLists = new Map();
+const sessionConceptSuggestionCooldown = new Map();
 const sessionAutoResearchContext = new Map();
 const sessionAutoResearchNoteCount = new Map();
 const sessionLastKdnState = new Map();
@@ -265,6 +268,83 @@ function setLastListContext(sessionId, { topicKey, qBase, items }) {
 function getLastListContext(sessionId) {
   if (!sessionId) return null;
   return sessionLastList.get(sessionId) || null;
+}
+
+function rememberLastSavedNoteId(sessionId, noteId) {
+  if (!sessionId) return;
+  const cleanId = String(noteId || "").trim();
+  if (!cleanId) return;
+  sessionLastSavedNote.set(sessionId, { noteId: cleanId, ts: Date.now() });
+}
+
+function getLastSavedNoteId(sessionId) {
+  if (!sessionId) return null;
+  const entry = sessionLastSavedNote.get(sessionId);
+  if (!entry || !entry.noteId) return null;
+  return entry.noteId;
+}
+
+function setLastNoteList(sessionId, entries, { context = "" } = {}) {
+  if (!sessionId) return;
+  const normalized = Array.isArray(entries)
+    ? entries
+        .map(entry => {
+          const noteId = String(entry?.noteId || entry?.id || entry || "").trim();
+          if (!noteId) return null;
+          return { noteId };
+        })
+        .filter(Boolean)
+    : [];
+  if (!normalized.length) {
+    sessionNoteLists.delete(sessionId);
+    return;
+  }
+  sessionNoteLists.set(sessionId, {
+    entries: normalized,
+    context: String(context || "").trim(),
+    ts: Date.now()
+  });
+}
+
+function getLastNoteList(sessionId) {
+  if (!sessionId) return null;
+  const record = sessionNoteLists.get(sessionId);
+  if (!record || !Array.isArray(record.entries) || !record.entries.length) return null;
+  const maxAgeMs = 15 * 60 * 1000;
+  if (Number.isFinite(record.ts) && Date.now() - record.ts > maxAgeMs) {
+    sessionNoteLists.delete(sessionId);
+    return null;
+  }
+  return record;
+}
+
+function registerSuggestionCooldown(sessionId, { noteId, conceptKey }) {
+  if (!sessionId) return;
+  const cleanId = String(noteId || "").trim();
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  if (!cleanId || !normalizedKey) return;
+  sessionConceptSuggestionCooldown.set(sessionId, {
+    noteId: cleanId,
+    conceptKey: normalizedKey,
+    ts: Date.now()
+  });
+}
+
+function consumeSuggestionCooldown(sessionId, noteId, conceptKey) {
+  if (!sessionId) return false;
+  const entry = sessionConceptSuggestionCooldown.get(sessionId);
+  if (!entry) return false;
+  const tooOld = Number.isFinite(entry.ts) && Date.now() - entry.ts > 2 * 60 * 1000;
+  if (tooOld) {
+    sessionConceptSuggestionCooldown.delete(sessionId);
+    return false;
+  }
+  const matches = entry.noteId === String(noteId || "").trim() && entry.conceptKey === normalizeConceptKey(conceptKey);
+  if (matches) {
+    sessionConceptSuggestionCooldown.delete(sessionId);
+    return true;
+  }
+  return false;
 }
 
 function getStoredListContext(sessionId) {
@@ -886,6 +966,9 @@ function maybeSuggestConceptLink(ws, sessionId, noteCard) {
   if (existing && existing.noteId === noteCard.id && existing.conceptKey === conceptKey) {
     return;
   }
+  if (consumeSuggestionCooldown(sessionId, noteCard.id, conceptKey)) {
+    return;
+  }
 
   const suggestion = {
     noteId: noteCard.id,
@@ -928,6 +1011,9 @@ function handleConceptSuggestionResponse(ws, sessionId, content) {
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
     emitEventLog(ws, "concept_link", { noteId: note.id, key: suggestion.conceptKey, accepted: true });
+    if (result.added) {
+      registerSuggestionCooldown(sessionId, { noteId: note.id, conceptKey: suggestion.conceptKey });
+    }
     return true;
   }
 
@@ -940,6 +1026,53 @@ function handleConceptSuggestionResponse(ws, sessionId, content) {
   }
 
   return false;
+}
+
+function linkNoteToConcept(ws, sessionId, noteId, conceptKeyRaw, { via = "command" } = {}) {
+  const cleanId = String(noteId || "").trim();
+  if (!cleanId) {
+    const reply = "I need a note id to link.";
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    return true;
+  }
+  const conceptKey = normalizeConceptKey(conceptKeyRaw);
+  if (!conceptKey) {
+    const reply = "I need a concept key to link that note.";
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    return true;
+  }
+  const note = findNoteCard(cleanId);
+  if (!note) {
+    const reply = `I couldn't find note ${cleanId}.`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    return true;
+  }
+  const concept = findConceptCard(conceptKey);
+  if (!concept) {
+    const reply = `I don't have concept ${conceptKeyRaw}.`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    return true;
+  }
+  const result = addConceptEdge(cleanId, conceptKey);
+  const suggestion = sessionConceptSuggestions.get(sessionId);
+  if (suggestion && suggestion.noteId === cleanId && suggestion.conceptKey === conceptKey) {
+    sessionConceptSuggestions.delete(sessionId);
+  }
+  if (result.added) {
+    registerSuggestionCooldown(sessionId, { noteId: cleanId, conceptKey });
+  }
+  const title = concept.title || conceptKey;
+  const reply = result.added
+    ? `Linked note ${cleanId} to concept "${title}".`
+    : `Note ${cleanId} is already linked to concept "${title}".`;
+  appendMessage(sessionId, { role: "assistant", content: reply });
+  ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+  emitEventLog(ws, "concept_link", { noteId: cleanId, key: conceptKey, accepted: true, via });
+  return true;
 }
 
 function canonicalConceptKeyFromTopic(value) {
@@ -1309,41 +1442,48 @@ function handleConceptCommand(ws, sessionId, content) {
     return true;
   }
 
-  const linkMatch = raw.match(/^link\s+note\s+([a-z0-9-]+)\s*->\s*concept\s+([\w\-./:]+)$/i);
+  const linkLastMatch = raw.match(/^link\s+last_note\s*->\s*concept\s+([\w\-./:]+)$/i);
+  if (linkLastMatch) {
+    const lastNoteId = getLastSavedNoteId(sessionId);
+    if (!lastNoteId) {
+      const reply = "I don't have a recently saved note in this session.";
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const conceptKeyRaw = linkLastMatch[1].trim();
+    return linkNoteToConcept(ws, sessionId, lastNoteId, conceptKeyRaw, { via: "last_note" });
+  }
+
+  const linkIndexMatch = raw.match(/^link\s+note\s+#(\d+)\s*->\s*concept\s+([\w\-./:]+)$/i);
+  if (linkIndexMatch) {
+    const list = getLastNoteList(sessionId);
+    if (!list) {
+      const reply = "I don't have a recent note list to use for that link.";
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const index = Number.parseInt(linkIndexMatch[1], 10);
+    if (!Number.isFinite(index) || index < 1 || index > list.entries.length) {
+      const reply = `Note #${linkIndexMatch[1]} isn't in the most recent list.`;
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    const conceptKeyRaw = linkIndexMatch[2].trim();
+    const target = list.entries[index - 1];
+    return linkNoteToConcept(ws, sessionId, target.noteId, conceptKeyRaw, { via: "list_index" });
+  }
+
+  const linkMatch = raw.match(/^link\s+note\s+([\w-]+)\s*->\s*concept\s+([\w\-./:]+)$/i);
   if (linkMatch) {
     const noteId = linkMatch[1].trim();
     const conceptKeyRaw = linkMatch[2].trim();
-    const conceptKey = normalizeConceptKey(conceptKeyRaw);
-    const note = findNoteCard(noteId);
-    if (!note) {
-      const reply = `I couldn't find note ${noteId}.`;
-      appendMessage(sessionId, { role: "assistant", content: reply });
-      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-      return true;
-    }
-    const concept = findConceptCard(conceptKey);
-    if (!concept) {
-      const reply = `I don't have concept ${conceptKeyRaw}.`;
-      appendMessage(sessionId, { role: "assistant", content: reply });
-      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-      return true;
-    }
-    const result = addConceptEdge(noteId, conceptKey);
-    const suggestion = sessionConceptSuggestions.get(sessionId);
-    if (suggestion && suggestion.noteId === noteId && suggestion.conceptKey === conceptKey) {
-      sessionConceptSuggestions.delete(sessionId);
-    }
-    const title = concept.title || conceptKey;
-    const reply = result.added
-      ? `Linked note ${noteId} to concept "${title}".`
-      : `Note ${noteId} is already linked to concept "${title}".`;
-    appendMessage(sessionId, { role: "assistant", content: reply });
-    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-    emitEventLog(ws, "concept_link", { noteId, key: conceptKey, accepted: true, via: "command" });
-    return true;
+    return linkNoteToConcept(ws, sessionId, noteId, conceptKeyRaw, { via: "command" });
   }
 
-  const unlinkMatch = raw.match(/^unlink\s+note\s+([a-z0-9-]+)\s*->\s*concept\s+([\w\-./:]+)$/i);
+  const unlinkMatch = raw.match(/^unlink\s+note\s+([\w-]+)\s*->\s*concept\s+([\w\-./:]+)$/i);
   if (unlinkMatch) {
     const noteId = unlinkMatch[1].trim();
     const conceptKeyRaw = unlinkMatch[2].trim();
@@ -1386,6 +1526,36 @@ function handleConceptCommand(ws, sessionId, content) {
     return true;
   }
 
+  const recentNotesMatch = /^notes\s+recent$/i.test(raw);
+  if (recentNotesMatch) {
+    const all = readAllCards();
+    const notes = all.filter(card => card?.type === "note" && card?.id);
+    if (!notes.length) {
+      const reply = "I don't have any saved notes yet.";
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      return true;
+    }
+    notes.sort((a, b) => {
+      const tsA = noteTimestamp(a) || 0;
+      const tsB = noteTimestamp(b) || 0;
+      if (tsA !== tsB) return tsB - tsA;
+      return (a.id || "").localeCompare(b.id || "");
+    });
+    const slice = notes.slice(0, 5);
+    const lines = slice.map((note, idx) => {
+      const topicLabel = preferBucketedTopicLabel(note.topic) || note.topic || "(no topic)";
+      const host = resolveNoteHost(note) || "(no host)";
+      const summary = formatCardOneLiner(note);
+      return `${idx + 1}. ${note.id} | ${topicLabel} | ${host} | ${summary}`;
+    });
+    const reply = `Recent notes:\n${lines.join("\n")}`;
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    setLastNoteList(sessionId, slice.map(note => ({ noteId: note.id })), { context: "recent" });
+    return true;
+  }
+
   const notesMatch = raw.match(/^notes\s+([\w\-./:]+)\s*$/i);
   if (notesMatch) {
     const conceptKeyRaw = notesMatch[1].trim();
@@ -1413,19 +1583,25 @@ function handleConceptCommand(ws, sessionId, content) {
     }
     const lines = [];
     const sorted = edges.slice().sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
-    for (const edge of sorted) {
+    const collected = [];
+    for (let idx = 0; idx < sorted.length; idx += 1) {
+      const edge = sorted[idx];
       const note = noteLookup.get(edge.note_id);
       if (!note) continue;
       const host = resolveNoteHost(note) || "(no host)";
       const age = formatAgeLabel(noteTimestamp(note) ?? edge.ts);
       const summary = formatCardOneLiner(note);
-      lines.push(`- ${note.id} | ${host} | ${age} | ${summary}`);
+      lines.push(`${idx + 1}. ${note.id} | ${host} | ${age} | ${summary}`);
+      collected.push({ noteId: note.id });
     }
     const reply = lines.length
       ? `Notes for concept "${concept.title || conceptKey}" (${conceptKey}):\n${lines.join("\n")}`
       : `No notes linked to concept "${concept.title || conceptKey}".`;
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    if (lines.length) {
+      setLastNoteList(sessionId, collected, { context: conceptKey });
+    }
     return true;
   }
 
@@ -2486,11 +2662,16 @@ wss.on("connection", (ws, req) => {
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
+        const noteId = result.card?.id ? String(result.card.id).trim() : "";
+        const idSuffix = noteId ? ` id:${noteId}` : "";
         const successMsg = savedListIndex !== null
-          ? `note_saved: "${ackTopic}" (#${savedListIndex})`
-          : `note_saved: "${ackTopic || result.card.topic}"`;
+          ? `note_saved: "${ackTopic}" (#${savedListIndex})${idSuffix ? ` ${idSuffix}` : ""}`
+          : `note_saved: "${ackTopic || result.card.topic}"${idSuffix ? ` ${idSuffix}` : ""}`;
         appendMessage(sessionId, { role: "assistant", content: successMsg });
         ws.send(JSON.stringify({ type: "assistant_message", content: successMsg }));
+        if (noteId) {
+          rememberLastSavedNoteId(sessionId, noteId);
+        }
         maybeSuggestConceptLink(ws, sessionId, result.card);
         maybeProposeAnalogy(ws, sessionId, userId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
@@ -2523,6 +2704,9 @@ wss.on("connection", (ws, req) => {
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
+        if (result.card?.id) {
+          rememberLastSavedNoteId(sessionId, result.card.id);
+        }
         maybeSuggestConceptLink(ws, sessionId, result.card);
         maybeProposeAnalogy(ws, sessionId, userId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
@@ -3516,6 +3700,9 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
           type: "note_saved",
           note: { topic: result.card.topic, score: Number(result.score ?? 0) }
         }));
+        if (result.card?.id) {
+          rememberLastSavedNoteId(meta.sessionId, result.card.id);
+        }
         maybeSuggestConceptLink(ws, meta.sessionId, result.card);
         maybeProposeAnalogy(ws, meta.sessionId, meta.userId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
