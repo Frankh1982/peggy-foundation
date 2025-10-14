@@ -412,7 +412,10 @@ async function maybeRunAutoResearch({
   isSearchCommand,
   summarizeCommand,
   hasUrl,
-  inReplyToGap
+  inReplyToGap,
+  conceptContextBlock = "",
+  conceptContextKey = "",
+  conceptContextCount = 0
 }) {
   if (!sessionId || !userId) return null;
   if (inReplyToGap) return null;
@@ -470,6 +473,10 @@ async function maybeRunAutoResearch({
 
   try {
     const spec = { tool: "web_search", args };
+    const conceptMeta = {};
+    if (conceptContextBlock) conceptMeta.conceptContextBlock = conceptContextBlock;
+    if (conceptContextKey) conceptMeta.conceptContextKey = conceptContextKey;
+    if (conceptContextCount) conceptMeta.conceptContextCount = conceptContextCount;
     await executeTool(ws, {
       userId,
       sessionId,
@@ -478,7 +485,8 @@ async function maybeRunAutoResearch({
       topic: topicForSearch,
       banditKeys: keysUsed,
       runNumber,
-      autoResearch: true
+      autoResearch: true,
+      ...conceptMeta
     }, "auto_research");
     return { triggered: true, handled: true, context };
   } catch (err) {
@@ -1069,6 +1077,88 @@ function formatCardOneLiner(card) {
   if (!summary) summary = "[no summary]";
   if (summary.length > 160) summary = `${summary.slice(0, 157)}…`;
   return summary;
+}
+
+function buildConceptContextBlock(conceptKey, { limit = 3 } = {}) {
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  if (!normalizedKey) return { block: "", notes: [], key: "" };
+  const edges = listConceptEdgesForKey(normalizedKey);
+  if (!edges.length) return { block: "", notes: [], key: normalizedKey };
+
+  const seenIds = new Set();
+  const noteEntries = [];
+  for (const edge of edges) {
+    const note = findNoteCard(edge.note_id);
+    if (!note || seenIds.has(note.id)) continue;
+    if (note.type && note.type !== "note") continue;
+    seenIds.add(note.id);
+
+    const summary = formatCardOneLiner(note);
+    const tsCandidates = [
+      note.value?.source?.ts,
+      note.last_used,
+      note.created_at,
+      edge.ts
+    ];
+    let ts = 0;
+    for (const candidate of tsCandidates) {
+      const numeric = Number(candidate);
+      if (Number.isFinite(numeric) && numeric > ts) {
+        ts = numeric;
+      }
+    }
+    noteEntries.push({ note, summary, ts });
+  }
+
+  if (!noteEntries.length) return { block: "", notes: [], key: normalizedKey };
+
+  noteEntries.sort((a, b) => {
+    const tsDiff = (Number(b.ts) || 0) - (Number(a.ts) || 0);
+    if (tsDiff !== 0) return tsDiff;
+    const confDiff = (Number(b.note?.confidence) || 0) - (Number(a.note?.confidence) || 0);
+    if (confDiff !== 0) return confDiff;
+    return (a.note?.id || "").localeCompare(b.note?.id || "");
+  });
+
+  const closing = "\n[/CONCEPT_CONTEXT]";
+  let block = "[CONCEPT_CONTEXT]";
+  const included = [];
+
+  for (const entry of noteEntries) {
+    if (included.length >= limit) break;
+    let lineSummary = entry.summary;
+    if (!lineSummary) continue;
+    let line = `\n- ${lineSummary}`;
+    if (block.length + line.length + closing.length > 400) {
+      const available = 400 - block.length - closing.length - 3; // account for prefix and ellipsis
+      if (available <= 0) break;
+      lineSummary = lineSummary.slice(0, Math.max(0, available)).trim();
+      if (!lineSummary) continue;
+      if (!/[.!?…]$/.test(lineSummary)) {
+        lineSummary = lineSummary.replace(/[\s,;:]+$/, "");
+      }
+      line = `\n- ${lineSummary}`;
+      if (block.length + line.length + closing.length > 400) {
+        continue;
+      }
+    }
+    block += line;
+    included.push({ card: entry.note, summary: entry.summary, line: lineSummary });
+  }
+
+  if (!included.length) return { block: "", notes: [], key: normalizedKey };
+  block += closing;
+  return { block, notes: included, key: normalizedKey };
+}
+
+function ensureSentence(text) {
+  let out = String(text || "").replace(/[\s\r\n]+/g, " ").trim();
+  if (!out) return "";
+  out = out.replace(/\s*[,;:]$/, "");
+  if (!/[.!?]$/.test(out)) {
+    out += ".";
+  }
+  return out;
 }
 
 function buildCardContextBlock(cards, fallbackTopic) {
@@ -1904,6 +1994,9 @@ wss.on("connection", (ws, req) => {
     let freshnessTopicSource = "message";
     let note = null;
     let stale = false;
+    let conceptContextBlock = "";
+    let conceptContextNotes = [];
+    let conceptContextKey = "";
     let freshnessEventSent = false;
     const sendFreshnessEvent = () => {
       if (freshnessEventSent) return;
@@ -2122,6 +2215,60 @@ wss.on("connection", (ws, req) => {
     for (const card of contextCards) {
       touchCardOnce(card);
     }
+    if (!conceptContextBlock) {
+      const candidateKeys = new Set();
+      const pushCandidate = (value) => {
+        const normalized = normalizeConceptKey(value);
+        if (!normalized) return;
+        candidateKeys.add(normalized);
+      };
+      pushCandidate(topic);
+      const normalizedTopicKey = normalizeTopicKey(content, "news");
+      if (normalizedTopicKey) {
+        const colonIdx = normalizedTopicKey.indexOf(":");
+        const body = colonIdx >= 0 ? normalizedTopicKey.slice(colonIdx + 1) : normalizedTopicKey;
+        pushCandidate(body);
+      }
+
+      for (const keyCandidate of candidateKeys) {
+        const context = buildConceptContextBlock(keyCandidate);
+        if (context?.notes?.length) {
+          conceptContextBlock = context.block;
+          conceptContextNotes = context.notes.slice(0, 3);
+          conceptContextKey = context.key || keyCandidate;
+          break;
+        }
+      }
+    }
+
+    if (conceptContextBlock && conceptContextNotes.length) {
+      for (const entry of conceptContextNotes) {
+        if (entry?.card) touchCardOnce(entry.card);
+      }
+      emitEventLog(ws, "concept_context", {
+        key: conceptContextKey,
+        cards_used: conceptContextNotes.length
+      });
+      if (!note) {
+        const conceptNote = conceptContextNotes[0]?.card || null;
+        if (conceptNote) {
+          note = conceptNote;
+          stale = isStale(note, FRESH_TTL_DAYS);
+        }
+      }
+    }
+    const conceptContextMeta = conceptContextBlock
+      ? {
+          conceptContextBlock,
+          conceptContextKey,
+          conceptContextCount: conceptContextNotes.length
+        }
+      : null;
+    const withConceptContext = (meta) => {
+      if (!conceptContextMeta) return meta;
+      return { ...meta, ...conceptContextMeta };
+    };
+
     const flushCardUsage = () => {
       if (cardsUsageLogged) return;
       if (touchedCardIds.size) {
@@ -2250,7 +2397,7 @@ wss.on("connection", (ws, req) => {
       }
       sendFreshnessEvent();
       flushCardUsage();
-      await executeTool(ws, { userId, sessionId, spec, requestText: base, topic: topicForSearch, banditKeys: keysUsed, runNumber });
+      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: base, topic: topicForSearch, banditKeys: keysUsed, runNumber }));
       return;
     }
 
@@ -2260,6 +2407,30 @@ wss.on("connection", (ws, req) => {
 
     const summarizeCommand = /^\s*summarize\s*#\d+\s*$/i.test(content);
     const hasUrl = /https?:\/\/\S+/i.test(content);
+    const wantsTwoSentenceUpdate = TWO_SENTENCE_REGEX.test(content);
+
+    if (!freshCue && !inReplyToGap && wantsTwoSentenceUpdate && conceptContextNotes.length && !listIntent && !isSearchCommand && !summarizeCommand) {
+      const conceptSentences = conceptContextNotes
+        .map(entry => ensureSentence(entry?.summary))
+        .filter(Boolean);
+      let replySentences = conceptSentences.slice(0, 2);
+      if (!replySentences.length) {
+        replySentences = ["I don't have any notes on that yet."];
+      }
+      if (replySentences.length === 1) {
+        replySentences.push("That's all I have in my notes right now.");
+      }
+      const reply = replySentences.slice(0, 2).join(" ");
+      freshnessAction = "concept_note";
+      for (const entry of conceptContextNotes) {
+        if (entry?.card) touchCardOnce(entry.card);
+      }
+      appendMessage(sessionId, { role: "assistant", content: reply });
+      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+      sendFreshnessEvent();
+      flushCardUsage();
+      return;
+    }
 
     let autoResearchOutcome = null;
     try {
@@ -2276,7 +2447,10 @@ wss.on("connection", (ws, req) => {
         isSearchCommand,
         summarizeCommand,
         hasUrl,
-        inReplyToGap
+        inReplyToGap,
+        conceptContextBlock,
+        conceptContextKey,
+        conceptContextCount: conceptContextNotes.length
       });
     } catch (err) {
       console.error("auto_research_invoke_error", err);
@@ -2327,7 +2501,7 @@ wss.on("connection", (ws, req) => {
         const spec = { tool: "web_get", args: { url: urlMatch[0] } };
         sendFreshnessEvent();
         flushCardUsage();
-        await executeTool(ws, { userId, sessionId, spec, requestText: content });
+        await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content }));
         return;
       }
     }
@@ -2377,7 +2551,7 @@ wss.on("connection", (ws, req) => {
       const spec = { tool: "web_get", args: { url: target.url } };
       sendFreshnessEvent();
       flushCardUsage();
-      await executeTool(ws, { userId, sessionId, spec, requestText: content, topic: stored.topic }, "auto");
+      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic: stored.topic }), "auto");
       return;
     }
 
@@ -2431,7 +2605,7 @@ wss.on("connection", (ws, req) => {
       }
       sendFreshnessEvent();
       flushCardUsage();
-      await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
+      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
       return;
     }
 
@@ -2454,15 +2628,18 @@ wss.on("connection", (ws, req) => {
       }
       sendFreshnessEvent();
       flushCardUsage();
-      await executeTool(ws, { userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber });
+      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
       return;
     }
 
     // Default → model
     const profile = getUserProfile(userId);
     let systemPrompt = buildSystemPrompt(profile);
-    if (cardContextBlock) {
-      systemPrompt = `${systemPrompt}\n\n${cardContextBlock}`;
+    const contextBlocks = [];
+    if (cardContextBlock) contextBlocks.push(cardContextBlock);
+    if (conceptContextBlock) contextBlocks.push(conceptContextBlock);
+    if (contextBlocks.length) {
+      systemPrompt = `${systemPrompt}\n\n${contextBlocks.join("\n\n")}`;
     }
     const recent = getTrimmedHistory(sessionId);
     const messages = [
@@ -2782,7 +2959,12 @@ async function executeTool(ws, meta, call_id="auto") {
 async function callModelWithGetResult(ws, meta, run) {
   const { userId, sessionId } = meta;
   const profile = getUserProfile(userId);
-  const systemPrompt = buildSystemPrompt(profile);
+  let systemPrompt = buildSystemPrompt(profile);
+  const contextBlocks = [];
+  if (meta?.conceptContextBlock) contextBlocks.push(meta.conceptContextBlock);
+  if (contextBlocks.length) {
+    systemPrompt = `${systemPrompt}\n\n${contextBlocks.join("\n\n")}`;
+  }
   const recent = getTrimmedHistory(sessionId, { omitAssistantTail: true });
   const doc = cleanAndCapDoc(run?.result?.text || "", MAX_PAGE_CHARS);
 
@@ -2802,7 +2984,12 @@ async function callModelWithGetResult(ws, meta, run) {
 async function callModelWithSearchResults(ws, meta, run) {
   const { userId, sessionId } = meta;
   const profile = getUserProfile(userId);
-  const systemPrompt = buildSystemPrompt(profile);
+  let systemPrompt = buildSystemPrompt(profile);
+  const contextBlocks = [];
+  if (meta?.conceptContextBlock) contextBlocks.push(meta.conceptContextBlock);
+  if (contextBlocks.length) {
+    systemPrompt = `${systemPrompt}\n\n${contextBlocks.join("\n\n")}`;
+  }
   const recent = getTrimmedHistory(sessionId, { omitAssistantTail: true });
   const results = JSON.stringify(run?.result?.results || []);
 
@@ -2868,7 +3055,14 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
       args.qlist = rotateList(args.qlist, runNumber - 1);
     }
     const spec = { tool: "web_search", args };
-    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber });
+    const conceptMeta = meta?.conceptContextBlock
+      ? {
+          conceptContextBlock: meta.conceptContextBlock,
+          conceptContextKey: meta.conceptContextKey || "",
+          conceptContextCount: meta.conceptContextCount || 0
+        }
+      : {};
+    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber, ...conceptMeta });
     return true;
   };
 
@@ -2905,6 +3099,11 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     let spec; try { spec = JSON.parse(call); } catch {}
     if (spec && (spec.tool === "web_get" || spec.tool === "web_search")) {
       const nextMeta = { userId, sessionId, spec };
+      if (meta?.conceptContextBlock) {
+        nextMeta.conceptContextBlock = meta.conceptContextBlock;
+        nextMeta.conceptContextKey = meta.conceptContextKey || "";
+        nextMeta.conceptContextCount = meta.conceptContextCount || 0;
+      }
       if (meta?.autoResearch) nextMeta.autoResearch = true;
       executeTool(ws, nextMeta, meta?.autoResearch ? "auto_research" : "auto");
       return;
