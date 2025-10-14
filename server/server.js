@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { AnalogyCard, ConceptCard, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys } from "./cards.js";
+import { AnalogyCard, ConceptCard, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -1526,16 +1526,6 @@ function buildConceptContextBlock(conceptKey, { limit = 3 } = {}) {
   return { block, notes: included, key: normalizedKey };
 }
 
-function ensureSentence(text) {
-  let out = String(text || "").replace(/[\s\r\n]+/g, " ").trim();
-  if (!out) return "";
-  out = out.replace(/\s*[,;:]$/, "");
-  if (!/[.!?]$/.test(out)) {
-    out += ".";
-  }
-  return out;
-}
-
 function buildCardContextBlock(cards, fallbackTopic) {
   if (!Array.isArray(cards) || !cards.length) {
     return { block: "", included: [] };
@@ -2793,18 +2783,18 @@ wss.on("connection", (ws, req) => {
     const wantsTwoSentenceUpdate = TWO_SENTENCE_REGEX.test(content);
 
     if (!freshCue && !inReplyToGap && wantsTwoSentenceUpdate && conceptContextNotes.length && !listIntent && !isSearchCommand && !summarizeCommand) {
-      const conceptSentences = conceptContextNotes
-        .map(entry => ensureSentence(entry?.summary))
-        .filter(Boolean);
-      let replySentences = conceptSentences.slice(0, 2);
-      if (!replySentences.length) {
-        replySentences = ["I don't have any notes on that yet."];
-      }
-      if (replySentences.length === 1) {
-        replySentences.push("That's all I have in my notes right now.");
-      }
-      const reply = replySentences.slice(0, 2).join(" ");
-      freshnessAction = "concept_note";
+      const conceptCard = conceptContextKey ? findConceptCard(conceptContextKey) : null;
+      const conceptTitle = conceptCard?.title ? String(conceptCard.title).trim() : "";
+      const conceptLabel = conceptTitle || conceptContextKey || "";
+      const enrichedNotes = conceptContextNotes.map(entry => ({
+        ...entry,
+        conceptTitle,
+        conceptKey: conceptContextKey,
+        conceptLabel
+      }));
+      const replyCandidate = twoSentenceFromNotes(enrichedNotes);
+      const reply = replyCandidate || "I don't have any notes on that yet.";
+      freshnessAction = "note";
       for (const entry of conceptContextNotes) {
         if (entry?.card) touchCardOnce(entry.card);
       }

@@ -542,3 +542,211 @@ export function reindexTopicKeys({ logger = console } = {}) {
 
   return logs;
 }
+
+const NUMBER_UNIT_REGEX = /\b\d+(?:\.\d+)?\s?(?:GW|MW|M|B|%)\b/gi;
+const DATE_SNIPPET_REGEX = /\b(?:H1|H2|Q[1-4]|20\d{2})\b/gi;
+const KEY_FACET_REGEX = /\b(?:warrants|stake|deployment|MI\d+)\b/gi;
+
+function ensureSentence(text) {
+  let out = String(text || "").replace(/[\s\r\n]+/g, " ").trim();
+  if (!out) return "";
+  out = out.replace(/[\s,;:]+$/, "");
+  if (!/[.!?]$/.test(out)) {
+    out += ".";
+  }
+  return out;
+}
+
+function extractNoteTimestamp(note) {
+  const candidates = [
+    note?.value?.source?.ts,
+    note?.last_used,
+    note?.created_at,
+    note?.ts
+  ];
+  let best = 0;
+  for (const candidate of candidates) {
+    const numeric = Number(candidate);
+    if (Number.isFinite(numeric) && numeric > best) {
+      best = numeric;
+    }
+  }
+  return best || null;
+}
+
+function formatAgeFromTimestamp(ts) {
+  const numeric = Number(ts);
+  if (!Number.isFinite(numeric) || numeric <= 0) return "?";
+  const diff = Date.now() - numeric;
+  if (!Number.isFinite(diff) || diff < 0) return "0m";
+  const minutes = Math.floor(diff / (60 * 1000));
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 90) return `${days}d`;
+  const months = Math.floor(days / 30);
+  if (months < 24) return `${months}mo`;
+  const years = Math.floor(days / 365);
+  return `${years}y`;
+}
+
+function extractHost(note) {
+  const url = note?.value?.source?.url || note?.value?.url || note?.url;
+  if (!url || typeof url !== "string") return "";
+  try {
+    const parsed = new URL(url);
+    const host = parsed.host || "";
+    return host.replace(/^www\./i, "");
+  } catch {
+    return "";
+  }
+}
+
+function firstSentenceClause(text) {
+  const cleaned = String(text || "").replace(/[\s\r\n]+/g, " ").trim();
+  if (!cleaned) return "";
+  const match = cleaned.match(/[^.!?]+[.!?]?/);
+  let clause = match ? match[0].trim() : cleaned;
+  clause = clause.replace(/[.!?]+$/g, "");
+  return clause;
+}
+
+function truncateClause(text, max) {
+  let clause = String(text || "").trim();
+  if (!clause) return clause;
+  if (clause.length <= max) return clause;
+  clause = clause.slice(0, Math.max(0, max)).trim();
+  clause = clause.replace(/[\s,;:]+$/g, "");
+  return clause;
+}
+
+function collectFacetsFromNotes(notes) {
+  const facets = [];
+  const seen = new Set();
+  const addFacet = (value) => {
+    const trimmed = String(value || "").replace(/[\s\r\n]+/g, " ").trim();
+    if (!trimmed) return;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    facets.push(trimmed);
+  };
+
+  const textBlob = notes
+    .map(entry => {
+      const parts = [];
+      if (typeof entry?.summary === "string") parts.push(entry.summary);
+      if (typeof entry?.card?.summary === "string") parts.push(entry.card.summary);
+      if (typeof entry?.card?.value?.data?.summary === "string") parts.push(entry.card.value.data.summary);
+      return parts.join(" ");
+    })
+    .join(" ");
+
+  if (textBlob) {
+    let match;
+    while ((match = NUMBER_UNIT_REGEX.exec(textBlob))) {
+      let value = match[0].replace(/\s+/g, " ").toUpperCase();
+      value = value.replace(/ %/g, "%");
+      addFacet(value);
+    }
+    NUMBER_UNIT_REGEX.lastIndex = 0;
+
+    while ((match = DATE_SNIPPET_REGEX.exec(textBlob))) {
+      addFacet(match[0].toUpperCase());
+    }
+    DATE_SNIPPET_REGEX.lastIndex = 0;
+
+    while ((match = KEY_FACET_REGEX.exec(textBlob))) {
+      const raw = match[0];
+      const facet = /mi\d+/i.test(raw) ? raw.toUpperCase() : raw.toLowerCase();
+      addFacet(facet);
+    }
+    KEY_FACET_REGEX.lastIndex = 0;
+  }
+
+  return facets.slice(0, 3);
+}
+
+function resolveConceptLabel(notes) {
+  const primary = notes[0] || {};
+  const candidates = [
+    primary.conceptTitle,
+    primary.conceptLabel,
+    primary.conceptKey,
+    primary.card?.value?.data?.concept_title,
+    primary.card?.value?.data?.concept,
+    primary.card?.topic,
+    primary.card?.title
+  ];
+  for (const candidate of candidates) {
+    const value = String(candidate || "").replace(/[\s\r\n]+/g, " ").trim();
+    if (value) return value.slice(0, 80);
+  }
+  return "Concept";
+}
+
+export function twoSentenceFromNotes(notes = []) {
+  if (!Array.isArray(notes) || notes.length === 0) {
+    return "";
+  }
+
+  const entries = notes.slice(0, 3).filter(Boolean);
+  if (!entries.length) return "";
+
+  const primary = entries[0];
+  const conceptLabel = resolveConceptLabel(entries);
+  let summaryClause = firstSentenceClause(primary?.summary || primary?.card?.summary || "");
+  if (!summaryClause) {
+    summaryClause = "No recent notes";
+  }
+
+  const facetsBase = collectFacetsFromNotes(entries);
+  let facets = facetsBase.length ? facetsBase.slice(0, 3) : ["n/a"];
+  const noteCard = primary?.card || {};
+  const host = extractHost(noteCard) || "unknown";
+  const age = formatAgeFromTimestamp(extractNoteTimestamp(noteCard)) || "?";
+  const prefix = `${conceptLabel} update: `;
+
+  const buildSentences = () => {
+    const sentenceOne = ensureSentence(`${prefix}${summaryClause}`);
+    const facetsLabel = facets.length ? facets.join(", ") : "n/a";
+    const sentenceTwo = ensureSentence(`Key facets: ${facetsLabel} — source ${host}, ${age}`);
+    return { sentenceOne, sentenceTwo };
+  };
+
+  let { sentenceOne, sentenceTwo } = buildSentences();
+  let combined = `${sentenceOne} ${sentenceTwo}`.trim();
+
+  while (combined.length > 220 && facets.length > 1) {
+    facets = facets.slice(0, facets.length - 1);
+    ({ sentenceOne, sentenceTwo } = buildSentences());
+    combined = `${sentenceOne} ${sentenceTwo}`.trim();
+  }
+
+  if (combined.length > 220) {
+    const availableForSummary = Math.max(10, 220 - (prefix.length + sentenceTwo.length + 1));
+    summaryClause = truncateClause(summaryClause, availableForSummary);
+    ({ sentenceOne, sentenceTwo } = buildSentences());
+    combined = `${sentenceOne} ${sentenceTwo}`.trim();
+  }
+
+  if (combined.length > 220 && facets.length) {
+    facets = [facets[0]];
+    if (!facets[0] || facets[0] === "n/a") {
+      facets[0] = "n/a";
+    }
+    ({ sentenceOne, sentenceTwo } = buildSentences());
+    combined = `${sentenceOne} ${sentenceTwo}`.trim();
+  }
+
+  if (combined.length > 220) {
+    const availableForSummary = Math.max(5, 220 - (prefix.length + sentenceTwo.length + 1));
+    summaryClause = truncateClause(summaryClause, availableForSummary);
+    ({ sentenceOne, sentenceTwo } = buildSentences());
+    combined = `${sentenceOne} ${sentenceTwo}`.trim();
+  }
+
+  return combined;
+}
