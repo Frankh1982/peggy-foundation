@@ -7,6 +7,7 @@ const cardsDir = path.resolve("data", "cards");
 const indexDir = path.resolve("data", "index");
 const cardsFile = path.join(cardsDir, "cards.jsonl");
 const indexFile = path.join(indexDir, "cards_index.json");
+const conceptEdgesFile = path.join(cardsDir, "edges.jsonl");
 
 const clamp01 = value => {
   const num = Number(value);
@@ -300,6 +301,9 @@ function ensureStorage() {
   if (!fs.existsSync(indexFile)) {
     const emptyIndex = { topics: {}, tags: {}, entities: {} };
     fs.writeFileSync(indexFile, JSON.stringify(emptyIndex, null, 2));
+  }
+  if (!fs.existsSync(conceptEdgesFile)) {
+    fs.writeFileSync(conceptEdgesFile, "");
   }
 }
 
@@ -749,4 +753,164 @@ export function twoSentenceFromNotes(notes = []) {
   }
 
   return combined;
+}
+
+const ANALOGY_FACET_RULES = [
+  {
+    key: "supply",
+    pattern: /\b(?:supply|capacity|reserve|offtake|commit|gpu|chips)\b/i
+  },
+  {
+    key: "warrants",
+    pattern: /\b(?:warrant|option|stake|equity)\b/i
+  },
+  {
+    key: "staged_deploy",
+    pattern: /\b(?:staged|phased|rollout|h1|h2|q[1-4]|20\d{2}|mi\d+)\b/i
+  }
+];
+
+function normalizeParty(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.toLowerCase();
+}
+
+function readConceptEdges() {
+  ensureStorage();
+  if (!fs.existsSync(conceptEdgesFile)) return [];
+  const raw = fs.readFileSync(conceptEdgesFile, "utf8");
+  return raw
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(line => {
+      try {
+        const parsed = JSON.parse(line);
+        const noteId = String(parsed?.note_id || "").trim();
+        const conceptKey = String(parsed?.concept_key || "").trim().toLowerCase();
+        const ts = Number(parsed?.ts);
+        if (!noteId || !conceptKey) return null;
+        return { note_id: noteId, concept_key: conceptKey, ts: Number.isFinite(ts) ? ts : 0 };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+export function extractFacetsFromNotes(notes = []) {
+  const parties = new Set();
+  const facets = new Set();
+  const textChunks = [];
+
+  for (const note of notes || []) {
+    if (!note || typeof note !== "object") continue;
+    const noteEntities = Array.isArray(note.entities) ? note.entities : [];
+    const cardEntities = Array.isArray(note.card?.entities) ? note.card.entities : [];
+    for (const entity of [...noteEntities, ...cardEntities]) {
+      const normalized = normalizeParty(entity);
+      if (normalized) parties.add(normalized);
+    }
+
+    const parts = [];
+    if (typeof note.summary === "string") parts.push(note.summary);
+    if (typeof note.card?.summary === "string") parts.push(note.card.summary);
+    if (typeof note.card?.value?.data?.summary === "string") parts.push(note.card.value.data.summary);
+    if (typeof note.card?.value?.source?.title === "string") parts.push(note.card.value.source.title);
+    if (typeof note.card?.value?.source?.excerpt === "string") parts.push(note.card.value.source.excerpt);
+    if (parts.length) {
+      textChunks.push(parts.join(" "));
+    }
+  }
+
+  if (textChunks.length) {
+    const blob = textChunks.join(" \n ");
+    for (const rule of ANALOGY_FACET_RULES) {
+      if (rule.pattern.test(blob)) {
+        facets.add(rule.key);
+      }
+      rule.pattern.lastIndex = 0;
+    }
+  }
+
+  return {
+    parties: Array.from(parties),
+    facets: Array.from(facets)
+  };
+}
+
+export function getConcept(key) {
+  const normalizedKey = normalizeParty(key);
+  if (!normalizedKey) return null;
+  const all = readAllCards();
+  return (
+    all.find(
+      card =>
+        card?.type === "concept" && normalizeParty(card?.key) === normalizedKey
+    ) || null
+  );
+}
+
+export function getLinkedNotes(key, { limit = 5 } = {}) {
+  const normalizedKey = normalizeParty(key);
+  if (!normalizedKey) return [];
+  const edges = readConceptEdges().filter(edge => edge.concept_key === normalizedKey);
+  if (!edges.length) return [];
+  edges.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  const limited = edges.slice(0, Math.max(1, Number(limit) || 5));
+  const noteIds = new Set(limited.map(edge => edge.note_id));
+  if (!noteIds.size) return [];
+  const cards = readAllCards();
+  const notes = cards.filter(card => card?.type === "note" && noteIds.has(card.id));
+  notes.sort((a, b) => {
+    const edgeA = edges.find(edge => edge.note_id === a.id);
+    const edgeB = edges.find(edge => edge.note_id === b.id);
+    return (edgeB?.ts || 0) - (edgeA?.ts || 0);
+  });
+  return notes.slice(0, limited.length);
+}
+
+export function scoreAnalogy(sourceSig = {}, targetSig = {}) {
+  const sourceFacets = new Set(Array.isArray(sourceSig.facets) ? sourceSig.facets : []);
+  const targetFacets = new Set(Array.isArray(targetSig.facets) ? targetSig.facets : []);
+  const facetUnion = new Set([...sourceFacets, ...targetFacets]);
+  const facetIntersection = [...sourceFacets].filter(value => targetFacets.has(value));
+  const facetScore = facetUnion.size === 0 ? 0 : facetIntersection.length / facetUnion.size;
+
+  const sourceParties = new Set(Array.isArray(sourceSig.parties) ? sourceSig.parties : []);
+  const targetParties = new Set(Array.isArray(targetSig.parties) ? targetSig.parties : []);
+  const partyUnion = new Set([...sourceParties, ...targetParties]);
+  const partyIntersection = [...sourceParties].filter(value => targetParties.has(value));
+  const partyScore = partyUnion.size === 0 ? 0 : partyIntersection.length / partyUnion.size;
+
+  if (!Number.isFinite(facetScore) || !Number.isFinite(partyScore)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(1, (facetScore + partyScore) / 2));
+}
+
+export function writeAnalogyCard({ from = "", to = "", mapping = {}, why = [], watchout = [], status = "proposed" } = {}) {
+  const now = Date.now();
+  const record = {
+    type: "analogy",
+    from,
+    to,
+    topic: from,
+    mapping,
+    why: Array.isArray(why) ? why.slice() : [],
+    watchout: Array.isArray(watchout) ? watchout.slice() : [],
+    status,
+    ts: now,
+    created_at: now,
+    last_used: now,
+    confidence: 0.6,
+    tags: ["analogy"],
+    value: {}
+  };
+  const result = writeCard(record);
+  const id = result?.id;
+  if (id) {
+    updateIndex({ ...record, id });
+  }
+  return { id };
 }
