@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { ConceptCard, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, scoreAnalogy, writeAnalogyCard } from "./cards.js";
+import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, scoreAnalogy, writeAnalogyCard } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -749,6 +749,7 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
             note: { topic: noteResult.card.topic, score: Number(noteResult.score ?? 0) }
           }));
           rememberLastSavedNoteId(sessionId, noteResult.card.id);
+          autoLinkNoteToInferredConcept(ws, sessionId, noteResult.card);
           maybeSuggestConceptLink(ws, sessionId, noteResult.card);
           if (updateLastEpisode({ note_saved: true })) {
             ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
@@ -1043,6 +1044,55 @@ function resolveNoteHost(note) {
   } catch {
     return "";
   }
+}
+
+function autoLinkNoteToInferredConcept(ws, sessionId, noteCard) {
+  if (!noteCard || !noteCard.id) return null;
+  const inferred = inferConceptKey(noteCard);
+  if (!inferred) return null;
+  const colonIdx = inferred.indexOf(":");
+  const conceptBody = colonIdx >= 0 ? inferred.slice(colonIdx + 1) : inferred;
+  const conceptKey = normalizeConceptKey(conceptBody);
+  if (!conceptKey) return null;
+
+  let promoted = false;
+  let concept = findConceptCard(conceptKey);
+  if (!concept) {
+    const metadata = inferConceptMetadata(conceptKey);
+    const now = Date.now();
+    const title = detokenizeTopicKey(conceptKey) || conceptKey;
+    const conceptCard = {
+      ...ConceptCard,
+      key: conceptKey,
+      title,
+      tags: metadata.tags,
+      entities: metadata.entities,
+      confidence: metadata.confidence,
+      ts: now,
+      last_used: null,
+      created_at: now,
+      ttl_days: null
+    };
+    const id = persistCard(conceptCard);
+    if (!id) {
+      return null;
+    }
+    concept = { ...conceptCard, id };
+    promoted = true;
+    invalidateConceptCache();
+    logCardWrite({ ts: now, type: "concept", topic: conceptKey, score: metadata.confidence, reason: "auto_promote" });
+  }
+
+  const result = addConceptEdge(noteCard.id, conceptKey);
+  if (!result?.edge) {
+    return null;
+  }
+
+  if (ws) {
+    emitEventLog(ws, "auto_link", { noteId: noteCard.id, key: conceptKey, promoted });
+  }
+
+  return { promoted, added: result.added, conceptKey };
 }
 
 function maybeSuggestConceptLink(ws, sessionId, noteCard) {
@@ -2713,6 +2763,7 @@ wss.on("connection", (ws, req) => {
         if (noteId) {
           rememberLastSavedNoteId(sessionId, noteId);
         }
+        autoLinkNoteToInferredConcept(ws, sessionId, result.card);
         maybeSuggestConceptLink(ws, sessionId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
@@ -2747,6 +2798,7 @@ wss.on("connection", (ws, req) => {
         if (result.card?.id) {
           rememberLastSavedNoteId(sessionId, result.card.id);
         }
+        autoLinkNoteToInferredConcept(ws, sessionId, result.card);
         maybeSuggestConceptLink(ws, sessionId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
@@ -3757,6 +3809,7 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
         if (result.card?.id) {
           rememberLastSavedNoteId(meta.sessionId, result.card.id);
         }
+        autoLinkNoteToInferredConcept(ws, meta.sessionId, result.card);
         maybeSuggestConceptLink(ws, meta.sessionId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
