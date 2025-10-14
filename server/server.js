@@ -153,6 +153,7 @@ const sessionNoteLists = new Map();
 const sessionConceptSuggestionCooldown = new Map();
 const sessionAutoResearchContext = new Map();
 const sessionAutoResearchNoteCount = new Map();
+const sessionAutoResearchSearchCount = new Map();
 const sessionLastKdnState = new Map();
 const sessionConceptSuggestions = new Map();
 const sessionAnalogyState = new Map();
@@ -468,6 +469,25 @@ function incrementAutoResearchNoteCount(sessionId) {
   return next;
 }
 
+function resetAutoResearchSearchCount(sessionId) {
+  if (!sessionId) return;
+  sessionAutoResearchSearchCount.set(sessionId, 0);
+}
+
+function getAutoResearchSearchCount(sessionId) {
+  if (!sessionId) return 0;
+  const stored = sessionAutoResearchSearchCount.get(sessionId);
+  const num = Number(stored);
+  return Number.isFinite(num) && num > 0 ? num : 0;
+}
+
+function incrementAutoResearchSearchCount(sessionId) {
+  if (!sessionId) return 0;
+  const next = getAutoResearchSearchCount(sessionId) + 1;
+  sessionAutoResearchSearchCount.set(sessionId, next);
+  return next;
+}
+
 function finalizeAutoResearchEvent(ws, sessionId, context) {
   if (!context || !context.trigger) {
     clearAutoResearchContext(sessionId);
@@ -537,6 +557,30 @@ function cleanAutoResearchQuery(text, topicKey, listQuery) {
   return working.slice(0, 200);
 }
 
+const DK_MARKERS = [
+  "unknown with current context",
+  "i don't have that information",
+  "i dont have that information",
+  "i'm not sure",
+  "im not sure"
+];
+
+function isDKMarkerReply(text) {
+  const raw = typeof text === "string" ? text : "";
+  if (!raw) return false;
+  const normalized = raw.trim().toLowerCase().replace(/[’`]/g, "'");
+  if (!normalized) return false;
+  const boundary = (ch) => {
+    if (!ch) return true;
+    return /\s|[\.,;:!?()'"\/\]]/.test(ch);
+  };
+  for (const marker of DK_MARKERS) {
+    if (normalized === marker) return true;
+    if (normalized.startsWith(marker) && boundary(normalized.charAt(marker.length))) return true;
+  }
+  return false;
+}
+
 function hasCardsForTopic(topicKey) {
   const key = typeof topicKey === "string" ? topicKey.trim() : "";
   if (!key) return false;
@@ -565,6 +609,7 @@ async function maybeRunAutoResearch({
   if (!sessionId || !userId) return null;
   if (inReplyToGap) return null;
   if (MAX_AUTO_SEARCHES_PER_TURN <= 0) return null;
+  if (getAutoResearchSearchCount(sessionId) >= MAX_AUTO_SEARCHES_PER_TURN) return null;
   if (isSearchCommand || summarizeCommand || hasUrl) return null;
   if (listIntent && !freshCue) return null;
 
@@ -607,6 +652,7 @@ async function maybeRunAutoResearch({
   }
 
   context.searched = true;
+  incrementAutoResearchSearchCount(sessionId);
   const { qlist, keysUsed } = buildQueryList(query, { max: 8 });
   const topicForSearch = bucketTopic(query);
   const runNumber = touchTopicRun(sessionId, topicForSearch);
@@ -639,6 +685,136 @@ async function maybeRunAutoResearch({
     console.error("auto_research_error", err);
     return { triggered: true, handled: false, context };
   }
+}
+
+async function runAutoResearchForDK({ ws, userId, sessionId }) {
+  if (!sessionId || !userId) return;
+  if (MAX_AUTO_SEARCHES_PER_TURN <= 0) return;
+  if (getAutoResearchSearchCount(sessionId) >= MAX_AUTO_SEARCHES_PER_TURN) return;
+
+  const recentMessages = getRecentMessages(sessionId, 6) || [];
+  const lastUser = [...recentMessages].reverse().find(msg => msg?.role === "user");
+  const userTextRaw = lastUser?.content ? String(lastUser.content) : "";
+  const userText = userTextRaw.replace(/[\r\n]+/g, " ").trim();
+  if (!userText) return;
+
+  const normalizedTopic = normalizeTopic(userText);
+  const baseTopicKey = normalizeTopicKey(normalizedTopic || userText, "news");
+  const query = cleanAutoResearchQuery(userText, baseTopicKey, null);
+  const queryTopicKey = normalizeTopicKey(query, "news");
+  const topicKey = queryTopicKey || baseTopicKey || normalizeTopicKey(userText, "news") || "";
+  const context = {
+    trigger: "dk",
+    topic: topicKey,
+    searched: false,
+    wrote: false,
+    candidate: null,
+    lastError: null
+  };
+  setAutoResearchContext(sessionId, context);
+
+  if (!query) {
+    finalizeAutoResearchEvent(ws, sessionId, context);
+    return;
+  }
+
+  context.searched = true;
+  incrementAutoResearchSearchCount(sessionId);
+
+  const { qlist, keysUsed } = buildQueryList(query, { max: 8 });
+  const topicForSearch = bucketTopic(query);
+  const runNumber = touchTopicRun(sessionId, topicForSearch);
+  const args = { q: query, qlist: qlist.slice(), k: 5 };
+  const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+  if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+    args.qlist = rotateList(args.qlist, runNumber - 1);
+  }
+
+  let run = null;
+  try {
+    const result = await tool_web_search(args, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
+    run = saveRunRecord("web_search", args, result);
+    const latency_ms = result?.latency_ms || 0;
+    const k = result?.k || 0;
+    recordSearch({
+      userId,
+      sessionId,
+      topic: topicForSearch,
+      q_base: args.q,
+      qlist: result?.qlist || args.qlist || [],
+      engine: result?.engine || "unknown",
+      k,
+      latency_ms,
+      error: null
+    });
+    const reward = Math.max(0, Math.min(1, k / 3)) - 0.02 * (latency_ms / 1000);
+    if (Array.isArray(keysUsed) && keysUsed.length) updateBandit(keysUsed, reward);
+    recordEpisode({
+      userId,
+      sessionId,
+      topic: topicForSearch,
+      success: k > 0,
+      note_saved: false,
+      tokens_total: null,
+      calls: { web_search: 1, web_get: 0 }
+    });
+    ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
+
+    const entries = Array.isArray(result?.results) ? result.results : [];
+    const cleanCandidates = entries
+      .map((entry, idx) => ({ entry, idx, domain: extractDomain(entry?.url || "") }))
+      .filter(({ entry, domain }) => entry && entry.url && domain && isPreferredDomain(domain) && !shouldExcludeDomain(domain, entry.url, userText));
+    if (!cleanCandidates.length) {
+      context.lastError = "no_primary_hit";
+    } else {
+      const best = cleanCandidates[0].entry;
+      const title = (best.title || "").replace(/[\r\n]+/g, " ").trim();
+      const snippet = (best.snippet || "").replace(/[\r\n]+/g, " ").trim();
+      const topicLabel = topicKey ? detokenizeTopicKey(topicKey) : (normalizedTopic || "");
+      const fallbackTopic = topicLabel || normalizedTopic || query || userText;
+      let summary = [title, snippet].filter(Boolean).join(" — ");
+      summary = summary.replace(/\s+/g, " ").trim();
+      if (!summary) summary = fallbackTopic.replace(/\s+/g, " ").trim();
+      summary = summary.slice(0, 400);
+      if (!summary) {
+        context.lastError = "missing_summary";
+      } else {
+        const payload = {
+          topic: fallbackTopic || summary,
+          summary,
+          source: { url: best.url }
+        };
+        if (title) payload.source.title = title.slice(0, 200);
+        const noteResult = saveNoteCardFromPayload({
+          payload,
+          explicitness: 0,
+          userId,
+          sessionId,
+          run,
+          reason: "auto_research_dk",
+          topicHint: fallbackTopic || summary,
+          autoResearch: true
+        });
+        if (noteResult?.saved && noteResult.card?.id) {
+          ws.send(JSON.stringify({
+            type: "note_saved",
+            note: { topic: noteResult.card.topic, score: Number(noteResult.score ?? 0) }
+          }));
+          rememberLastSavedNoteId(sessionId, noteResult.card.id);
+          maybeSuggestConceptLink(ws, sessionId, noteResult.card);
+          maybeProposeAnalogy(ws, sessionId, userId, noteResult.card);
+          if (updateLastEpisode({ note_saved: true })) {
+            ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
+          }
+        }
+      }
+    }
+  } catch (err) {
+    context.lastError = "search_error";
+    console.error("auto_research_dk_error", err);
+  }
+
+  finalizeAutoResearchEvent(ws, sessionId, context);
 }
 
 function loadSourcePriors() {
@@ -2518,6 +2694,7 @@ wss.on("connection", (ws, req) => {
 
     const userId = msg.user_id || "default";
     const sessionId = msg.session_id || "default";
+    resetAutoResearchSearchCount(sessionId);
     const content = (msg.content || "").toString().slice(0, 8000);
     const inReplyToGap = msg.in_reply_to_gap || null;
     const topic = normalizeTopic(content);
@@ -3670,6 +3847,15 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
   if (cleanText && cleanText.trim().length) {
     appendMessage(sessionId, { role: "assistant", content: cleanText });
     ws.send(JSON.stringify({ type: "assistant_message", content: cleanText }));
+  }
+
+  const trimmedAssistant = cleanText ? cleanText.trim() : "";
+  if (!origin && !meta?.autoResearch && trimmedAssistant && isDKMarkerReply(trimmedAssistant)) {
+    try {
+      await runAutoResearchForDK({ ws, userId, sessionId });
+    } catch (err) {
+      console.error("auto_research_dk_invoke_error", err);
+    }
   }
 
   if (gap) {
