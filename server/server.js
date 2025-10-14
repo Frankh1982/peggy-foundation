@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { AnalogyCard, ConceptCard, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes } from "./cards.js";
+import { ConceptCard, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, scoreAnalogy, writeAnalogyCard } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -54,68 +54,17 @@ const SEEN_HOST_TTL = 15 * 60 * 1000;
 const FRESH_CUE_REGEX = /\b(latest|breaking|today|tonight|this\s*week|refresh)\b|\bupdate\b.*\b(now|today)\b|\b(now|today)\b.*\bupdate\b/i;
 const TWO_SENTENCE_REGEX = /\b(?:two|2)[-\s]?sentence\b/i;
 
-const ANALOGY_SOURCE_KEY = "openai/amd/deal";
-const ANALOGY_FACET_LABELS = {
-  supply: "GPU supply commitments",
-  warrants: "Equity & warrants",
-  staged_deploy: "Staged rollout"
-};
-const ANALOGY_FACET_CONFIG = [
-  {
-    key: "supply",
-    patterns: [
-      /\b6\s*gw\b/i,
-      /\bgigawatt\b/i,
-      /\bmi300\b/i,
-      /\bgpu\s+(?:supply|capacity|deliver(?:y|ies)|allocation)\b/i,
-      /\bchip\s+(?:supply|capacity|output)\b/i,
-      /\baccelerator\s+(?:orders?|pipeline)\b/i
-    ]
-  },
-  {
-    key: "warrants",
-    patterns: [
-      /\bwarrant(?:s)?\b/i,
-      /\b\$?160\s*(?:m|million)\b/i,
-      /\bequity\s+(?:stake|sweetener|grant)/i,
-      /\bconvertible\s+(?:note|instrument)\b/i,
-      /\boptions?\b/i
-    ]
-  },
-  {
-    key: "staged_deploy",
-    patterns: [
-      /\b2h\s*26\b/i,
-      /\bh2\s*2026\b/i,
-      /\bsecond\s+half\s+of\s+2026\b/i,
-      /\brollout\b/i,
-      /\bphased\b/i,
-      /\bstaged\b/i,
-      /\bdeployment\b/i,
-      /\bmilestone\b/i,
-      /\btimeline\b/i
-    ]
+const envAnalogyMinScore = (process.env.ANALOGY_MIN_SCORE ?? "").trim();
+const ANALOGY_MIN_SCORE = (() => {
+  const num = Number(envAnalogyMinScore);
+  if (Number.isFinite(num)) {
+    if (num <= 0) return 0;
+    if (num >= 1) return 1;
+    return num;
   }
-];
-const ANALOGY_TARGET_CANDIDATES = [
-  {
-    key: "microsoft/nvidia/cloud_gpu",
-    parties: { partyA: "microsoft", partyB: "nvidia" },
-    signature: ["supply", "warrants", "staged_deploy"],
-    facets: {
-      supply: "Microsoft locked in NVIDIA GPU supply to scale Azure AI supercomputers.",
-      warrants: "Azure spend is paired with warrant-style incentives aligning NVIDIA with Microsoft's growth.",
-      staged_deploy: "GPU clusters are phased into Azure regions through 2026 as demand ramps."
-    },
-    watchout:
-      "Microsoft controls Azure's customer adoption, so risk centers on cloud platform uptake rather than a single lab build.",
-    followup: {
-      query: "Microsoft NVIDIA Azure GPU warrant 2026 rollout",
-      topic: "microsoft/nvidia/cloud_gpu",
-      hint: "Check how Microsoft sequences Azure's NVIDIA GPU deliveries alongside warrant milestones."
-    }
-  }
-];
+  return 0.45;
+})();
+const ANALOGY_NOTE_LIMIT = 5;
 
 const cardsDirPath = path.resolve("data", "cards");
 const indexDirPath = path.resolve("data", "index");
@@ -156,7 +105,6 @@ const sessionAutoResearchNoteCount = new Map();
 const sessionAutoResearchSearchCount = new Map();
 const sessionLastKdnState = new Map();
 const sessionConceptSuggestions = new Map();
-const sessionAnalogyState = new Map();
 const sessionAnalogyProposals = new Map();
 
 function topicToSearchPhrase(topic) {
@@ -802,7 +750,6 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
           }));
           rememberLastSavedNoteId(sessionId, noteResult.card.id);
           maybeSuggestConceptLink(ws, sessionId, noteResult.card);
-          maybeProposeAnalogy(ws, sessionId, userId, noteResult.card);
           if (updateLastEpisode({ note_saved: true })) {
             ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
           }
@@ -1251,202 +1198,191 @@ function linkNoteToConcept(ws, sessionId, noteId, conceptKeyRaw, { via = "comman
   return true;
 }
 
-function canonicalConceptKeyFromTopic(value) {
+function normalizeAnalogyName(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
-  const normalizedTopic = normalizeTopicKey(raw, "news");
-  if (normalizedTopic) {
-    const colon = normalizedTopic.indexOf(":");
-    const body = colon >= 0 ? normalizedTopic.slice(colon + 1) : normalizedTopic;
-    const normalized = normalizeConceptKey(body);
-    if (normalized) return normalized;
-  }
-  return normalizeConceptKey(raw);
+  return raw.toLowerCase();
 }
 
-function extractConceptKeysFromNote(noteCard) {
-  const keys = new Set();
-  if (!noteCard || typeof noteCard !== "object") return keys;
-  const consider = (value) => {
-    const key = canonicalConceptKeyFromTopic(value);
-    if (key) keys.add(key);
+function formatPartyLabel(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/[A-Z]/.test(raw)) return raw;
+  return raw.replace(/\b([a-z])/g, (_, ch) => ch.toUpperCase());
+}
+
+function gatherParties(signature, concept) {
+  const map = new Map();
+  const push = (value) => {
+    const normalized = normalizeAnalogyName(value);
+    if (!normalized) return;
+    if (map.has(normalized)) return;
+    const display = formatPartyLabel(value);
+    if (display) {
+      map.set(normalized, display);
+    }
   };
-  consider(noteCard.topic);
-  consider(noteCard?.value?.data?.topic);
-  consider(noteCard?.value?.topic);
-  if (Array.isArray(noteCard?.tags)) {
-    for (const tag of noteCard.tags) {
-      if (!tag || typeof tag !== "string") continue;
-      if (!tag.includes("/")) continue;
-      consider(tag);
+  if (Array.isArray(concept?.entities)) {
+    for (const entity of concept.entities) {
+      push(entity);
     }
   }
-  return keys;
-}
-
-function ensureAnalogyConceptState(sessionId, conceptKey) {
-  if (!sessionId || !conceptKey) return null;
-  let sessionState = sessionAnalogyState.get(sessionId);
-  if (!sessionState) {
-    sessionState = new Map();
-    sessionAnalogyState.set(sessionId, sessionState);
-  }
-  let conceptState = sessionState.get(conceptKey);
-  if (!conceptState) {
-    conceptState = {
-      noteCount: 0,
-      notes: [],
-      seenNotes: new Set(),
-      facets: { supply: null, warrants: null, staged_deploy: null },
-      suppressed: false,
-      completed: false,
-      pending: null,
-      lastProposalAt: 0
-    };
-    sessionState.set(conceptKey, conceptState);
-  }
-  return conceptState;
-}
-
-function truncateAnalogyText(text, max = 220) {
-  const raw = String(text || "").replace(/[\r\n]+/g, " ").trim();
-  if (!raw) return "";
-  if (raw.length <= max) return raw;
-  return `${raw.slice(0, Math.max(0, max - 1))}…`;
-}
-
-function buildAnalogySnippet(text, index, length, { pad = 60, max = 220 } = {}) {
-  const raw = String(text || "");
-  if (!raw) return "";
-  const safeIndex = Number.isFinite(index) && index >= 0 ? index : 0;
-  const width = Number.isFinite(length) && length > 0 ? length : 0;
-  let start = Math.max(0, safeIndex - pad);
-  let end = Math.min(raw.length, safeIndex + width + pad);
-  if (end <= start) {
-    start = Math.max(0, safeIndex - pad);
-    end = Math.min(raw.length, start + pad * 2 + Math.max(width, 1));
-  }
-  let snippet = raw.slice(start, end).replace(/[\r\n]+/g, " ").trim();
-  if (start > 0) snippet = `…${snippet}`;
-  if (end < raw.length) snippet = `${snippet}…`;
-  return truncateAnalogyText(snippet, max);
-}
-
-function updateAnalogyFacetsFromSummary(state, noteCard) {
-  if (!state || !noteCard) return;
-  const summary = String(noteCard.summary || "").trim();
-  if (!summary) return;
-  for (const config of ANALOGY_FACET_CONFIG) {
-    if (state.facets[config.key]) continue;
-    for (const pattern of config.patterns || []) {
-      const match = summary.match(pattern);
-      if (match) {
-        const snippet = buildAnalogySnippet(summary, match.index ?? summary.toLowerCase().indexOf(match[0].toLowerCase()), match[0]?.length || 0);
-        state.facets[config.key] = {
-          noteId: noteCard.id || null,
-          snippet,
-          summary: truncateAnalogyText(summary, 240),
-          ts: noteTimestamp(noteCard) || Date.now()
-        };
-        break;
-      }
+  if (Array.isArray(signature?.parties)) {
+    for (const party of signature.parties) {
+      push(party);
     }
   }
+  return Array.from(map.values());
 }
 
-function pickAnalogyCandidate(state) {
-  if (!state) return null;
-  let best = null;
-  let bestOverlap = [];
-  for (const candidate of ANALOGY_TARGET_CANDIDATES) {
-    const signature = Array.isArray(candidate.signature) && candidate.signature.length
-      ? candidate.signature
-      : Object.keys(candidate.facets || {});
-    const overlap = signature.filter(facet => state.facets[facet]);
-    if (overlap.length >= 2) {
-      if (!best || overlap.length > bestOverlap.length) {
-        best = candidate;
-        bestOverlap = overlap;
-      }
-    }
-  }
-  if (!best) return null;
-  return { candidate: best, overlap: bestOverlap };
+function labelFacet(value) {
+  return String(value || "")
+    .trim()
+    .replace(/[\s_]+/g, " ")
+    .toLowerCase();
 }
 
 function formatAnalogyProposalMessage(suggestion) {
+  const mapping = suggestion.mapping || {};
+  const facets = Array.isArray(mapping.facets) ? mapping.facets.map(labelFacet).join(", ") : "";
+  const partyALine = `${mapping.partyA?.from || "partyA"} ↔ ${mapping.partyA?.to || "partyA"}`;
+  const partyBLine = `${mapping.partyB?.from || "partyB"} ↔ ${mapping.partyB?.to || "partyB"}`;
+  const why = suggestion.why || [];
+  const watchout = suggestion.watchout || [];
   const lines = [
-    `analogy_proposal: ${suggestion.from} ↔ ${suggestion.to}`,
-    "similarities:",
-    ...suggestion.why.map(item => `- ${item}`),
+    `from: ${suggestion.from}`,
+    `to: ${suggestion.to}`,
+    "mapping:",
+    `  partyA: ${partyALine}`,
+    `  partyB: ${partyBLine}`,
+    `  facets: ${facets}`,
+    "why:",
+    `  1) ${why[0] || "Shared structural overlap."}`,
+    `  2) ${why[1] || "Comparable party incentives."}`,
     "watchout:",
-    ...suggestion.watchout.map(item => `- ${item}`),
-    "Accept? (yes/no)"
+    `  - ${watchout[0] || "Confirm contextual differences."}`,
+    "accept? (yes/no)"
   ];
   return lines.join("\n");
 }
 
-function maybeProposeAnalogy(ws, sessionId, userId, noteCard) {
-  if (!ws || !sessionId || !noteCard) return;
-  if (sessionAnalogyProposals.has(sessionId)) return;
-  const conceptKeys = extractConceptKeysFromNote(noteCard);
-  if (!conceptKeys.has(ANALOGY_SOURCE_KEY)) return;
-  const conceptState = ensureAnalogyConceptState(sessionId, ANALOGY_SOURCE_KEY);
-  if (!conceptState || conceptState.suppressed || conceptState.completed) return;
-  const summary = String(noteCard.summary || "").trim();
-  if (!summary) return;
-  const noteKeyTs = noteTimestamp(noteCard) || Date.now();
-  const noteId = noteCard.id || `${noteKeyTs}:${summary}`;
-  if (noteId && conceptState.seenNotes.has(noteId)) return;
-  conceptState.seenNotes.add(noteId);
-  conceptState.noteCount += 1;
-  conceptState.notes.push({ id: noteCard.id || null, summary, ts: noteKeyTs });
-  updateAnalogyFacetsFromSummary(conceptState, noteCard);
-  const availableFacets = Object.keys(conceptState.facets).filter(key => conceptState.facets[key]);
-  if (conceptState.noteCount < 2 || availableFacets.length < 2) return;
-  const pick = pickAnalogyCandidate(conceptState);
-  if (!pick) return;
-  const facetsForWhy = pick.overlap.slice(0, 2);
-  const mappingFacets = Array.from(new Set(pick.overlap)).slice(0, 3);
-  const why = facetsForWhy.map(facet => {
-    const label = ANALOGY_FACET_LABELS[facet] || facet;
-    const left = conceptState.facets[facet]?.snippet || conceptState.facets[facet]?.summary || summary;
-    const right = pick.candidate?.facets?.[facet] || "";
-    return truncateAnalogyText(`${label}: ${left} ↔ ${right}`, 240);
+function buildAnalogySearchQuery(suggestion) {
+  const facets = Array.isArray(suggestion.sharedFacets) ? suggestion.sharedFacets : [];
+  const parties = Array.isArray(suggestion.targetParties) ? suggestion.targetParties : [];
+  const facetTerms = facets.map(labelFacet).join(" ");
+  const partyTerms = parties.join(" ");
+  const raw = `${facetTerms} ${partyTerms}`.trim();
+  if (raw) return raw;
+  return suggestion.to || "";
+}
+
+function buildAnalogySuggestion({ fromKey, sourceConcept, toConcept, sourceSig, targetSig, sharedFacets, score }) {
+  const targetKey = toConcept?.key || "";
+  const sourceParties = gatherParties(sourceSig, sourceConcept || getConcept(fromKey) || { key: fromKey });
+  const targetParties = gatherParties(targetSig, toConcept);
+  const [sourceA, sourceB] = [sourceParties[0] || "partyA", sourceParties[1] || sourceParties[0] || "partyB"];
+  const [targetA, targetB] = [targetParties[0] || "partyA", targetParties[1] || targetParties[0] || "partyB"];
+  const mappedFacets = sharedFacets.slice(0, 3);
+  const facetWhy = sharedFacets.slice(0, 2).map(facet => {
+    const label = labelFacet(facet);
+    return `Shared facet "${label}" appears in linked notes for ${fromKey} and ${targetKey}.`;
   });
-  if (why.length < 2) return;
-  const stagedSnippet = conceptState.facets.staged_deploy?.snippet || conceptState.facets.staged_deploy?.summary || "";
-  const watchoutBase = pick.candidate.watchout || "Different execution focus between the deals.";
-  const watchoutText = truncateAnalogyText(stagedSnippet ? `${watchoutBase} OpenAI/AMD note: ${stagedSnippet}` : watchoutBase, 240);
-  const suggestion = {
-    conceptKey: ANALOGY_SOURCE_KEY,
-    from: ANALOGY_SOURCE_KEY,
-    to: pick.candidate.key,
-    mapping: { partyA: "openai", partyB: "amd", facet: mappingFacets },
-    why,
-    watchout: [watchoutText],
+  while (facetWhy.length < 2) {
+    facetWhy.push(`Both concepts involve overlapping parties ${sourceA} and ${targetA}.`);
+  }
+  const uniqueTargetFacets = targetSig.facets.filter(facet => !sourceSig.facets.includes(facet));
+  const watchout = uniqueTargetFacets.length
+    ? [`${targetKey} also highlights ${uniqueTargetFacets.map(labelFacet).join(", ")} that may diverge from ${fromKey}.`]
+    : [`Roles for ${targetA} and ${targetB} may differ from ${sourceA}/${sourceB}.`];
+  return {
+    from: fromKey,
+    to: targetKey,
+    mapping: {
+      partyA: { from: sourceA, to: targetA },
+      partyB: { from: sourceB, to: targetB },
+      facets: mappedFacets
+    },
+    why: facetWhy.slice(0, 2),
+    watchout,
     status: "proposed",
-    ts: Date.now(),
-    userId,
-    notesUsed: facetsForWhy.map(facet => conceptState.facets[facet]?.noteId).filter(Boolean),
-    overlapFacets: mappingFacets,
-    followup: pick.candidate.followup || null
+    score,
+    sharedFacets: mappedFacets.slice(),
+    sourceParties,
+    targetParties
   };
+}
+
+function handleAnalogyCommand(ws, sessionId, content) {
+  const match = String(content || "").trim().match(/^propose\s+analogy\s+from\s+(.+)$/i);
+  if (!match) return false;
+  const conceptKeyRaw = match[1].trim();
+  const conceptCard = getConcept(conceptKeyRaw);
+  const normalizedKey = normalizeConceptKey(conceptCard?.key || conceptKeyRaw);
+  if (!normalizedKey) {
+    const reply = "no structural analogy proposed.";
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "analogy_proposal", { from: conceptKeyRaw || "", to: null, score: 0, reason: "no_candidates" });
+    sessionAnalogyProposals.delete(sessionId);
+    return true;
+  }
+  const sourceNotes = getLinkedNotes(normalizedKey, { limit: ANALOGY_NOTE_LIMIT });
+  if (!sourceNotes.length) {
+    const reply = "no structural analogy proposed.";
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "analogy_proposal", { from: normalizedKey, to: null, score: 0, reason: "no_candidates" });
+    sessionAnalogyProposals.delete(sessionId);
+    return true;
+  }
+  const sourceSig = extractFacetsFromNotes(sourceNotes);
+  const concepts = getConceptCards();
+  let best = null;
+  let bestScore = 0;
+  let hadShared = false;
+  for (const candidate of concepts) {
+    if (!candidate || candidate.type !== "concept") continue;
+    const candidateKey = normalizeConceptKey(candidate.key);
+    if (!candidateKey || candidateKey === normalizedKey) continue;
+    const targetNotes = getLinkedNotes(candidateKey, { limit: ANALOGY_NOTE_LIMIT });
+    if (!targetNotes.length) continue;
+    const targetSig = extractFacetsFromNotes(targetNotes);
+    const sharedFacets = targetSig.facets.filter(facet => sourceSig.facets.includes(facet));
+    if (sharedFacets.length < 2) continue;
+    hadShared = true;
+    const score = scoreAnalogy(sourceSig, targetSig);
+    if (score >= ANALOGY_MIN_SCORE && (!best || score > bestScore)) {
+      best = { concept: candidate, sharedFacets, targetSig };
+      bestScore = score;
+    }
+  }
+  if (!best) {
+    const reason = hadShared ? "below_threshold" : "no_candidates";
+    const reply = "no structural analogy proposed.";
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "analogy_proposal", { from: normalizedKey, to: null, score: 0, reason });
+    sessionAnalogyProposals.delete(sessionId);
+    return true;
+  }
+  const suggestion = buildAnalogySuggestion({
+    fromKey: normalizedKey,
+    sourceConcept: conceptCard,
+    toConcept: best.concept,
+    sourceSig,
+    targetSig: best.targetSig,
+    sharedFacets: best.sharedFacets,
+    score: bestScore
+  });
   sessionAnalogyProposals.set(sessionId, suggestion);
-  conceptState.pending = suggestion;
-  conceptState.lastProposalAt = suggestion.ts;
   const message = formatAnalogyProposalMessage(suggestion);
   appendMessage(sessionId, { role: "assistant", content: message });
   ws.send(JSON.stringify({ type: "assistant_message", content: message }));
-  emitEventLog(ws, "analogy_proposed", {
-    from: suggestion.from,
-    to: suggestion.to,
-    facets: mappingFacets,
-    notes: suggestion.notesUsed
-  });
+  emitEventLog(ws, "analogy_proposal", { from: suggestion.from, to: suggestion.to, score: Number(bestScore.toFixed(3)), reason: "ok" });
+  return true;
 }
 
-async function handleAnalogySuggestionResponse(ws, sessionId, userId, content) {
+async function handleAnalogyResponse(ws, sessionId, content) {
   const suggestion = sessionAnalogyProposals.get(sessionId);
   if (!suggestion) return false;
   const normalized = String(content || "").trim().toLowerCase();
@@ -1455,110 +1391,38 @@ async function handleAnalogySuggestionResponse(ws, sessionId, userId, content) {
   const negative = normalized === "no" || normalized === "n";
   if (!positive && !negative) return false;
   sessionAnalogyProposals.delete(sessionId);
-  const conceptState = ensureAnalogyConceptState(sessionId, suggestion.conceptKey);
-  if (conceptState) {
-    conceptState.pending = null;
-  }
   if (positive) {
-    const now = Date.now();
-    const summary = `Analogy: ${suggestion.from} ↔ ${suggestion.to} via ${suggestion.mapping.facet.join(", ")}`;
-    const card = {
-      ...AnalogyCard,
-      type: "analogy",
+    const result = writeAnalogyCard({
       from: suggestion.from,
       to: suggestion.to,
-      topic: suggestion.from,
       mapping: suggestion.mapping,
-      why: suggestion.why.slice(),
-      watchout: suggestion.watchout.slice(),
-      status: "accepted",
-      ts: now,
-      summary,
-      tags: ["analogy"],
-      value: {
-        ...(AnalogyCard.value || {}),
-        overlap: suggestion.mapping.facet,
-        notes_used: suggestion.notesUsed || [],
-        followup_query: suggestion.followup?.query || null,
-        target: suggestion.to
-      },
-      confidence: 0.6,
-      created_at: now,
-      last_used: now,
-      ttl_days: 180
-    };
-    const id = persistCard(card);
+      why: suggestion.why,
+      watchout: suggestion.watchout,
+      status: "accepted"
+    });
+    const id = result?.id || null;
     if (!id) {
       const reply = "I couldn't save that analogy.";
       appendMessage(sessionId, { role: "assistant", content: reply });
       ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-      emitEventLog(ws, "analogy_error", { from: suggestion.from, to: suggestion.to, reason: "persist_failed" });
       return true;
     }
-    logCardWrite({ ts: now, type: "analogy", topic: suggestion.from, score: 0.6, reason: "analogy_accept" });
-    if (conceptState) {
-      conceptState.completed = true;
-      conceptState.suppressed = true;
-    }
-    const ack = `Analogy saved: ${suggestion.from} ↔ ${suggestion.to}.`;
-    appendMessage(sessionId, { role: "assistant", content: ack });
-    ws.send(JSON.stringify({ type: "assistant_message", content: ack }));
-    emitEventLog(ws, "analogy_accept", {
-      from: suggestion.from,
-      to: suggestion.to,
-      facets: suggestion.mapping.facet,
-      notes: suggestion.notesUsed,
-      card_id: id
-    });
-    if (suggestion.followup?.query) {
-      const followupLine = suggestion.followup?.hint
-        ? `Running follow-up search: "${suggestion.followup.query}" — ${suggestion.followup.hint}`
-        : `Running follow-up search: "${suggestion.followup.query}"`;
-      appendMessage(sessionId, { role: "assistant", content: followupLine });
-      ws.send(JSON.stringify({ type: "assistant_message", content: followupLine }));
-      emitEventLog(ws, "analogy_followup_start", {
-        from: suggestion.from,
-        to: suggestion.to,
-        query: suggestion.followup.query
-      });
-      try {
-        await runAnalogyFollowupSearch(ws, { sessionId, userId, suggestion });
-      } catch (err) {
-        const warning = "Follow-up search hit an error.";
-        appendMessage(sessionId, { role: "assistant", content: warning });
-        ws.send(JSON.stringify({ type: "assistant_message", content: warning }));
-        emitEventLog(ws, "analogy_followup_error", { error: err?.message || String(err) });
-      }
-    }
+    const searchQuery = buildAnalogySearchQuery(suggestion);
+    const lines = [`Analogy saved.`, `search: "${searchQuery}"`];
+    const reply = lines.join("\n");
+    appendMessage(sessionId, { role: "assistant", content: reply });
+    ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+    emitEventLog(ws, "analogy_saved", { id, from: suggestion.from, to: suggestion.to });
     return true;
   }
   if (negative) {
-    if (conceptState) {
-      conceptState.suppressed = true;
-    }
-    const reply = `Okay, not saving that analogy for ${suggestion.from}.`;
+    const reply = `Analogy discarded for ${suggestion.from}.`;
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-    emitEventLog(ws, "analogy_reject", { from: suggestion.from, to: suggestion.to });
+    emitEventLog(ws, "analogy_rejected", { from: suggestion.from, to: suggestion.to });
     return true;
   }
   return false;
-}
-
-async function runAnalogyFollowupSearch(ws, { sessionId, userId, suggestion }) {
-  if (!ws || !suggestion?.followup?.query) return;
-  const query = String(suggestion.followup.query || "").trim();
-  if (!query) return;
-  const { qlist, keysUsed } = buildQueryList(query, { max: 6 });
-  const args = {
-    q: query,
-    qlist: qlist.slice(),
-    k: Math.max(3, Math.min(6, suggestion.followup?.k || 4))
-  };
-  const topic = suggestion.followup?.topic ? bucketTopic(suggestion.followup.topic) : bucketTopic(query);
-  const runNumber = touchTopicRun(sessionId, topic);
-  const spec = { tool: "web_search", args };
-  await executeTool(ws, { userId, sessionId, spec, requestText: query, topic, banditKeys: keysUsed, runNumber }, "analogy_followup");
 }
 
 function handleConceptCommand(ws, sessionId, content) {
@@ -2850,7 +2714,6 @@ wss.on("connection", (ws, req) => {
           rememberLastSavedNoteId(sessionId, noteId);
         }
         maybeSuggestConceptLink(ws, sessionId, result.card);
-        maybeProposeAnalogy(ws, sessionId, userId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
         }
@@ -2885,7 +2748,6 @@ wss.on("connection", (ws, req) => {
           rememberLastSavedNoteId(sessionId, result.card.id);
         }
         maybeSuggestConceptLink(ws, sessionId, result.card);
-        maybeProposeAnalogy(ws, sessionId, userId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
         }
@@ -3007,7 +2869,7 @@ wss.on("connection", (ws, req) => {
 
     appendMessage(sessionId, { role: "user", content });
 
-    if (await handleAnalogySuggestionResponse(ws, sessionId, userId, trimmedContent)) {
+    if (await handleAnalogyResponse(ws, sessionId, trimmedContent)) {
       flushCardUsage();
       sendFreshnessEvent();
       return;
@@ -3020,6 +2882,12 @@ wss.on("connection", (ws, req) => {
     }
 
     if (handleConceptCommand(ws, sessionId, trimmedContent)) {
+      flushCardUsage();
+      sendFreshnessEvent();
+      return;
+    }
+
+    if (handleAnalogyCommand(ws, sessionId, trimmedContent)) {
       flushCardUsage();
       sendFreshnessEvent();
       return;
@@ -3890,7 +3758,6 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
           rememberLastSavedNoteId(meta.sessionId, result.card.id);
         }
         maybeSuggestConceptLink(ws, meta.sessionId, result.card);
-        maybeProposeAnalogy(ws, meta.sessionId, meta.userId, result.card);
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
         }
