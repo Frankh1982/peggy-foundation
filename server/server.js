@@ -709,9 +709,33 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
     ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
 
     const entries = Array.isArray(result?.results) ? result.results : [];
-    const cleanCandidates = entries
-      .map((entry, idx) => ({ entry, idx, domain: extractDomain(entry?.url || "") }))
-      .filter(({ entry, domain }) => entry && entry.url && domain && isPreferredDomain(domain) && !shouldExcludeDomain(domain, entry.url, userText));
+    const scoredCandidates = entries
+      .map((entry, idx) => {
+        const domain = extractDomain(entry?.url || "");
+        if (!entry || !entry.url || !domain) return null;
+        if (shouldExcludeDomain(domain, entry.url, userText)) return null;
+        const prior = getSourcePrior(domain);
+        const recency = computeRecencyScore(entry);
+        const score = SCORE_PRIOR_WEIGHT * prior + SCORE_RECENCY_WEIGHT * recency;
+        return { entry, domain, prior, recency, score, idx };
+      })
+      .filter(Boolean);
+
+    const dedupedByHost = new Map();
+    for (const candidate of scoredCandidates) {
+      const key = candidate.domain;
+      const prev = dedupedByHost.get(key);
+      if (!prev || prev.score < candidate.score) {
+        dedupedByHost.set(key, candidate);
+      }
+    }
+
+    const cleanCandidates = Array.from(dedupedByHost.values())
+      .sort((a, b) => {
+        if (a.score !== b.score) return b.score - a.score;
+        return a.idx - b.idx;
+      });
+
     if (!cleanCandidates.length) {
       context.lastError = "no_primary_hit";
     } else {
@@ -730,7 +754,8 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
         const payload = {
           topic: fallbackTopic || summary,
           summary,
-          source: { url: best.url }
+          source: { url: best.url },
+          ttl_days: AUTO_RESEARCH_CONFIG.note_ttl_days
         };
         if (title) payload.source.title = title.slice(0, 200);
         const noteResult = saveNoteCardFromPayload({
@@ -3116,13 +3141,13 @@ wss.on("connection", (ws, req) => {
         freshnessTopic = context.topic;
         freshnessTopicSource = "auto";
       }
-      finalizeAutoResearchEvent(ws, sessionId, context);
       if (autoResearchOutcome.handled) {
         freshnessAction = "search";
         sendFreshnessEvent();
         flushCardUsage();
         return;
       }
+      finalizeAutoResearchEvent(ws, sessionId, context);
     }
 
     if (!freshCue && !inReplyToGap && note && !stale && wantsBriefUpdate && !listIntent && !isSearchCommand && !summarizeCommand) {
@@ -3559,6 +3584,8 @@ async function executeTool(ws, meta, call_id="auto") {
         });
       }
 
+      let handedToModel = false;
+
       if (selected.length) {
         const lines = selected.map((r,i) => `#${i+1} — ${r.title || "(no title)"} (score ${formatScore(r.score)}) — ${r.url}`).join("\n");
         const msg = `Here are ${selected.length} sources:\n${lines}`;
@@ -3586,7 +3613,13 @@ async function executeTool(ws, meta, call_id="auto") {
 
       // If not list-only, continue to model to pick best URL
       if (!wantsListOnly(meta.requestText || "") && selected.length) {
+        handedToModel = true;
         await callModelWithSearchResults(ws, meta, run);
+      }
+
+      if (meta?.autoResearch && !handedToModel) {
+        const context = getAutoResearchContext(meta.sessionId);
+        if (context) finalizeAutoResearchEvent(ws, meta.sessionId, context);
       }
     } else {
       ws.send(JSON.stringify({ type:"error", error:"unsupported_tool" }));
@@ -3669,6 +3702,12 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
   const artifacts = extractArtifactsTolerant(completion);
   let cleanText = artifacts.cleanText;
   const { memo, gap, evidence, kdn, call, note } = artifacts;
+  const finalizeAutoResearch = () => {
+    if (meta?.autoResearch) {
+      const context = getAutoResearchContext(sessionId);
+      if (context) finalizeAutoResearchEvent(ws, sessionId, context);
+    }
+  };
   if (usage) {
     ws.send(JSON.stringify({ type:"telemetry", usage }));
     if (usage.total_tokens && updateLastEpisode({ tokens_total: usage.total_tokens })) {
@@ -3728,13 +3767,13 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
       || normalizeTopicKey(storedList?.normalizedTopic || "", "news")
       || normalizeTopicKey(storedList?.topic || "", "news");
     emitEventLog(ws, "list_model_blocked", { topic: canonicalListTopic, reason: "model_block" });
-    if (await triggerServerListFallback()) return;
+    if (await triggerServerListFallback()) { finalizeAutoResearch(); return; }
     cleanText = "";
   }
 
   const wantsServerList = /here are\s+5\s+sources\b/i.test(cleanText || "");
   if (wantsServerList && !hasRecentServerList(sessionId)) {
-    if (await triggerServerListFallback()) return;
+    if (await triggerServerListFallback()) { finalizeAutoResearch(); return; }
   }
 
   if (kdn) {
@@ -3821,6 +3860,8 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
       ws.send(JSON.stringify({ type: "note_rejected", reason: "invalid_note_payload" }));
     }
   }
+
+  finalizeAutoResearch();
 }
 
 function getTrimmedHistory(sessionId, { omitAssistantTail = false } = {}) {
