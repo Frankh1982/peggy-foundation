@@ -560,6 +560,7 @@ async function maybeRunAutoResearch({
   if (getAutoResearchSearchCount(sessionId) >= MAX_AUTO_SEARCHES_PER_TURN) return null;
   if (isSearchCommand || summarizeCommand || hasUrl) return null;
   if (listIntent && !freshCue) return null;
+  if (!freshCue && conceptContextCount > 0) return null;
 
   const lastKdn = getLastKdn(sessionId);
   const rawText = typeof content === "string" ? content : "";
@@ -2615,6 +2616,95 @@ function detectListIntent(text) {
 
 function wantsListOnly(text) { return Boolean(detectListIntent(text)); }
 
+function cleanConceptPhrase(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/^[\s,;:\-]+/, "")
+    .replace(/[?!.\s]+$/g, "")
+    .trim();
+}
+
+function extractConceptPhrases(text) {
+  const raw = typeof text === "string" ? text : "";
+  if (!raw.trim()) return [];
+  const normalized = raw.replace(/\s+/g, " ");
+  const phrases = new Set();
+
+  const push = (value) => {
+    const cleaned = cleanConceptPhrase(value);
+    if (!cleaned) return;
+    if (cleaned.length < 3) return;
+    phrases.add(cleaned);
+  };
+
+  const patterns = [
+    /(?:two[-\s]?sentence|brief|quick|short)?\s*update\s+(?:on|about|regarding)\s+([^?!.]+)/gi,
+    /(?:what(?:'s| is)?\s+)?(?:the\s+)?latest\s+(?:on|about|regarding)\s+([^?!.]+)/gi,
+    /(?:news|info|information|story|coverage|background|recap)\s+(?:on|about|regarding)\s+([^?!.]+)/gi,
+    /(?:summary|recap)\s+(?:on|about|regarding)\s+([^?!.]+)/gi,
+    /\b(?:on|about|regarding)\s+([^?!.]+?)(?:\?|$)/gi
+  ];
+
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(normalized))) {
+      if (match && match[1]) {
+        push(match[1]);
+      }
+    }
+  }
+
+  const quoteRegex = /["“”'‘’]([^"“”'‘’]{3,})["“”'‘’]/g;
+  let quoteMatch;
+  while ((quoteMatch = quoteRegex.exec(normalized))) {
+    if (quoteMatch && quoteMatch[1]) {
+      push(quoteMatch[1]);
+    }
+  }
+
+  return Array.from(phrases);
+}
+
+function conceptKeyFromText(text) {
+  const normalizedTopicKey = normalizeTopicKey(text, "news");
+  if (!normalizedTopicKey) return "";
+  const colonIdx = normalizedTopicKey.indexOf(":");
+  const body = colonIdx >= 0 ? normalizedTopicKey.slice(colonIdx + 1) : normalizedTopicKey;
+  return normalizeConceptKey(body);
+}
+
+function gatherConceptKeyCandidates({ content = "", topic = "", listIntent = null } = {}) {
+  const candidates = new Map();
+  const addCandidate = (value, weight = 1) => {
+    if (!value) return;
+    const key = conceptKeyFromText(value);
+    if (!key) return;
+    const existing = candidates.get(key);
+    if (!existing || weight > existing.weight) {
+      candidates.set(key, { key, weight });
+    }
+  };
+
+  addCandidate(content, 1);
+  if (topic) addCandidate(topic, 1.4);
+  if (listIntent?.query) addCandidate(listIntent.query, 1.6);
+
+  const focusPhrases = extractConceptPhrases(content);
+  let phraseWeight = 1.3;
+  for (const phrase of focusPhrases) {
+    addCandidate(phrase, phraseWeight);
+    phraseWeight = Math.max(1.05, phraseWeight - 0.05);
+  }
+
+  return Array.from(candidates.values())
+    .sort((a, b) => {
+      if (b.weight !== a.weight) return b.weight - a.weight;
+      return a.key.localeCompare(b.key);
+    })
+    .map(entry => entry.key);
+}
+
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (ACCESS_TOKEN) {
@@ -2883,20 +2973,7 @@ wss.on("connection", (ws, req) => {
       touchCardOnce(card);
     }
     if (!conceptContextBlock) {
-      const candidateKeys = new Set();
-      const pushCandidate = (value) => {
-        const normalized = normalizeConceptKey(value);
-        if (!normalized) return;
-        candidateKeys.add(normalized);
-      };
-      pushCandidate(topic);
-      const normalizedTopicKey = normalizeTopicKey(content, "news");
-      if (normalizedTopicKey) {
-        const colonIdx = normalizedTopicKey.indexOf(":");
-        const body = colonIdx >= 0 ? normalizedTopicKey.slice(colonIdx + 1) : normalizedTopicKey;
-        pushCandidate(body);
-      }
-
+      const candidateKeys = gatherConceptKeyCandidates({ content, topic, listIntent });
       for (const keyCandidate of candidateKeys) {
         const context = buildConceptContextBlock(keyCandidate);
         if (context?.notes?.length) {
