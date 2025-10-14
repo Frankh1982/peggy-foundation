@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard } from "./cards.js";
+import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -94,6 +94,13 @@ const ANALOGY_MAX_PROPOSALS_PER_DAY = (() => {
 const ANALOGY_AUTO_STATE = { dateKey: "", total: 0 };
 const ANALOGY_CONCEPT_DAILY = new Map();
 
+const NOTE_DEMOTE_INTERVAL_MS = 5 * 60 * 1000;
+const SIMHASH_DUP_THRESHOLD = 6;
+
+const demotedNotes = new Set();
+const conceptLearningStats = new Map();
+let conceptTurnCounter = 0;
+
 const cardsDirPath = path.resolve("data", "cards");
 const indexDirPath = path.resolve("data", "index");
 fs.mkdirSync(cardsDirPath, { recursive: true });
@@ -134,6 +141,110 @@ const sessionAutoResearchSearchCount = new Map();
 const sessionLastKdnState = new Map();
 const sessionConceptSuggestions = new Map();
 const sessionAnalogyProposals = new Map();
+
+function refreshNoteDemotions() {
+  try {
+    const all = readAllCards();
+    const now = Date.now();
+    const active = new Set();
+    for (const card of all) {
+      if (!card || card.type !== "note" || !card.id) continue;
+      const stale = isStale(card, FRESH_TTL_DAYS, now);
+      if (stale) {
+        active.add(card.id);
+      }
+    }
+    demotedNotes.clear();
+    for (const id of active) demotedNotes.add(id);
+  } catch (err) {
+    console.error("note_demote_refresh_error", err);
+  }
+}
+
+refreshNoteDemotions();
+const demoteInterval = setInterval(refreshNoteDemotions, NOTE_DEMOTE_INTERVAL_MS);
+if (typeof demoteInterval.unref === "function") demoteInterval.unref();
+
+function isNoteDemoted(noteId) {
+  const clean = String(noteId || "").trim();
+  if (!clean) return false;
+  return demotedNotes.has(clean);
+}
+
+function ensureConceptEntry(key) {
+  let entry = conceptLearningStats.get(key);
+  if (!entry) {
+    entry = { window: [], lastTurn: 0, paused: false, totals: { used: 0, saved: 0 } };
+    conceptLearningStats.set(key, entry);
+  }
+  return entry;
+}
+
+function appendZeroTurns(entry, fromTurn, toTurn) {
+  if (!entry || toTurn <= fromTurn) return;
+  for (let t = fromTurn + 1; t <= toTurn; t += 1) {
+    entry.window.push({ used: 0, saved: 0 });
+    if (entry.window.length > 20) entry.window.shift();
+  }
+}
+
+function finalizeConceptTurn(ws, turnStats, tokenMeter) {
+  conceptTurnCounter += 1;
+  const currentTurn = conceptTurnCounter;
+  for (const [rawKey, stats] of turnStats.entries()) {
+    const normalizedKey = normalizeConceptKey(rawKey);
+    if (!normalizedKey) continue;
+    const entry = ensureConceptEntry(normalizedKey);
+    appendZeroTurns(entry, entry.lastTurn, currentTurn - 1);
+    const used = Number(stats?.used || 0);
+    const saved = Number(stats?.saved || 0);
+    entry.window.push({ used, saved });
+    if (entry.window.length > 20) entry.window.shift();
+    entry.lastTurn = currentTurn;
+  }
+
+  for (const [key, entry] of conceptLearningStats.entries()) {
+    if (entry.lastTurn === currentTurn) continue;
+    appendZeroTurns(entry, entry.lastTurn, currentTurn - 1);
+    entry.window.push({ used: 0, saved: 0 });
+    if (entry.window.length > 20) entry.window.shift();
+    entry.lastTurn = currentTurn;
+  }
+
+  for (const [key, entry] of conceptLearningStats.entries()) {
+    const totals = entry.window.reduce((acc, record) => {
+      acc.used += Number(record?.used || 0);
+      acc.saved += Number(record?.saved || 0);
+      return acc;
+    }, { used: 0, saved: 0 });
+    entry.totals = totals;
+    const ratio = totals.saved > 0 ? totals.used / totals.saved : 1;
+    const below = totals.saved > 0 && ratio < 0.3;
+    const above = totals.saved === 0 || ratio >= 0.35;
+    if (below && !entry.paused) {
+      entry.paused = true;
+      if (ws) emitEventLog(ws, "auto_learn_paused", { key, reason: "low_utility" });
+    } else if (entry.paused && above) {
+      entry.paused = false;
+    }
+  }
+
+  if (ws && tokenMeter) {
+    if (tokenMeter.concept > 0) {
+      emitEventLog(ws, "tokens_saved", { via: "concept", tokens_saved: Math.round(tokenMeter.concept) });
+    }
+    if (tokenMeter.search > 0) {
+      emitEventLog(ws, "tokens_saved", { via: "search", tokens_saved: Math.round(tokenMeter.search) });
+    }
+  }
+}
+
+function isConceptAutoWritePaused(key) {
+  const normalizedKey = normalizeConceptKey(key);
+  if (!normalizedKey) return false;
+  const entry = conceptLearningStats.get(normalizedKey);
+  return Boolean(entry?.paused);
+}
 
 function topicToSearchPhrase(topic) {
   const raw = String(topic || "").trim();
@@ -580,7 +691,8 @@ async function maybeRunAutoResearch({
   inReplyToGap,
   conceptContextBlock = "",
   conceptContextKey = "",
-  conceptContextCount = 0
+  conceptContextCount = 0,
+  turnHooks = null
 }) {
   if (!sessionId || !userId) return null;
   if (inReplyToGap) return null;
@@ -654,7 +766,8 @@ async function maybeRunAutoResearch({
       banditKeys: keysUsed,
       runNumber,
       autoResearch: true,
-      ...conceptMeta
+      ...conceptMeta,
+      turnHooks
     }, "auto_research");
     return { triggered: true, handled: true, context };
   } catch (err) {
@@ -806,9 +919,16 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
           autoLinkNoteToInferredConcept(ws, sessionId, noteResult.card);
           maybeSuggestConceptLink(ws, sessionId, noteResult.card);
           maybeProposeAnalogyFromNote(ws, sessionId, noteResult.card);
+          if (turnHooks?.registerConceptSave && noteResult.conceptKey) {
+            turnHooks.registerConceptSave(noteResult.conceptKey, 1);
+          }
           if (updateLastEpisode({ note_saved: true })) {
             ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
           }
+        } else if (noteResult?.error === "duplicate_note" && noteResult?.conceptKey) {
+          context.lastError = "duplicate";
+        } else if (noteResult?.error === "auto_paused") {
+          context.lastError = "auto_paused";
         }
       }
     }
@@ -1953,6 +2073,7 @@ function buildConceptContextBlock(conceptKey, { limit = 3 } = {}) {
     const note = findNoteCard(edge.note_id);
     if (!note || seenIds.has(note.id)) continue;
     if (note.type && note.type !== "note") continue;
+    if (isNoteDemoted(note.id)) continue;
     seenIds.add(note.id);
 
     const summary = formatCardOneLiner(note);
@@ -2620,6 +2741,42 @@ function sanitizeNoteSource(source) {
   return sanitized;
 }
 
+function findNearDuplicateNote(conceptKey, fingerprint) {
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  const candidateHash = fingerprint?.simhash;
+  const normalizedText = typeof fingerprint?.normalized === "string" ? fingerprint.normalized : "";
+  if (!normalizedKey || !candidateHash) return null;
+  const edges = listConceptEdgesForKey(normalizedKey);
+  if (!edges.length) return null;
+  let closest = null;
+  for (const edge of edges) {
+    const note = findNoteCard(edge.note_id);
+    if (!note || note.type !== "note") continue;
+    let existingHash = typeof note.value?.metadata?.simhash === "string" ? note.value.metadata.simhash.trim() : "";
+    let existingNormalized = typeof note.value?.metadata?.normalized_summary === "string"
+      ? note.value.metadata.normalized_summary
+      : "";
+    if (!existingHash || !existingNormalized) {
+      const computed = computeNoteFingerprint(note);
+      if (!existingHash && computed?.simhash) existingHash = computed.simhash;
+      if (!existingNormalized && computed?.normalized) existingNormalized = computed.normalized;
+    }
+    if (!existingHash) continue;
+    if (normalizedText && existingNormalized && normalizedText === existingNormalized) {
+      return { noteId: note.id, distance: 0 };
+    }
+    const distance = simhashDistance(existingHash, candidateHash);
+    if (!Number.isFinite(distance)) continue;
+    if (distance <= SIMHASH_DUP_THRESHOLD) {
+      if (!closest || distance < closest.distance) {
+        closest = { noteId: note.id, distance };
+        if (distance === 0) break;
+      }
+    }
+  }
+  return closest;
+}
+
 function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run, reason, topicHint, autoResearch = false }) {
   if (!payload || typeof payload !== "object") {
     return { saved: false, error: "invalid_payload" };
@@ -2732,12 +2889,45 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
     ttl_days: ttlDays
   };
 
+  const fingerprint = computeNoteFingerprint(card);
+  if (fingerprint?.simhash) {
+    card.value.metadata.simhash = fingerprint.simhash;
+  }
+  if (fingerprint?.normalized) {
+    card.value.metadata.normalized_summary = fingerprint.normalized;
+  }
+
+  const inferredConcept = inferConceptKey(card);
+  let conceptKey = "";
+  if (inferredConcept) {
+    const colonIdx = inferredConcept.indexOf(":");
+    const body = colonIdx >= 0 ? inferredConcept.slice(colonIdx + 1) : inferredConcept;
+    conceptKey = normalizeConceptKey(body);
+  }
+
   if (!shouldSave(card, metrics)) {
     if (autoContext) {
       autoContext.lastError = "score_low";
       autoContext.candidate = { summary: trimmedSummary, url: sanitizedSource.url, score };
     }
-    return { saved: false, error: "score_low", score, metrics };
+    return { saved: false, error: "score_low", score, metrics, conceptKey };
+  }
+
+  if (autoResearch && conceptKey && isConceptAutoWritePaused(conceptKey)) {
+    if (autoContext) {
+      autoContext.lastError = "paused_low_utility";
+    }
+    return { saved: false, error: "auto_paused", score, metrics, conceptKey };
+  }
+
+  if (conceptKey && fingerprint?.simhash) {
+    const duplicate = findNearDuplicateNote(conceptKey, fingerprint);
+    if (duplicate) {
+      if (autoContext) {
+        autoContext.lastError = "duplicate";
+      }
+      return { saved: false, error: "duplicate_note", score, metrics, conceptKey, duplicate };
+    }
   }
 
   const id = persistCard(card);
@@ -2745,7 +2935,7 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
     if (autoContext) {
       autoContext.lastError = "persist_failed";
     }
-    return { saved: false, error: "persist_failed", score, metrics };
+    return { saved: false, error: "persist_failed", score, metrics, conceptKey };
   }
 
   if (autoResearch) {
@@ -2758,7 +2948,7 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
 
   const logReason = reason || ((Number(explicitness) || 0) >= 1 ? "user_reply" : "");
   logCardWrite({ ts: now, type: card.type, topic: card.topic, score, reason: logReason });
-  return { saved: true, card: { ...card, id }, score, metrics };
+  return { saved: true, card: { ...card, id }, score, metrics, conceptKey };
 }
 
 function formatScore(score) {
@@ -2916,42 +3106,79 @@ wss.on("connection", (ws, req) => {
 
     if (msg.type !== "user_message") return;
 
-    const userId = msg.user_id || "default";
-    const sessionId = msg.session_id || "default";
-    resetAutoResearchSearchCount(sessionId);
-    const content = (msg.content || "").toString().slice(0, 8000);
-    const inReplyToGap = msg.in_reply_to_gap || null;
-    const topic = normalizeTopic(content);
-    const trimmedContent = content.trim();
-    const refreshMatch = trimmedContent.match(/^refresh(?:\s+(.+))?$/i);
-    const refreshArg = refreshMatch ? (refreshMatch[1] || "").trim() : "";
-    const freshRegexCue = FRESH_CUE_REGEX.test(content);
-    let freshCue = freshRegexCue;
-    if (refreshMatch) freshCue = true;
-    if (TWO_SENTENCE_REGEX.test(content) && !freshRegexCue) {
-      freshCue = false;
-    }
-    let freshnessAction = "none";
-    let freshnessTopic = topic;
-    let freshnessTopicSource = "message";
-    let note = null;
-    let stale = false;
-    let conceptContextBlock = "";
-    let conceptContextNotes = [];
-    let conceptContextKey = "";
-    let freshnessEventSent = false;
-    const sendFreshnessEvent = () => {
-      if (freshnessEventSent) return;
-      const canonicalTopic = freshnessTopic ? normalizeTopicKey(freshnessTopic, "news") : "";
-      emitEventLog(ws, "freshness_gate", {
-        cue: Boolean(freshCue),
-        note: Boolean(note),
-        stale: Boolean(stale),
-        action: freshnessAction,
-        topic: canonicalTopic
-      });
-      freshnessEventSent = true;
+    const turnConceptStats = new Map();
+    const turnTokenMeter = { concept: 0, search: 0 };
+    const bumpTurnConcept = (key, delta = {}) => {
+      const str = typeof key === "string" ? key.trim() : String(key || "").trim();
+      if (!str) return;
+      const existing = turnConceptStats.get(str) || { used: 0, saved: 0 };
+      if (delta.used) existing.used += Number(delta.used) || 0;
+      if (delta.saved) existing.saved += Number(delta.saved) || 0;
+      turnConceptStats.set(str, existing);
     };
+    const registerConceptUsage = (key, count = 0, blockLength = 0) => {
+      if (count > 0) {
+        bumpTurnConcept(key, { used: count });
+      }
+      if (blockLength > 0) {
+        const est = Math.max(1, Math.round(blockLength / 4));
+        turnTokenMeter.concept += est;
+      }
+    };
+    const registerConceptSave = (key, count = 1) => {
+      if (count <= 0) return;
+      bumpTurnConcept(key, { saved: count });
+    };
+    const registerSearchTokens = (tokens = 0) => {
+      const numeric = Number(tokens);
+      if (!Number.isFinite(numeric) || numeric <= 0) return;
+      turnTokenMeter.search += Math.round(numeric);
+    };
+    const turnHooks = { registerConceptUsage, registerConceptSave, registerSearchTokens };
+    let turnFinalized = false;
+    const finalizeTurn = () => {
+      if (turnFinalized) return;
+      finalizeConceptTurn(ws, turnConceptStats, turnTokenMeter);
+      turnFinalized = true;
+    };
+
+    try {
+      const userId = msg.user_id || "default";
+      const sessionId = msg.session_id || "default";
+      resetAutoResearchSearchCount(sessionId);
+      const content = (msg.content || "").toString().slice(0, 8000);
+      const inReplyToGap = msg.in_reply_to_gap || null;
+      const topic = normalizeTopic(content);
+      const trimmedContent = content.trim();
+      const refreshMatch = trimmedContent.match(/^refresh(?:\s+(.+))?$/i);
+      const refreshArg = refreshMatch ? (refreshMatch[1] || "").trim() : "";
+      const freshRegexCue = FRESH_CUE_REGEX.test(content);
+      let freshCue = freshRegexCue;
+      if (refreshMatch) freshCue = true;
+      if (TWO_SENTENCE_REGEX.test(content) && !freshRegexCue) {
+        freshCue = false;
+      }
+      let freshnessAction = "none";
+      let freshnessTopic = topic;
+      let freshnessTopicSource = "message";
+      let note = null;
+      let stale = false;
+      let conceptContextBlock = "";
+      let conceptContextNotes = [];
+      let conceptContextKey = "";
+      let freshnessEventSent = false;
+      const sendFreshnessEvent = () => {
+        if (freshnessEventSent) return;
+        const canonicalTopic = freshnessTopic ? normalizeTopicKey(freshnessTopic, "news") : "";
+        emitEventLog(ws, "freshness_gate", {
+          cue: Boolean(freshCue),
+          note: Boolean(note),
+          stale: Boolean(stale),
+          action: freshnessAction,
+          topic: canonicalTopic
+        });
+        freshnessEventSent = true;
+      };
 
     const shortcutNote = extractNoteShortcutCommand(content);
     if (shortcutNote) {
@@ -3080,8 +3307,11 @@ wss.on("connection", (ws, req) => {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
         }
       } else {
-        ws.send(JSON.stringify({ type: "note_rejected", reason: result.error || "unknown" }));
-        const reply = "I couldn't save that note.";
+        const reason = result.error || "unknown";
+        ws.send(JSON.stringify({ type: "note_rejected", reason }));
+        const reply = reason === "duplicate_note"
+          ? "That note is very similar to one I already saved for this concept."
+          : "I couldn't save that note.";
         appendMessage(sessionId, { role: "assistant", content: reply });
         ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
       }
@@ -3116,16 +3346,26 @@ wss.on("connection", (ws, req) => {
           ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
         }
       } else {
+        const reason = result.error || "unknown";
         ws.send(JSON.stringify({
           type: "note_rejected",
-          reason: result.error || "unknown"
+          reason
         }));
+        if (reason === "duplicate_note") {
+          const reply = "That note looks like a duplicate of what I already have.";
+          appendMessage(sessionId, { role: "assistant", content: reply });
+          ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+        }
       }
       sendFreshnessEvent();
       return;
     }
 
     let cards = topic ? getTopByTopic(topic, { limit: 3 }) : [];
+    cards = cards.filter(card => {
+      if (!card || card.type !== "note") return true;
+      return !isNoteDemoted(card.id);
+    });
     const cardsById = new Map();
     for (const card of cards) {
       if (card && card.id) {
@@ -3205,9 +3445,10 @@ wss.on("connection", (ws, req) => {
           conceptContextCount: conceptContextNotes.length
         }
       : null;
-    const withConceptContext = (meta) => {
-      if (!conceptContextMeta) return meta;
-      return { ...meta, ...conceptContextMeta };
+    const withConceptContext = (meta = {}) => {
+      const base = { ...meta, turnHooks };
+      if (!conceptContextMeta) return base;
+      return { ...base, ...conceptContextMeta };
     };
 
     const flushCardUsage = () => {
@@ -3375,6 +3616,7 @@ wss.on("connection", (ws, req) => {
       const replyCandidate = twoSentenceFromNotes(enrichedNotes);
       const reply = replyCandidate || "I don't have any notes on that yet.";
       freshnessAction = "note";
+      registerConceptUsage(conceptContextKey, conceptContextNotes.length, conceptContextBlock.length);
       for (const entry of conceptContextNotes) {
         if (entry?.card) touchCardOnce(entry.card);
       }
@@ -3383,6 +3625,10 @@ wss.on("connection", (ws, req) => {
       sendFreshnessEvent();
       flushCardUsage();
       return;
+    }
+
+    if (conceptContextBlock && conceptContextNotes.length) {
+      registerConceptUsage(conceptContextKey, conceptContextNotes.length, conceptContextBlock.length);
     }
 
     let autoResearchOutcome = null;
@@ -3403,7 +3649,8 @@ wss.on("connection", (ws, req) => {
         inReplyToGap,
         conceptContextBlock,
         conceptContextKey,
-        conceptContextCount: conceptContextNotes.length
+        conceptContextCount: conceptContextNotes.length,
+        turnHooks
       });
     } catch (err) {
       console.error("auto_research_invoke_error", err);
@@ -3605,12 +3852,17 @@ wss.on("connection", (ws, req) => {
       sendFreshnessEvent();
       flushCardUsage();
       const { content: completion, usage } = await callOpenAI(messages);
-      await handleAssistantResponse(ws, { completion, usage, userId, sessionId });
+      await handleAssistantResponse(ws, { completion, usage, userId, sessionId }, turnHooks);
     } catch (err) {
       sendFreshnessEvent();
       ws.send(JSON.stringify({ type: "assistant_message", content: "unknown with current context (API error)." }));
       console.error(err);
     }
+  } catch (err) {
+    console.error("chat_turn_error", err);
+  } finally {
+    finalizeTurn();
+  }
   });
 });
 
@@ -3628,6 +3880,10 @@ async function executeTool(ws, meta, call_id="auto") {
       // Learning: fetch ledger
       recordFetch({ userId: meta.userId, sessionId: meta.sessionId, url: result.url, title: result.title, chars: result.chars, latency_ms: result.latency_ms });
       ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
+
+      if (meta.turnHooks?.registerSearchTokens) {
+        meta.turnHooks.registerSearchTokens(Math.round((result?.chars || 0) / 4));
+      }
 
       rememberLastSummary(meta.sessionId, {
         url: result.url,
@@ -3654,6 +3910,10 @@ async function executeTool(ws, meta, call_id="auto") {
         q_base: meta.spec.args.q, qlist: result?.qlist || meta.spec.args.qlist || [],
         engine: result?.engine || "unknown", k, latency_ms, error: null
       });
+      if (meta.turnHooks?.registerSearchTokens) {
+        const estimate = (result?.k || 0) * 60;
+        meta.turnHooks.registerSearchTokens(estimate);
+      }
       const reward = Math.max(0, Math.min(1, k/3)) - 0.02*(latency_ms/1000);
       if (Array.isArray(meta.banditKeys) && meta.banditKeys.length) updateBandit(meta.banditKeys, reward);
       recordEpisode({
@@ -3939,7 +4199,7 @@ async function callModelWithGetResult(ws, meta, run) {
 
   const { content: completion, usage } = await callOpenAI(messages);
   const forced = enforceSummaryCompletionFormat(completion, run);
-  await handleAssistantResponse(ws, { completion: forced, usage, userId, sessionId, origin: "web_get_summary", run, meta });
+  await handleAssistantResponse(ws, { completion: forced, usage, userId, sessionId, origin: "web_get_summary", run, meta }, meta.turnHooks || null);
 }
 
 async function callModelWithSearchResults(ws, meta, run) {
@@ -3963,7 +4223,7 @@ async function callModelWithSearchResults(ws, meta, run) {
   ];
 
   const { content: completion, usage } = await callOpenAI(messages);
-  await handleAssistantResponse(ws, { completion, usage, userId, sessionId, meta });
+  await handleAssistantResponse(ws, { completion, usage, userId, sessionId, meta }, meta.turnHooks || null);
 }
 
 function hasRecentServerList(sessionId, windowMs = 2500) {
@@ -3972,7 +4232,7 @@ function hasRecentServerList(sessionId, windowMs = 2500) {
   return (Date.now() - stored.ts) <= windowMs;
 }
 
-async function handleAssistantResponse(ws, { completion, usage, userId, sessionId, origin = null, run = null, meta = null }) {
+async function handleAssistantResponse(ws, { completion, usage, userId, sessionId, origin = null, run = null, meta = null }, turnHooks = null) {
   const artifacts = extractArtifactsTolerant(completion);
   let cleanText = artifacts.cleanText;
   const { memo, gap, evidence, kdn, call, note } = artifacts;
@@ -4029,7 +4289,7 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
           conceptContextCount: meta.conceptContextCount || 0
         }
       : {};
-    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber, ...conceptMeta });
+    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber, ...conceptMeta, turnHooks });
     return true;
   };
 
@@ -4065,14 +4325,14 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
   if (call) {
     let spec; try { spec = JSON.parse(call); } catch {}
     if (spec && (spec.tool === "web_get" || spec.tool === "web_search")) {
-      const nextMeta = { userId, sessionId, spec };
+      const nextMeta = { userId, sessionId, spec, turnHooks: turnHooks || meta?.turnHooks || null };
       if (meta?.conceptContextBlock) {
         nextMeta.conceptContextBlock = meta.conceptContextBlock;
         nextMeta.conceptContextKey = meta.conceptContextKey || "";
         nextMeta.conceptContextCount = meta.conceptContextCount || 0;
       }
       if (meta?.autoResearch) nextMeta.autoResearch = true;
-      executeTool(ws, nextMeta, meta?.autoResearch ? "auto_research" : "auto");
+      await executeTool(ws, nextMeta, meta?.autoResearch ? "auto_research" : "auto");
       return;
     }
   }
@@ -4125,6 +4385,9 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
         autoLinkNoteToInferredConcept(ws, meta.sessionId, result.card);
         maybeSuggestConceptLink(ws, meta.sessionId, result.card);
         maybeProposeAnalogyFromNote(ws, meta.sessionId, result.card);
+        if (meta?.autoResearch && turnHooks?.registerConceptSave && result.conceptKey) {
+          turnHooks.registerConceptSave(result.conceptKey, 1);
+        }
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
         }

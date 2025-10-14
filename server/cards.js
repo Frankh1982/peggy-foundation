@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const cardsDir = path.resolve("data", "cards");
@@ -190,6 +190,112 @@ function dedupeStrings(values = []) {
     result.push(trimmed);
   }
   return result;
+}
+
+function collectNoteText(note) {
+  if (!note || typeof note !== "object") return "";
+  const parts = [];
+  const push = (value) => {
+    if (!value) return;
+    const str = String(value).replace(/[\r\n]+/g, " ").trim();
+    if (!str) return;
+    parts.push(str);
+  };
+  push(note.summary);
+  push(note.topic);
+  push(note.value?.data?.summary);
+  push(note.value?.data?.headline);
+  push(note.value?.data?.title);
+  push(note.value?.data?.key_points?.join?.(" "));
+  push(note.value?.source?.title);
+  push(note.value?.source?.excerpt);
+  push(note.value?.source?.snippet);
+  return parts.join(" ");
+}
+
+function normalizeTextForSimhash(text) {
+  const raw = String(text || "");
+  if (!raw.trim()) return "";
+  const lower = raw.toLowerCase();
+  const withoutUrls = lower.replace(/https?:\/\/\S+/g, " ");
+  const cleaned = withoutUrls.replace(/[^a-z0-9\s]+/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned;
+}
+
+function tokenizeForSimhash(normalizedText) {
+  if (!normalizedText) return [];
+  const words = normalizedText.split(" ").filter(Boolean);
+  if (!words.length) return [];
+  const tokens = [];
+  const maxTokens = 128;
+  for (let i = 0; i < words.length && tokens.length < maxTokens; i += 1) {
+    tokens.push(words[i]);
+  }
+  for (let i = 0; i < words.length - 1 && tokens.length < maxTokens; i += 1) {
+    tokens.push(`${words[i]}_${words[i + 1]}`);
+  }
+  for (let i = 0; i < words.length - 2 && tokens.length < maxTokens; i += 1) {
+    tokens.push(`${words[i]}_${words[i + 1]}_${words[i + 2]}`);
+  }
+  return tokens;
+}
+
+function simhashFromTokens(tokens, bits = 64) {
+  if (!Array.isArray(tokens) || !tokens.length) return null;
+  const vector = new Array(bits).fill(0);
+  for (const token of tokens) {
+    const digest = createHash("sha256").update(String(token)).digest("hex").slice(0, bits / 4);
+    if (!digest) continue;
+    let value;
+    try {
+      value = BigInt(`0x${digest}`);
+    } catch {
+      continue;
+    }
+    for (let bit = 0; bit < bits; bit += 1) {
+      const mask = 1n << BigInt(bits - 1 - bit);
+      vector[bit] += (value & mask) ? 1 : -1;
+    }
+  }
+  let result = 0n;
+  for (let bit = 0; bit < bits; bit += 1) {
+    if (vector[bit] > 0) {
+      result |= 1n << BigInt(bits - 1 - bit);
+    }
+  }
+  return result.toString(16).padStart(bits / 4, "0");
+}
+
+export function computeNoteFingerprint(note) {
+  const text = collectNoteText(note);
+  const normalized = normalizeTextForSimhash(text);
+  if (!normalized) {
+    return { normalized: "", simhash: null };
+  }
+  const tokens = tokenizeForSimhash(normalized);
+  if (!tokens.length) {
+    return { normalized, simhash: null };
+  }
+  const simhash = simhashFromTokens(tokens);
+  return { normalized, simhash };
+}
+
+export function simhashDistance(a, b) {
+  const cleanA = typeof a === "string" ? a.trim() : "";
+  const cleanB = typeof b === "string" ? b.trim() : "";
+  if (!cleanA || !cleanB) return Number.POSITIVE_INFINITY;
+  let xor;
+  try {
+    xor = BigInt(`0x${cleanA}`) ^ BigInt(`0x${cleanB}`);
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+  let distance = 0;
+  while (xor) {
+    distance += Number(xor & 1n);
+    xor >>= 1n;
+  }
+  return distance;
 }
 
 export function inferConceptMetadata(key) {
