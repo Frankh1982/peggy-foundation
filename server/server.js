@@ -8,7 +8,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { normalizeTopic, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, repairAmdOpenaiDealIndex } from "./cards.js";
+import { normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -46,7 +46,7 @@ if (!fs.existsSync(cardWriteLogFile)) {
 }
 
 migrateLegacyCardData();
-repairAmdOpenaiDealIndex();
+reindexTopicKeys();
 
 if (!OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY in .env");
@@ -150,14 +150,19 @@ function normalizeListItems(items) {
 
 function setLastListContext(sessionId, { topicKey, qBase, items }) {
   if (!sessionId) return;
-  let normalizedTopicKey = normalizeTopic(topicKey || "");
   const lastQBase = String(qBase || "").trim();
-  if (!normalizedTopicKey && lastQBase) {
-    normalizedTopicKey = normalizeTopic(lastQBase);
+  let canonicalTopicKey = "";
+  for (const candidate of [topicKey, lastQBase]) {
+    if (!candidate) continue;
+    const normalized = normalizeTopicKey(candidate, "news");
+    if (normalized) {
+      canonicalTopicKey = normalized;
+      break;
+    }
   }
   const listItems = normalizeListItems(items);
   sessionLastList.set(sessionId, {
-    lastTopicKey: normalizedTopicKey || "",
+    lastTopicKey: canonicalTopicKey,
     lastQBase,
     lastList: {
       items: listItems,
@@ -431,7 +436,7 @@ function extractPrefKey(text) {
 
 function buildNoteFingerprint(note) {
   if (!note || typeof note !== "object") return "";
-  const topicKey = normalizeTopic(note.topic || note.title || "");
+  const topicKey = normalizeTopicKey(note.topic || note.title || "");
   const summaryKey = String(note.summary || "").trim().toLowerCase();
   const sourceKey = String(note.source?.url || note.url || "").trim().toLowerCase();
   const tsKey = note.ts || note.timestamp || "";
@@ -473,7 +478,7 @@ function migrateLegacyCardData() {
 
     for (const card of existingCards) {
       if (!card || typeof card !== "object") continue;
-      const normalizedTopic = normalizeTopic(card.topic || "");
+      const normalizedTopic = normalizeTopicKey(card.topic || "");
       const cardUserKey = canonicalUserId(
         card.value?.userId
         || card.value?.legacy?.userId
@@ -1023,6 +1028,9 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
     return { saved: false, error: "missing_summary" };
   }
 
+  const canonicalTopic = normalizeTopicKey(finalTopic, "news");
+  const topicForCard = canonicalTopic || finalTopic;
+
   const sanitizedSource = sanitizeNoteSource(payload.source || payload);
   if (!sanitizedSource) {
     return { saved: false, error: "missing_source_url" };
@@ -1040,7 +1048,7 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
   const ageMs = Number.isFinite(tsCandidate) ? Math.max(0, Date.now() - tsCandidate) : null;
   const recency = ageMs === null ? 1 : recencyFromAge(ageMs);
 
-  const topicKey = normalizeTopic(finalTopic);
+  const topicKey = normalizeTopicKey(topicForCard, "news") || normalizeTopic(topicForCard);
   let touches = 0;
   if (topicKey) {
     const state = getTopicState(sessionId, topicKey);
@@ -1067,13 +1075,13 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
 
   const card = {
     type: "note",
-    topic: finalTopic,
+    topic: topicForCard,
     summary: trimmedSummary,
     value: {
       source: sanitizedSource,
       data: {
         ...payload,
-        topic: finalTopic,
+        topic: topicForCard,
         summary: trimmedSummary
       },
       metadata: {
@@ -1194,13 +1202,7 @@ wss.on("connection", (ws, req) => {
     let freshnessEventSent = false;
     const sendFreshnessEvent = () => {
       if (freshnessEventSent) return;
-      const canonicalTopic = (() => {
-        if (!freshnessTopic) return "";
-        if (freshnessTopicSource === "list") {
-          return normalizeTopic(freshnessTopic, { prefix: "news" });
-        }
-        return normalizeTopic(freshnessTopic);
-      })();
+      const canonicalTopic = freshnessTopic ? normalizeTopicKey(freshnessTopic, "news") : "";
       emitEventLog(ws, "freshness_gate", {
         cue: Boolean(freshCue),
         note: Boolean(note),
@@ -1933,10 +1935,27 @@ async function executeTool(ws, meta, call_id="auto") {
           return normalized ? normalized.trim() : "";
         })();
         const humanQuery = String(meta.requestText || baseQuery || "").trim();
+        const originalUserQuery = humanQuery || baseQuery || "";
+        const canonicalTopicKey = (() => {
+          const candidates = [
+            originalUserQuery,
+            normalizedTopic,
+            normalizedQuery,
+            topicToSearchPhrase(topic),
+            baseQuery,
+            topic
+          ];
+          for (const candidate of candidates) {
+            if (!candidate) continue;
+            const normalized = normalizeTopicKey(candidate, "news");
+            if (normalized) return normalized;
+          }
+          return "";
+        })();
         const listItems = selected.map(r => ({ title: r.title || "", url: r.url, host: r.domain || null }));
         setLastListContext(meta.sessionId, {
-          topicKey: normalizedTopic || normalizeTopic(humanQuery) || normalizeTopic(topicToSearchPhrase(topic)) || topic,
-          qBase: humanQuery,
+          topicKey: canonicalTopicKey,
+          qBase: originalUserQuery,
           items: listItems
         });
         sessionSearch.set(meta.sessionId, {
@@ -1947,7 +1966,9 @@ async function executeTool(ws, meta, call_id="auto") {
           normalizedQuery,
           normalizedTopic,
           list: listItems,
-          ts: Date.now()
+          ts: Date.now(),
+          lastTopicKey: canonicalTopicKey,
+          lastQBase: originalUserQuery
         });
       }
 
@@ -1957,13 +1978,9 @@ async function executeTool(ws, meta, call_id="auto") {
         appendMessage(meta.sessionId, { role:"assistant", content: msg });
         ws.send(JSON.stringify({ type:"assistant_message", content: msg }));
         ws.send(JSON.stringify({ type: "list_posted", explore: exploreFlag, reason: exploreReason, hosts: selectedHosts }));
-        const canonicalListTopic = (() => {
-          if (normalizedTopic) return normalizeTopic(normalizedTopic, { prefix: "news" });
-          const fromHuman = normalizeTopic(humanQuery, { prefix: "news" });
-          if (fromHuman) return fromHuman;
-          const fromBucket = normalizeTopic(topicToSearchPhrase(topic), { prefix: "news" });
-          return fromBucket;
-        })();
+        const canonicalListTopic = canonicalTopicKey
+          || normalizeTopicKey(normalizedTopic || "", "news")
+          || normalizeTopicKey(humanQuery || normalizedQuery || topicToSearchPhrase(topic) || topic, "news");
         emitEventLog(ws, "list_posted", {
           runId: run?.id || null,
           items: selected.length,
@@ -2075,14 +2092,16 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
       const reuse = storedList?.queryForReuse ? storedList.queryForReuse.trim() : "";
       if (!reuse) return false;
       base = reuse;
-      topic = storedList?.topic || bucketTopic(base);
+      topic = storedList?.lastTopicKey || storedList?.topic || bucketTopic(base);
     }
     if (!base) {
       base = fallbackText.trim();
     }
     if (!base) return false;
     if (!topic) {
-      const topicSource = listIntent?.topicless && storedList?.topic ? storedList.topic : null;
+      const topicSource = listIntent?.topicless && storedList?.lastTopicKey
+        ? storedList.lastTopicKey
+        : storedList?.topic;
       topic = topicSource || bucketTopic(base || fallbackText);
     }
     const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
@@ -2101,12 +2120,9 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
   const looksLikeListHeader = listHeaderRegex.test(cleanText || "");
   if (looksLikeListHeader && !hasRecentServerList(sessionId, 2000)) {
     const storedList = getStoredListContext(sessionId);
-    const canonicalListTopic = (() => {
-      if (!storedList) return "";
-      if (storedList.normalizedTopic) return normalizeTopic(storedList.normalizedTopic, { prefix: "news" });
-      if (storedList.topic) return normalizeTopic(storedList.topic, { prefix: "news" });
-      return "";
-    })();
+    const canonicalListTopic = storedList?.lastTopicKey
+      || normalizeTopicKey(storedList?.normalizedTopic || "", "news")
+      || normalizeTopicKey(storedList?.topic || "", "news");
     emitEventLog(ws, "list_model_blocked", { topic: canonicalListTopic, reason: "model_block" });
     if (await triggerServerListFallback()) return;
     cleanText = "";
