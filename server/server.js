@@ -52,6 +52,34 @@ const MIN_WRITE_SCORE = (() => {
   }
   return 0.6;
 })();
+const envMinQueryLen = (process.env.MIN_QUERY_LEN ?? "").trim();
+const MIN_QUERY_LEN = (() => {
+  const numeric = Number(envMinQueryLen);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 3;
+  return Math.min(8, Math.max(1, Math.floor(numeric)));
+})();
+const NORMALIZE_QUOTES = (process.env.NORMALIZE_QUOTES || "").trim() === "1";
+const STRICT_FOLLOWUP = (process.env.STRICT_FOLLOWUP || "").trim() === "1";
+const RESET_OFFSET_ON_TOPIC_CHANGE = (process.env.RESET_OFFSET_ON_TOPIC_CHANGE || "").trim() === "1";
+const POLITICAL_NEWS_ALLOWED = (process.env.POLITICAL_NEWS_ALLOWED || "").trim() === "1";
+const VOTER_INFO_ONLY_GATE = (process.env.VOTER_INFO_ONLY_GATE || "").trim() === "1";
+const envLearnCooldown = (process.env.LEARN_COOLDOWN_HOURS ?? "").trim();
+const LEARN_COOLDOWN_HOURS = (() => {
+  const numeric = Number(envLearnCooldown);
+  if (!Number.isFinite(numeric) || numeric < 0) return 4;
+  return Math.min(24, Math.max(0, numeric));
+})();
+const envLearnBudget = (process.env.LEARN_BUDGET_PER_DAY ?? "").trim();
+const LEARN_BUDGET_PER_DAY = (() => {
+  const numeric = Number(envLearnBudget);
+  if (!Number.isFinite(numeric) || numeric < 0) return 12;
+  return Math.min(100, Math.max(0, Math.floor(numeric)));
+})();
+
+const NEWS_ALLOWLIST = parseHostList(process.env.NEWS_ALLOWLIST || "");
+const NEWS_DOWNRANK = parseHostList(process.env.NEWS_DOWNRANK || "");
+const OFFICIAL_PR_DOMAINS = parseHostList(process.env.OFFICIAL_PR_DOMAINS || process.env.PR_ALLOWLIST || "");
+const FOLLOWUP_KEYWORD_REGEX = /^(?:find\s+more(?:\s+(?:sites?|sources?|links?|stories))?|more(?:\s+(?:sites?|sources?|links?|stories))?|more)$/i;
 const AUTO_RESEARCH_CONFIG = {
   max_searches_per_turn: MAX_AUTO_SEARCHES_PER_TURN,
   max_notes_per_session: MAX_AUTO_NOTES_PER_SESSION,
@@ -166,6 +194,72 @@ function persistSeenHostStore() {
   } catch (err) {
     console.warn("seen_host_store_write_failed", err);
   }
+}
+
+function parseHostList(raw) {
+  if (!raw) return new Set();
+  const values = Array.isArray(raw)
+    ? raw
+    : String(raw)
+        .split(/[,\s]+/)
+        .map(value => value.trim().toLowerCase())
+        .filter(Boolean);
+  return new Set(values);
+}
+
+function normalizeSmartQuotes(text) {
+  if (!text) return "";
+  return String(text)
+    .replace(/[“”«»]/g, '"')
+    .replace(/[‘’‹›]/g, "'");
+}
+
+function sanitizeQuery(value) {
+  let query = typeof value === "string" ? value : String(value || "");
+  if (NORMALIZE_QUOTES) {
+    query = normalizeSmartQuotes(query);
+  }
+  query = query.replace(/[\s\u00A0]+/g, " ").trim();
+  return query;
+}
+
+function queryTokenLength(query) {
+  if (!query) return 0;
+  return query.replace(/[^A-Za-z0-9]+/g, "").length;
+}
+
+function isMeaningfulQuery(query) {
+  if (!query) return false;
+  if (queryTokenLength(query) >= MIN_QUERY_LEN) return true;
+  return false;
+}
+
+function inferSearchIntent(rawText = "", query = "") {
+  const haystack = `${String(rawText || "")} ${String(query || "")}`.toLowerCase();
+  if (/press[-\s]?release|deal announcement|acquisition|merger|buyout|takeover|joint venture/.test(haystack)) {
+    return "press_release";
+  }
+  if (/earnings call|quarterly results|financial guidance/.test(haystack)) {
+    return "earnings";
+  }
+  if (/vote|voting|register to vote|polling place|ballot|absentee/.test(haystack)) {
+    return "voter_info";
+  }
+  if (/election|campaign|president|senate|tariff|policy|congress|white house|prime minister|minister|parliament/.test(haystack)) {
+    return "political_news";
+  }
+  return "";
+}
+
+function evaluatePolicyGate(rawText = "", query = "") {
+  const intent = inferSearchIntent(rawText, query);
+  if (intent === "voter_info" && VOTER_INFO_ONLY_GATE) {
+    return { blocked: true, reason: "voter_info", intent };
+  }
+  if (intent === "political_news" && !POLITICAL_NEWS_ALLOWED) {
+    return { blocked: true, reason: "political_news", intent };
+  }
+  return { blocked: false, reason: intent, intent };
 }
 
 function getPersistentSeenHosts(topicKey) {
@@ -290,6 +384,8 @@ const sessionAnalogyProposals = new Map();
 const sessionTopicTracker = new Map();
 const pendingAnalogyTimers = new Map();
 const sessionStateStore = new Map();
+const newsCardCooldown = new Map();
+const newsCardDaily = { dateKey: "", total: 0 };
 
 export const inspector = new EventEmitter();
 
@@ -1029,12 +1125,14 @@ async function ensureCard(topicKey, intent, { sessionId = null, userId = null } 
   }
 
   const query = detokenizeTopicKey(canonicalKey) || topicToSearchPhrase(canonicalKey) || canonicalKey.replace(/[\/_]/g, " ");
-  if (!query) {
+  const sanitizedQuery = sanitizeQuery(query);
+  if (!sanitizedQuery) {
     logTelemetryEvent({ intent: intent || "auto", topicKey: canonicalKey, wroteCard: false, appendedUpdate: false, proposedBridge: false, tokensSaved: 0, reason: "no_query" });
     return { wroteCard: false, appendedUpdate: false };
   }
 
-  const searchArgs = { q: query, k: 5 };
+  const effectiveQuery = isMeaningfulQuery(sanitizedQuery) ? sanitizedQuery : query;
+  const searchArgs = { q: effectiveQuery, k: 5 };
   if (offset > 0) {
     searchArgs.offset = offset;
   }
@@ -1133,7 +1231,9 @@ function cleanAutoResearchQuery(text, topicKey, listQuery) {
   working = working.replace(/\?+$/g, "");
   working = working.replace(/\s+/g, " ").trim();
   if (!working) working = base.trim();
-  return working.slice(0, 200);
+  working = sanitizeQuery(working).slice(0, 200);
+  if (!isMeaningfulQuery(working)) return "";
+  return working;
 }
 
 const DK_MARKERS = [
@@ -1604,6 +1704,90 @@ function logCardWrite(entry) {
   } catch (err) {
     console.warn("CardWriteLog append failed", err);
   }
+}
+
+function maybeUpsertNewsCard({ ws, topicKey, topicLabel, selected, qualityScore }) {
+  if (!Array.isArray(selected) || !selected.length) return null;
+  const canonicalKey = normalizeTopicKey(topicKey || topicLabel || "", "news");
+  if (!canonicalKey) return null;
+  const score = Number.isFinite(qualityScore) ? qualityScore : 0;
+  if (score < MIN_WRITE_SCORE) return null;
+  const now = Date.now();
+  if (LEARN_COOLDOWN_HOURS > 0) {
+    const last = newsCardCooldown.get(canonicalKey);
+    const cooldownMs = LEARN_COOLDOWN_HOURS * 60 * 60 * 1000;
+    if (last && now - last < cooldownMs) return null;
+  }
+  const dateKey = new Date(now).toISOString().slice(0, 10);
+  if (newsCardDaily.dateKey !== dateKey) {
+    newsCardDaily.dateKey = dateKey;
+    newsCardDaily.total = 0;
+  }
+  if (LEARN_BUDGET_PER_DAY > 0 && newsCardDaily.total >= LEARN_BUDGET_PER_DAY) {
+    return null;
+  }
+
+  const topicName = topicLabel || detokenizeTopicKey(canonicalKey) || canonicalKey;
+  const sources = selected
+    .slice(0, 3)
+    .map((entry, idx) => {
+      if (!entry?.url) return null;
+      const host = entry.domain || extractDomain(entry.url) || "";
+      return {
+        url: entry.url,
+        title: entry.title || topicName,
+        host,
+        ts: now,
+        rank: idx + 1
+      };
+    })
+    .filter(Boolean);
+  if (!sources.length) return null;
+
+  const headlineParts = selected
+    .slice(0, 2)
+    .map(item => String(item?.title || "").replace(/[\r\n]+/g, " ").trim())
+    .filter(Boolean);
+  const summaryLine = headlineParts.length
+    ? headlineParts.join(" • ")
+    : `Top updates from ${sources.length} sources.`;
+  const sourceLine = sources.map(src => src.host || extractDomain(src.url) || src.url).filter(Boolean).join(" · ");
+  const summary = `${summaryLine.slice(0, 180)}\nSources: ${sourceLine.slice(0, 180)}`;
+
+  const card = {
+    type: "note",
+    topic: topicName,
+    summary,
+    value: {
+      source: sources[0],
+      sources,
+      metadata: {
+        saved_by: "auto",
+        reason: "news_followup",
+        saved_at: now,
+        intent: "news_card"
+      }
+    },
+    tags: ["auto", "news"],
+    entities: [],
+    confidence: Math.min(1, Math.max(MIN_WRITE_SCORE, score)),
+    created_at: now,
+    last_used: now,
+    ttl_days: 7,
+    conceptKey: canonicalKey
+  };
+
+  const noteId = persistCard(card);
+  if (!noteId) return null;
+  newsCardCooldown.set(canonicalKey, now);
+  newsCardDaily.total += 1;
+  logCardWrite({ ts: now, type: "news_card", topic: canonicalKey, score, reason: "news_followup" });
+  emitInspectorEvent(ws, "card_upsert", {
+    topicKey: canonicalKey,
+    noteId,
+    sources: sources.map(src => src.url)
+  });
+  return { noteId };
 }
 
 function readConceptEdges() {
@@ -2465,16 +2649,17 @@ async function handleAnalogyResponse(ws, sessionId, userId, content, turnHooks) 
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
     emitEventLog(ws, "analogy_saved", { id, from: suggestion.from, to: suggestion.to });
     emitInspectorEvent(ws, "analogy_followup", { query: searchQuery, to: suggestion.to });
-    if (searchQuery && userId) {
+    const cleanedSearchQuery = sanitizeQuery(searchQuery);
+    if (cleanedSearchQuery && userId) {
       try {
-        const { qlist, keysUsed } = buildQueryList(searchQuery, { max: 6 });
-        const args = { q: searchQuery, qlist: qlist.slice(), k: 5 };
+        const { qlist, keysUsed } = buildQueryList(cleanedSearchQuery, { max: 6 });
+        const args = { q: cleanedSearchQuery, qlist: qlist.slice(), k: 5 };
         await executeTool(ws, {
           userId,
           sessionId,
           spec: { tool: "web_search", args },
-          requestText: searchQuery,
-          topic: bucketTopic(searchQuery),
+          requestText: cleanedSearchQuery,
+          topic: bucketTopic(cleanedSearchQuery),
           banditKeys: keysUsed,
           turnHooks,
           targetConceptKey: suggestion.to
@@ -4555,14 +4740,19 @@ wss.on("connection", (ws, req) => {
           // Search intents
           if (listIntent) {
             const storedList = getStoredListContext(sessionId);
-            let base = String(listIntent.query || "").trim();
+            let baseRaw = String(listIntent.query || "").trim();
+            let base = sanitizeQuery(baseRaw);
             let topic = null;
-      
+            const previous = sessionSearch.get(sessionId) || null;
+            const storedReuse = sanitizeQuery(storedList?.queryForReuse || previous?.lastQuery || "");
+            const storedTopic = storedList?.topic || previous?.topic || "";
+            const storedTopicKey = storedList?.lastTopicKey || previous?.lastTopicKey || "";
+            let followupMode = false;
+
             if (listIntent.topicless) {
-              const reuseTopic = storedList?.normalizedTopic ? storedList.normalizedTopic.trim() : "";
-              const reuse = reuseTopic || (storedList?.queryForReuse ? storedList.queryForReuse.trim() : "");
-              if (reuse) {
-                base = reuse;
+              if (storedReuse) {
+                base = storedReuse;
+                followupMode = true;
               } else {
                 flushCardUsage();
                 sendGapPrompt(ws, {
@@ -4578,17 +4768,59 @@ wss.on("connection", (ws, req) => {
             }
 
             if (!base) {
-              base = content.trim() || content;
+              base = sanitizeQuery(content.trim() || content);
+            }
+
+            const policyCheck = evaluatePolicyGate(content, base);
+            if (policyCheck.blocked) {
+              flushCardUsage();
+              const topicCandidate = normalizeTopicKey(base || content, "news") || storedTopicKey || "";
+              emitInspectorEvent(ws, "policy_gate", { reason: policyCheck.reason, topicKey: topicCandidate });
+              const reply = policyCheck.reason === "voter_info"
+                ? "For official voting information, please visit Vote.gov or your local election office."
+                : "I can't help with that topic right now.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendFreshnessEvent();
+              return;
+            }
+            const searchIntent = policyCheck.intent || "";
+
+            const shortOrFollowup = !isMeaningfulQuery(base) || FOLLOWUP_KEYWORD_REGEX.test(baseRaw.trim().toLowerCase());
+            if (shortOrFollowup && storedReuse) {
+              base = storedReuse;
+              followupMode = true;
+            } else if (shortOrFollowup && !storedReuse) {
+              if (STRICT_FOLLOWUP) {
+                const reply = "I need the topic again to keep searching.";
+                appendMessage(sessionId, { role: "assistant", content: reply });
+                ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+                sendFreshnessEvent();
+                return;
+              }
+            }
+
+            if (!base) {
+              flushCardUsage();
+              sendGapPrompt(ws, {
+                userId,
+                sessionId,
+                prompt: "What topic do you want?",
+                q: "Need topic for list request",
+                why: "User asked for sources without a usable query"
+              });
+              sendFreshnessEvent();
+              return;
             }
 
             if (!topic) {
-              const topicSource = listIntent.topicless && storedList?.topic ? storedList.topic : null;
+              const topicSource = followupMode && storedTopic ? storedTopic : (listIntent.topicless && storedList?.topic ? storedList.topic : null);
               topic = topicSource || bucketTopic(base || content);
             }
 
             const canonicalListKey = (() => {
               const options = [
-                storedList?.lastTopicKey,
+                storedTopicKey,
                 storedList?.topic,
                 ensureTopic(base || content, sessionId)
               ];
@@ -4605,8 +4837,33 @@ wss.on("connection", (ws, req) => {
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topic);
             const args = { q: base, qlist: qlist.slice(), k: 5 };
-            if (Number.isFinite(persistentInfo?.offset) && persistentInfo.offset > 0) {
-              args.offset = persistentInfo.offset;
+            let pageIndex = 0;
+            const previousTopicKey = previous?.lastTopicKey || "";
+            if (followupMode) {
+              const prevPage = Number(previous?.pageIndex);
+              pageIndex = Number.isFinite(prevPage) && prevPage >= 0 ? prevPage + 1 : 1;
+              if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
+                pageIndex = 1;
+              }
+            } else if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
+              pageIndex = 0;
+            }
+            const computedOffset = pageIndex > 0 ? pageIndex * 5 : 0;
+            let offsetToUse = Number.isFinite(persistentInfo?.offset) ? persistentInfo.offset : 0;
+            if (followupMode) {
+              offsetToUse = Math.max(offsetToUse, computedOffset);
+            } else if (computedOffset > 0) {
+              offsetToUse = computedOffset;
+            }
+            if (offsetToUse > 0) {
+              args.offset = offsetToUse;
+            }
+            const canonicalListTopic = normalizeTopic(base);
+            if (followupMode) {
+              const followupKey = canonicalListKey || storedTopicKey || normalizeTopicKey(base || content, "news") || "";
+              if (followupKey) {
+                emitInspectorEvent(ws, "followup_resolved", { topicKey: followupKey, offset: pageIndex });
+              }
             }
             const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
             if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
@@ -4614,20 +4871,58 @@ wss.on("connection", (ws, req) => {
             }
             const spec = { tool: "web_search", args };
             if (freshCue) freshnessAction = "search";
-            const canonicalListTopic = normalizeTopic(base);
             if (canonicalListTopic) {
               freshnessTopic = canonicalListTopic;
               freshnessTopicSource = "list";
             }
             sendFreshnessEvent();
             flushCardUsage();
-            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber, canonicalTopicKey: canonicalListKey, listFollowup: Boolean(listIntent.topicless) }));
+            await executeTool(ws, withConceptContext({
+              userId,
+              sessionId,
+              spec,
+              requestText: content,
+              topic,
+              banditKeys: keysUsed,
+              runNumber,
+              canonicalTopicKey: canonicalListKey,
+              listFollowup: Boolean(listIntent.topicless || followupMode),
+              pageIndex,
+              searchIntent
+            }));
             return;
           }
       
           if (/^\s*(search|look up)\b/i.test(content)) {
             const topic = bucketTopic(content);
-            const base = content.replace(/^\s*(search|look up)\b/i, "").trim() || content;
+            const rawBase = content.replace(/^\s*(search|look up)\b/i, "").trim() || content;
+            let base = sanitizeQuery(rawBase);
+            if (!isMeaningfulQuery(base)) {
+              const fallbackStored = sanitizeQuery(getStoredListContext(sessionId)?.queryForReuse || sessionSearch.get(sessionId)?.lastQuery || "");
+              if (fallbackStored) {
+                base = fallbackStored;
+              } else if (STRICT_FOLLOWUP) {
+                const reply = "I need the topic again to search properly.";
+                appendMessage(sessionId, { role: "assistant", content: reply });
+                ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+                sendFreshnessEvent();
+                return;
+              }
+            }
+            const policyCheck = evaluatePolicyGate(content, base);
+            if (policyCheck.blocked) {
+              flushCardUsage();
+              const topicCandidate = normalizeTopicKey(base || content, "news") || "";
+              emitInspectorEvent(ws, "policy_gate", { reason: policyCheck.reason, topicKey: topicCandidate });
+              const reply = policyCheck.reason === "voter_info"
+                ? "For official voting information, please visit Vote.gov or your local election office."
+                : "I can't help with that topic right now.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendFreshnessEvent();
+              return;
+            }
+            const searchIntent = policyCheck.intent || "";
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topic);
             const args = { q: base, qlist: qlist.slice(), k: 5 };
@@ -4644,7 +4939,7 @@ wss.on("connection", (ws, req) => {
             }
             sendFreshnessEvent();
             flushCardUsage();
-            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
+            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber, searchIntent }));
             return;
           }
       
@@ -4763,13 +5058,29 @@ async function executeTool(ws, meta, call_id="auto") {
         return weight;
       };
 
-      const scoreEntries = (entries, baseIdx = 0) => {
+      const searchIntent = typeof meta?.searchIntent === "string" ? meta.searchIntent : "";
+      const adjustmentLog = [];
+
+      const scoreEntries = (entries, baseIdx = 0, logArray = adjustmentLog) => {
         return (entries || []).map((entry, idx) => {
           const domain = extractDomain(entry?.url || "");
           const prior = getSourcePrior(domain);
           const recency = computeRecencyScore(entry);
-          const score = SCORE_PRIOR_WEIGHT * prior + SCORE_RECENCY_WEIGHT * recency;
-          return { ...entry, domain, prior, recency, score, idx: baseIdx + idx };
+          const baseScore = SCORE_PRIOR_WEIGHT * prior + SCORE_RECENCY_WEIGHT * recency;
+          let adjustment = 0;
+          if (domain && NEWS_ALLOWLIST.has(domain)) adjustment += 0.15;
+          if (domain && NEWS_DOWNRANK.has(domain)) adjustment -= 0.25;
+          if (domain && searchIntent === "press_release" && OFFICIAL_PR_DOMAINS.has(domain)) adjustment += 0.1;
+          const score = baseScore + adjustment;
+          if (logArray) {
+            logArray.push({
+              host: domain || "",
+              base: Number(baseScore.toFixed(3)),
+              adj: Number(adjustment.toFixed(3)),
+              final: Number(score.toFixed(3))
+            });
+          }
+          return { ...entry, domain, prior, recency, score, baseScore, adjustment, idx: baseIdx + idx };
         }).filter(entry => entry && entry.url && !shouldExcludeDomain(entry.domain, entry.url, meta.requestText));
       };
 
@@ -4897,6 +5208,55 @@ async function executeTool(ws, meta, call_id="auto") {
         addFromCandidates(fallbackCandidates, { allowSeen: true, reason: "seen_fallback" });
       }
 
+      const ensureHighTrustQuota = () => {
+        if (!NEWS_ALLOWLIST.size) return;
+        const currentTrusted = new Set(
+          selected
+            .map(item => (item?.domain && NEWS_ALLOWLIST.has(item.domain) ? item.domain : null))
+            .filter(Boolean)
+        );
+        if (currentTrusted.size >= 3) return;
+        const trustedCandidates = rankEntries(Array.from(candidatePool.values())).filter(
+          entry => entry?.domain && NEWS_ALLOWLIST.has(entry.domain)
+        );
+        for (const candidate of trustedCandidates) {
+          if (currentTrusted.size >= 3) break;
+          const hostKey = hostKeyForEntry(candidate);
+          if (!hostKey || selectedHostKeys.has(hostKey)) continue;
+          if (selected.length < 5) {
+            if (tryAddEntry(candidate, { allowSeen: true, reason: "high_trust" })) {
+              currentTrusted.add(candidate.domain);
+            }
+            continue;
+          }
+          const replaceable = selected
+            .map((entry, idx) => ({ entry, idx }))
+            .filter(item => !item.entry?.domain || !NEWS_ALLOWLIST.has(item.entry.domain))
+            .sort((a, b) => {
+              const scoreA = Number.isFinite(a.entry?.score) ? a.entry.score : -Infinity;
+              const scoreB = Number.isFinite(b.entry?.score) ? b.entry.score : -Infinity;
+              return scoreA - scoreB;
+            });
+          if (!replaceable.length) break;
+          const target = replaceable[0];
+          const removed = selected.splice(target.idx, 1, candidate)[0];
+          if (removed) {
+            const removedKey = hostKeyForEntry(removed);
+            if (removedKey) selectedHostKeys.delete(removedKey);
+          }
+          selectedHostKeys.add(hostKey);
+          currentTrusted.add(candidate.domain);
+          markExplore("high_trust");
+        }
+      };
+
+      ensureHighTrustQuota();
+
+      if (adjustmentLog.length) {
+        const trimmedLog = adjustmentLog.slice(0, 15);
+        emitInspectorEvent(ws, "rank_adjust", trimmedLog);
+      }
+
       const selectedHosts = selected.map(item => item?.domain || null);
       const exploreFlag = exploreReason !== "none";
 
@@ -4954,7 +5314,20 @@ async function executeTool(ws, meta, call_id="auto") {
           list: listItems,
           ts: Date.now(),
           lastTopicKey: canonicalTopicKey,
-          lastQBase: originalUserQuery
+          lastQBase: originalUserQuery,
+          lastQuery: baseQuery,
+          pageIndex: Number.isFinite(meta?.pageIndex) ? Math.max(0, Number(meta.pageIndex)) : 0
+        });
+
+        const averageScore = selected.length
+          ? selected.reduce((sum, entry) => sum + (Number(entry.score) || 0), 0) / selected.length
+          : 0;
+        maybeUpsertNewsCard({
+          ws,
+          topicKey: canonicalTopicKey,
+          topicLabel: normalizedTopic || topic,
+          selected,
+          qualityScore: averageScore
         });
       }
 
@@ -5098,32 +5471,87 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     if (!fallbackText) return false;
     const listIntent = detectListIntent(fallbackText);
     const storedList = getStoredListContext(sessionId);
-    let base = String(listIntent?.query || "").trim();
+    const previous = sessionSearch.get(sessionId) || null;
+    let baseRaw = String(listIntent?.query || "").trim();
+    let base = sanitizeQuery(baseRaw);
     let topic = null;
+    const storedReuse = sanitizeQuery(storedList?.queryForReuse || previous?.lastQuery || "");
+    const storedTopic = storedList?.topic || previous?.topic || "";
+    const storedTopicKey = storedList?.lastTopicKey || previous?.lastTopicKey || "";
+    let followupMode = false;
     if (listIntent?.topicless) {
-      const reuse = storedList?.queryForReuse ? storedList.queryForReuse.trim() : "";
-      if (!reuse) return false;
-      base = reuse;
-      topic = storedList?.lastTopicKey || storedList?.topic || bucketTopic(base);
+      if (!storedReuse) return false;
+      base = storedReuse;
+      followupMode = true;
+      topic = storedTopicKey || storedTopic || bucketTopic(base);
     }
     if (!base) {
-      base = fallbackText.trim();
+      base = sanitizeQuery(fallbackText.trim());
     }
     if (!base) return false;
+    const shortOrFollowup = !isMeaningfulQuery(base) || FOLLOWUP_KEYWORD_REGEX.test(baseRaw.trim().toLowerCase());
+    if (shortOrFollowup && storedReuse) {
+      base = storedReuse;
+      followupMode = true;
+    } else if (shortOrFollowup && !storedReuse) {
+      if (STRICT_FOLLOWUP) return false;
+    }
+    const policyCheck = evaluatePolicyGate(fallbackText, base);
+    if (policyCheck.blocked) {
+      const topicCandidate = normalizeTopicKey(base || fallbackText, "news") || storedTopicKey || "";
+      emitInspectorEvent(ws, "policy_gate", { reason: policyCheck.reason, topicKey: topicCandidate });
+      return false;
+    }
+    const searchIntent = policyCheck.intent || "";
     if (!topic) {
-      const topicSource = listIntent?.topicless && storedList?.lastTopicKey
+      const topicSource = followupMode && storedTopic ? storedTopic : (listIntent?.topicless && storedList?.lastTopicKey
         ? storedList.lastTopicKey
-        : storedList?.topic;
+        : storedList?.topic);
       topic = topicSource || bucketTopic(base || fallbackText);
     }
+    const canonicalListKey = (() => {
+      const options = [storedTopicKey, storedList?.topic, ensureTopic(base || fallbackText, sessionId)];
+      for (const candidate of options) {
+        if (!candidate) continue;
+        const normalized = normalizeTopicKey(candidate, "news");
+        if (normalized) return normalized;
+      }
+      return "";
+    })();
+    const persistentInfo = canonicalListKey ? getPersistentSeenHosts(canonicalListKey) : { offset: 0 };
     const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
     const runNumber = touchTopicRun(sessionId, topic);
     const args = { q: base, qlist: qlist.slice(), k: 5 };
+    let pageIndex = 0;
+    const previousTopicKey = previous?.lastTopicKey || "";
+    if (followupMode) {
+      const prevPage = Number(previous?.pageIndex);
+      pageIndex = Number.isFinite(prevPage) && prevPage >= 0 ? prevPage + 1 : 1;
+      if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
+        pageIndex = 1;
+      }
+    }
+    const computedOffset = pageIndex > 0 ? pageIndex * 5 : 0;
+    let offsetToUse = Number.isFinite(persistentInfo?.offset) ? persistentInfo.offset : 0;
+    if (followupMode) {
+      offsetToUse = Math.max(offsetToUse, computedOffset);
+    } else if (computedOffset > 0) {
+      offsetToUse = computedOffset;
+    }
+    if (offsetToUse > 0) {
+      args.offset = offsetToUse;
+    }
     const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
     if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
       args.qlist = rotateList(args.qlist, runNumber - 1);
     }
     const spec = { tool: "web_search", args };
+    if (followupMode) {
+      const followupKey = canonicalListKey || storedTopicKey || normalizeTopicKey(base || fallbackText, "news") || "";
+      if (followupKey) {
+        emitInspectorEvent(ws, "followup_resolved", { topicKey: followupKey, offset: pageIndex });
+      }
+    }
     const conceptMeta = meta?.conceptContextBlock
       ? {
           conceptContextBlock: meta.conceptContextBlock,
@@ -5134,12 +5562,17 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
             : []
         }
       : {};
-    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber, ...conceptMeta, turnHooks });
+    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber, pageIndex, canonicalTopicKey: canonicalListKey, searchIntent, ...conceptMeta, turnHooks });
     return true;
   };
 
   const listHeaderRegex = /^\s*here\s+are\s+\d+\s+(?:sources?|links?|results?)\b/i;
   const looksLikeListHeader = listHeaderRegex.test(cleanText || "");
+  const policyBlockDetected = !!(cleanText && /policy/i.test(cleanText) && /(can't|cannot|unable)/i.test(cleanText));
+  if (policyBlockDetected) {
+    emitInspectorEvent(ws, "policy_override", { note: "news_ok" });
+    if (await triggerServerListFallback()) { finalizeAutoResearch(); return; }
+  }
   if (looksLikeListHeader && !hasRecentServerList(sessionId, 2000)) {
     const storedList = getStoredListContext(sessionId);
     const canonicalListTopic = storedList?.lastTopicKey
