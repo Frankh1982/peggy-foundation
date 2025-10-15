@@ -11,6 +11,7 @@ import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, ap
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
 import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeConceptKey, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance, canonicalizeFacet, buildAnalogyQuery } from "./cards.js";
+import { maybeBridge } from "../lib/bridge.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -65,6 +66,9 @@ const RECENCY_FALLBACK = 0.6;
 const SOURCE_PRIORS = loadSourcePriors();
 const DOMAIN_PREFS = loadDomainPrefs();
 const SEEN_HOST_TTL = 15 * 60 * 1000;
+const TELEMETRY_FILE = path.resolve("data", "events.jsonl");
+const WATCHLIST_FILE = path.resolve("data", "watchlist.jsonl");
+const SEEN_HOST_STORE_FILE = path.resolve("data", "seen_hosts.json");
 const FRESH_CUE_REGEX = /\b(latest|breaking|today|tonight|this\s*week|refresh)\b|\bupdate\b.*\b(now|today)\b|\b(now|today)\b.*\bupdate\b/i;
 const TWO_SENTENCE_REGEX = /\b(?:two|2)[-\s]?sentence\b/i;
 
@@ -112,6 +116,12 @@ const cardsDirPath = path.resolve("data", "cards");
 const indexDirPath = path.resolve("data", "index");
 fs.mkdirSync(cardsDirPath, { recursive: true });
 fs.mkdirSync(indexDirPath, { recursive: true });
+fs.mkdirSync(path.dirname(TELEMETRY_FILE), { recursive: true });
+if (!fs.existsSync(TELEMETRY_FILE)) fs.writeFileSync(TELEMETRY_FILE, "");
+if (!fs.existsSync(WATCHLIST_FILE)) fs.writeFileSync(WATCHLIST_FILE, "");
+if (!fs.existsSync(SEEN_HOST_STORE_FILE)) {
+  fs.writeFileSync(SEEN_HOST_STORE_FILE, JSON.stringify({ topics: {} }, null, 2));
+}
 const cardWriteLogFile = path.join(cardsDirPath, "CardWriteLog.jsonl");
 if (!fs.existsSync(cardWriteLogFile)) {
   fs.writeFileSync(cardWriteLogFile, "");
@@ -119,6 +129,135 @@ if (!fs.existsSync(cardWriteLogFile)) {
 const conceptEdgesFile = path.join(cardsDirPath, "edges.jsonl");
 if (!fs.existsSync(conceptEdgesFile)) {
   fs.writeFileSync(conceptEdgesFile, "");
+}
+
+function loadSeenHostStore() {
+  try {
+    const raw = fs.readFileSync(SEEN_HOST_STORE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return { topics: {} };
+    }
+    const topics = parsed.topics && typeof parsed.topics === "object" ? parsed.topics : {};
+    for (const [key, entry] of Object.entries(topics)) {
+      if (!entry || typeof entry !== "object") {
+        topics[key] = { hosts: [], offset: 0, updated_at: 0 };
+        continue;
+      }
+      const list = Array.isArray(entry.hosts) ? entry.hosts : [];
+      const deduped = Array.from(new Set(list.map(value => String(value || "").toLowerCase()).filter(Boolean)));
+      topics[key] = {
+        hosts: deduped,
+        offset: Number(entry.offset) || deduped.length,
+        updated_at: Number(entry.updated_at) || 0
+      };
+    }
+    return { topics };
+  } catch {
+    return { topics: {} };
+  }
+}
+
+const persistentSeenHosts = loadSeenHostStore();
+
+function persistSeenHostStore() {
+  try {
+    fs.writeFileSync(SEEN_HOST_STORE_FILE, JSON.stringify(persistentSeenHosts, null, 2));
+  } catch (err) {
+    console.warn("seen_host_store_write_failed", err);
+  }
+}
+
+function getPersistentSeenHosts(topicKey) {
+  const normalized = normalizeTopicKey(topicKey || "", "news");
+  if (!normalized) {
+    return { hosts: new Set(), offset: 0 };
+  }
+  const entry = persistentSeenHosts.topics[normalized];
+  const hosts = new Set(Array.isArray(entry?.hosts) ? entry.hosts : []);
+  const offset = Number(entry?.offset);
+  return {
+    hosts,
+    offset: Number.isFinite(offset) ? offset : hosts.size
+  };
+}
+
+function updatePersistentSeenHosts(topicKey, hosts = []) {
+  const normalized = normalizeTopicKey(topicKey || "", "news");
+  if (!normalized) return;
+  if (!persistentSeenHosts.topics[normalized]) {
+    persistentSeenHosts.topics[normalized] = { hosts: [], offset: 0, updated_at: 0 };
+  }
+  const entry = persistentSeenHosts.topics[normalized];
+  const existing = new Set(Array.isArray(entry.hosts) ? entry.hosts : []);
+  let changed = false;
+  for (const host of hosts || []) {
+    const clean = String(host || "").trim().toLowerCase();
+    if (!clean) continue;
+    if (!existing.has(clean)) {
+      existing.add(clean);
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  entry.hosts = Array.from(existing);
+  entry.offset = entry.hosts.length;
+  entry.updated_at = Date.now();
+  persistentSeenHosts.topics[normalized] = entry;
+  persistSeenHostStore();
+}
+
+function logTelemetryEvent(event) {
+  if (!event || typeof event !== "object") return;
+  const record = { ...event };
+  if (!Number.isFinite(record.ts)) {
+    record.ts = Date.now();
+  }
+  try {
+    fs.appendFileSync(TELEMETRY_FILE, JSON.stringify(record) + "\n");
+  } catch (err) {
+    console.warn("telemetry_append_failed", err);
+  }
+}
+
+function appendWatchEvent(event) {
+  if (!event || typeof event !== "object") return;
+  const payload = { ...event };
+  if (!payload.ts) payload.ts = Date.now();
+  try {
+    fs.appendFileSync(WATCHLIST_FILE, JSON.stringify(payload) + "\n");
+  } catch (err) {
+    console.warn("watchlist_append_failed", err);
+  }
+}
+
+function addWatch(entity, reason, extras = {}) {
+  const raw = String(entity || "").trim();
+  if (!raw) return;
+  const topicKey = normalizeTopicKey(raw, "news") || raw;
+  const record = {
+    type: "add",
+    entity: topicKey,
+    reason: reason || "unknown",
+    topicKey,
+    context: extras?.context || null
+  };
+  appendWatchEvent(record);
+}
+
+function resolveWatch(entity, cardId) {
+  const raw = String(entity || "").trim();
+  if (!raw) return;
+  const topicKey = normalizeTopicKey(raw, "news") || raw;
+  const record = {
+    type: "resolve",
+    entity: topicKey,
+    topicKey,
+    cardId: cardId || null
+  };
+  appendWatchEvent(record);
 }
 
 migrateLegacyCardData();
@@ -150,6 +289,7 @@ const sessionConceptSuggestions = new Map();
 const sessionAnalogyProposals = new Map();
 const sessionTopicTracker = new Map();
 const pendingAnalogyTimers = new Map();
+const sessionStateStore = new Map();
 
 export const inspector = new EventEmitter();
 
@@ -376,6 +516,21 @@ function getSessionTopicRecord(sessionId) {
   return record;
 }
 
+function getSessionState(sessionId) {
+  if (!sessionId) {
+    return { currentTopic: "", lastList: null, lastSummary: null };
+  }
+  let state = sessionStateStore.get(sessionId);
+  if (!state) {
+    state = { currentTopic: "", lastList: null, lastSummary: null };
+    sessionStateStore.set(sessionId, state);
+  }
+  if (typeof state.currentTopic !== "string") {
+    state.currentTopic = state.currentTopic ? String(state.currentTopic) : "";
+  }
+  return state;
+}
+
 function getActiveTopicKey(sessionId) {
   if (!sessionId) return "";
   const record = getSessionTopicRecord(sessionId);
@@ -409,6 +564,9 @@ function updateSessionTopicLastList(sessionId, { topicKey = "", query = "" } = {
   const now = Date.now();
   record.lastList = { key: finalKey, ts: now };
   record.active = finalKey;
+  const sessionState = getSessionState(sessionId);
+  sessionState.lastList = { key: finalKey, query: String(query || ""), ts: now };
+  sessionState.currentTopic = finalKey;
 }
 
 function updateSessionTopicLastConcept(sessionId, key) {
@@ -419,6 +577,8 @@ function updateSessionTopicLastConcept(sessionId, key) {
   const now = Date.now();
   record.lastConcept = { key: conceptKey, ts: now };
   record.active = conceptKey;
+  const sessionState = getSessionState(sessionId);
+  sessionState.currentTopic = conceptKey;
 }
 
 function updateSessionTopicLastAuto(sessionId, key) {
@@ -427,6 +587,10 @@ function updateSessionTopicLastAuto(sessionId, key) {
   if (!conceptKey) return;
   const record = getSessionTopicRecord(sessionId);
   record.lastAuto = { key: conceptKey, ts: Date.now() };
+  const sessionState = getSessionState(sessionId);
+  if (!sessionState.currentTopic) {
+    sessionState.currentTopic = conceptKey;
+  }
 }
 
 function setLastListContext(sessionId, { topicKey, qBase, items }) {
@@ -451,6 +615,16 @@ function setLastListContext(sessionId, { topicKey, qBase, items }) {
     }
   });
   updateSessionTopicLastList(sessionId, { topicKey: canonicalTopicKey, query: lastQBase });
+  const sessionState = getSessionState(sessionId);
+  sessionState.lastList = {
+    key: canonicalTopicKey || "",
+    query: lastQBase,
+    items: listItems,
+    ts: Date.now()
+  };
+  if (canonicalTopicKey) {
+    sessionState.currentTopic = canonicalTopicKey;
+  }
 }
 
 function getLastListContext(sessionId) {
@@ -629,6 +803,17 @@ function sendKdn(ws, sessionId, payload) {
   try { ws.send(JSON.stringify({ type: "kdn", kdn: safe })); } catch {}
   if (sessionId) {
     sessionLastKdnState.set(sessionId, { ...safe, ts: Date.now() });
+    if (safe.state === "DK" && typeof safe.reason === "string" && /unknown/i.test(safe.reason)) {
+      const history = getRecentMessages(sessionId, 4) || [];
+      const lastUser = [...history].reverse().find(msg => msg?.role === "user");
+      const requestText = lastUser?.content ? String(lastUser.content) : "";
+      if (requestText) {
+        const topicKey = ensureTopic(requestText, sessionId);
+        if (topicKey) {
+          addWatch(topicKey, safe.reason, { context: requestText.slice(0, 200) });
+        }
+      }
+    }
   }
 }
 
@@ -774,6 +959,161 @@ function makeFallbackDkTopicKey(text) {
   if (!raw) return "dk/" + Math.random().toString(36).slice(2, 10);
   const hash = createHash("sha1").update(raw).digest("hex");
   return `dk/${hash.slice(0, 10)}`;
+}
+
+function ensureTopic(reqText, sessionId = null) {
+  const base = typeof reqText === "string" ? reqText : "";
+  const trimmed = base.replace(/[\r\n]+/g, " ").trim();
+  const candidates = [];
+  if (trimmed) {
+    const normalizedTopic = normalizeTopic(trimmed);
+    if (normalizedTopic) candidates.push(normalizedTopic);
+    const normalizedKey = normalizeTopicKey(trimmed, "news");
+    if (normalizedKey) candidates.push(normalizedKey);
+    const entityKey = extractEntitiesToKey(trimmed);
+    if (entityKey) candidates.push(entityKey);
+  }
+  if (sessionId) {
+    const sessionState = getSessionState(sessionId);
+    if (sessionState.currentTopic) candidates.push(sessionState.currentTopic);
+    if (sessionState.lastList?.key) candidates.push(sessionState.lastList.key);
+    if (sessionState.lastSummary?.conceptKey) candidates.push(sessionState.lastSummary.conceptKey);
+    const topicRecord = getSessionTopicRecord(sessionId);
+    if (topicRecord?.active) candidates.push(topicRecord.active);
+    if (topicRecord?.lastList?.key) candidates.push(topicRecord.lastList.key);
+    if (topicRecord?.lastConcept?.key) candidates.push(topicRecord.lastConcept.key);
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const normalized = normalizeTopicKey(candidate, "news");
+    if (normalized) {
+      return normalized;
+    }
+  }
+  if (trimmed) {
+    return makeFallbackDkTopicKey(trimmed);
+  }
+  return `dk/${Math.random().toString(36).slice(2, 10)}`;
+}
+
+const CREDIBLE_SOURCE_WHITELIST = new Set([
+  "reuters.com",
+  "apnews.com",
+  "ap.org",
+  "ft.com",
+  "bbc.com",
+  "theguardian.com",
+  "npr.org",
+  "wsj.com",
+  "bloomberg.com"
+]);
+
+async function ensureCard(topicKey, intent, { sessionId = null, userId = null } = {}) {
+  if (!AUTO_LEARN_ENABLED) return { wroteCard: false, appendedUpdate: false };
+  const canonicalKey = normalizeTopicKey(topicKey || "", "news");
+  if (!canonicalKey) {
+    logTelemetryEvent({ intent: intent || "auto", topicKey: "", wroteCard: false, appendedUpdate: false, proposedBridge: false, tokensSaved: 0, reason: "no_topic" });
+    return { wroteCard: false, appendedUpdate: false };
+  }
+
+  const existingCards = getTopByTopic(canonicalKey, { limit: 3 }) || [];
+  const primaryNote = existingCards.find(card => card?.type === "note") || null;
+  const stale = primaryNote ? isStale(primaryNote, FRESH_TTL_DAYS) : true;
+  const shouldSeekUpdate = Boolean(primaryNote && !stale);
+
+  const { hosts: persistentHosts, offset } = getPersistentSeenHosts(canonicalKey);
+  const excludeHosts = new Set(persistentHosts);
+  if (primaryNote?.value?.source?.url) {
+    const host = extractDomain(primaryNote.value.source.url);
+    if (host) excludeHosts.add(host);
+  }
+
+  const query = detokenizeTopicKey(canonicalKey) || topicToSearchPhrase(canonicalKey) || canonicalKey.replace(/[\/_]/g, " ");
+  if (!query) {
+    logTelemetryEvent({ intent: intent || "auto", topicKey: canonicalKey, wroteCard: false, appendedUpdate: false, proposedBridge: false, tokensSaved: 0, reason: "no_query" });
+    return { wroteCard: false, appendedUpdate: false };
+  }
+
+  const searchArgs = { q: query, k: 5 };
+  if (offset > 0) {
+    searchArgs.offset = offset;
+  }
+
+  let searchResult = null;
+  try {
+    searchResult = await tool_web_search(searchArgs, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
+  } catch (err) {
+    console.warn("ensure_card_search_failed", err);
+    logTelemetryEvent({ intent: intent || "auto", topicKey: canonicalKey, wroteCard: false, appendedUpdate: false, proposedBridge: false, tokensSaved: 0, reason: "search_error" });
+    return { wroteCard: false, appendedUpdate: false };
+  }
+
+  const results = Array.isArray(searchResult?.results) ? searchResult.results : [];
+  let selectedSource = null;
+  for (const entry of results) {
+    if (!entry || !entry.url) continue;
+    const host = extractDomain(entry.url);
+    if (!host || excludeHosts.has(host)) continue;
+    const credible = CREDIBLE_SOURCE_WHITELIST.has(host) || /\.(gov|gov\.\w+|mil)$/i.test(host) || /\.(edu)$/i.test(host);
+    if (!credible) continue;
+    selectedSource = { ...entry, host };
+    break;
+  }
+
+  if (!selectedSource) {
+    logTelemetryEvent({ intent: intent || "auto", topicKey: canonicalKey, wroteCard: false, appendedUpdate: false, proposedBridge: false, tokensSaved: 0, reason: "no_source" });
+    return { wroteCard: false, appendedUpdate: false };
+  }
+
+  const summaryBase = (selectedSource.snippet || selectedSource.title || "").replace(/[\r\n]+/g, " ").trim();
+  const summary = (summaryBase || `Update on ${detokenizeTopicKey(canonicalKey) || canonicalKey}`).slice(0, 400);
+  const facetSource = summaryBase.split(/(?:\.|;|\?|!)+/).map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const facets = facetSource.slice(0, 3);
+  const now = Date.now();
+  const topicLabel = detokenizeTopicKey(canonicalKey) || canonicalKey;
+
+  const card = {
+    type: "note",
+    topic: topicLabel,
+    summary,
+    value: {
+      source: {
+        url: selectedSource.url,
+        title: selectedSource.title || topicLabel,
+        host: selectedSource.host,
+        ts: now
+      },
+      facets,
+      metadata: {
+        saved_by: "auto", 
+        reason: intent || "auto_learn", 
+        saved_at: now,
+        intent: intent || ""
+      }
+    },
+    tags: ["auto", "note"],
+    entities: [],
+    confidence: 0.6,
+    created_at: now,
+    last_used: now,
+    ttl_days: 30,
+    conceptKey: canonicalKey
+  };
+
+  let wroteCard = false;
+  let appendedUpdate = false;
+  const cardId = persistCard(card);
+  if (cardId) {
+    wroteCard = true;
+    updatePersistentSeenHosts(canonicalKey, [selectedSource.host]);
+    resolveWatch(canonicalKey, cardId);
+    maybeBridge({ ...card, id: cardId }, existingCards);
+  } else if (shouldSeekUpdate) {
+    appendedUpdate = true;
+  }
+
+  logTelemetryEvent({ intent: intent || "auto", topicKey: canonicalKey, wroteCard, appendedUpdate, proposedBridge: false, tokensSaved: 0, reason: wroteCard ? "ensure_card" : "ensure_card_skipped" });
+  return { wroteCard, appendedUpdate };
 }
 
 function cleanAutoResearchQuery(text, topicKey, listQuery) {
@@ -2883,6 +3223,13 @@ function getSeenHostUnion(sessionId, topic) {
       if (host) union.add(host);
     }
   }
+  const canonical = normalizeTopicKey(topic || "", "news");
+  if (canonical) {
+    const persistent = getPersistentSeenHosts(canonical);
+    for (const host of persistent.hosts) {
+      union.add(host);
+    }
+  }
   return { state, union };
 }
 
@@ -3089,6 +3436,11 @@ function rememberLastSummary(sessionId, info) {
     ts: Date.now()
   };
   sessionLastSummary.set(sessionId, record);
+  const sessionState = getSessionState(sessionId);
+  sessionState.lastSummary = record;
+  if (conceptKey) {
+    sessionState.currentTopic = conceptKey;
+  }
 }
 
 function getLastSummary(sessionId) {
@@ -3107,6 +3459,10 @@ function sanitizeNoteSource(source) {
   if (source.title) {
     const title = String(source.title).replace(/[\r\n]+/g, " ").trim();
     if (title) sanitized.title = title.slice(0, 200);
+  }
+  if (source.source_url) {
+    const alias = String(source.source_url).trim();
+    if (alias) sanitized.source_url = alias;
   }
   const ts = Number(source.ts ?? source.timestamp ?? source.accessed_at);
   if (Number.isFinite(ts)) sanitized.ts = ts;
@@ -3315,6 +3671,10 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
       autoContext.lastError = "persist_failed";
     }
     return { saved: false, error: "persist_failed", score, metrics, conceptKey };
+  }
+
+  if (topicKey) {
+    resolveWatch(topicKey, id);
   }
 
   if (autoResearch) {
@@ -3530,9 +3890,14 @@ wss.on("connection", (ws, req) => {
     };
 
     const handleUserMessage = async (messageObj) => {
-      const content = (messageObj.content || "").toString().slice(0, 8000);
-      const inReplyToGap = messageObj.in_reply_to_gap || null;
+          const content = (messageObj.content || "").toString().slice(0, 8000);
+          const inReplyToGap = messageObj.in_reply_to_gap || null;
             const topic = normalizeTopic(content);
+            const ensuredTopicKey = ensureTopic(content, sessionId);
+            if (sessionId) {
+              const sessionState = getSessionState(sessionId);
+              sessionState.currentTopic = ensuredTopicKey;
+            }
             const trimmedContent = content.trim();
             const refreshMatch = trimmedContent.match(/^refresh(?:\s+(.+))?$/i);
             const refreshArg = refreshMatch ? (refreshMatch[1] || "").trim() : "";
@@ -3621,8 +3986,9 @@ wss.on("connection", (ws, req) => {
                 const summaryConceptKey = toConceptKey(last.conceptKey);
                 const activeConceptKey = toConceptKey(topicRecord.active);
                 const lastListConceptKey = getSlotConceptKey(topicRecord.lastList);
+                const sessionState = getSessionState(sessionId);
                 const conceptKey = shortcutNote.kind === "last_summary"
-                  ? (summaryConceptKey || activeConceptKey || lastListConceptKey)
+                  ? (sessionState.currentTopic || summaryConceptKey || activeConceptKey || lastListConceptKey)
                   : "";
                 if (conceptKey) {
                   lastSummaryConceptKey = conceptKey;
@@ -3631,7 +3997,7 @@ wss.on("connection", (ws, req) => {
                 const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
                 const topicFinal = topicValue || summary;
                 noteTopicLabel = topicFinal;
-                const source = { url: last.url };
+                const source = { url: last.url, source_url: last.url };
                 if (last.title) source.title = last.title;
                 if (last.host) source.host = last.host;
                 payload = { topic: topicFinal, summary, source };
@@ -3789,6 +4155,12 @@ wss.on("connection", (ws, req) => {
           let listIntent = detectListIntent(content);
           const prefKeyInfo = extractPrefKey(content);
           const profileTopicNormalized = normalizeTopic(`profile:${userId}`);
+          const routerIntent = listIntent ? "list" : (freshCue ? "fresh" : "chat");
+          try {
+            await ensureCard(ensuredTopicKey, routerIntent, { sessionId, userId });
+          } catch (err) {
+            console.warn("ensure_card_failed", err);
+          }
           const touchedCardIds = new Set();
           let cardsUsageLogged = false;
           const touchCardOnce = (card) => {
@@ -4204,19 +4576,38 @@ wss.on("connection", (ws, req) => {
                 return;
               }
             }
-      
+
             if (!base) {
               base = content.trim() || content;
             }
-      
+
             if (!topic) {
               const topicSource = listIntent.topicless && storedList?.topic ? storedList.topic : null;
               topic = topicSource || bucketTopic(base || content);
             }
-      
+
+            const canonicalListKey = (() => {
+              const options = [
+                storedList?.lastTopicKey,
+                storedList?.topic,
+                ensureTopic(base || content, sessionId)
+              ];
+              for (const candidate of options) {
+                if (!candidate) continue;
+                const normalized = normalizeTopicKey(candidate, "news");
+                if (normalized) return normalized;
+              }
+              return "";
+            })();
+
+            const persistentInfo = canonicalListKey ? getPersistentSeenHosts(canonicalListKey) : { offset: 0 };
+
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topic);
             const args = { q: base, qlist: qlist.slice(), k: 5 };
+            if (Number.isFinite(persistentInfo?.offset) && persistentInfo.offset > 0) {
+              args.offset = persistentInfo.offset;
+            }
             const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
             if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
               args.qlist = rotateList(args.qlist, runNumber - 1);
@@ -4230,7 +4621,7 @@ wss.on("connection", (ws, req) => {
             }
             sendFreshnessEvent();
             flushCardUsage();
-            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
+            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber, canonicalTopicKey: canonicalListKey, listFollowup: Boolean(listIntent.topicless) }));
             return;
           }
       
@@ -4336,6 +4727,7 @@ async function executeTool(ws, meta, call_id="auto") {
       if (!meta.runNumber) {
         touchTopicRun(meta.sessionId, topic);
       }
+      const canonicalHintKey = meta.canonicalTopicKey ? normalizeTopicKey(meta.canonicalTopicKey, "news") : "";
       const result = await tool_web_search(meta.spec.args, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
       const run = saveRunRecord("web_search", meta.spec.args, result);
       ws.send(JSON.stringify({ type:"call_result", call_id, run }));
@@ -4510,6 +4902,9 @@ async function executeTool(ws, meta, call_id="auto") {
 
       if (selected.length) {
         updateSeenHosts(meta.sessionId, topic, selectedHosts.filter(Boolean));
+        if (canonicalHintKey) {
+          updatePersistentSeenHosts(canonicalHintKey, selectedHosts.filter(Boolean));
+        }
         const baseQuery = typeof meta.spec.args.q === "string" ? meta.spec.args.q : "";
         const storedQlist = Array.isArray(meta.spec.args.qlist) ? meta.spec.args.qlist.filter(Boolean) : [];
         const normalizedQuery = topicToSearchPhrase(topic);
@@ -4525,6 +4920,7 @@ async function executeTool(ws, meta, call_id="auto") {
           : "";
         let canonicalTopicKey = (() => {
           const candidates = [
+            canonicalHintKey,
             originalUserQuery,
             normalizedTopic,
             normalizedQuery,
@@ -4570,7 +4966,7 @@ async function executeTool(ws, meta, call_id="auto") {
         appendMessage(meta.sessionId, { role:"assistant", content: msg });
         ws.send(JSON.stringify({ type:"assistant_message", content: msg }));
         ws.send(JSON.stringify({ type: "list_posted", explore: exploreFlag, reason: exploreReason, hosts: selectedHosts }));
-        const canonicalListTopic = (targetConceptKey ? normalizeTopicKey(targetConceptKey, "news") : canonicalTopicKey)
+        const canonicalListTopic = (targetConceptKey ? normalizeTopicKey(targetConceptKey, "news") : (canonicalHintKey || canonicalTopicKey))
           || normalizeTopicKey(normalizedTopic || "", "news")
           || normalizeTopicKey(humanQuery || normalizedQuery || topicToSearchPhrase(topic) || topic, "news");
         emitEventLog(ws, "list_posted", {
@@ -4584,7 +4980,9 @@ async function executeTool(ws, meta, call_id="auto") {
       } else {
         const pb = playbookFor(topic);
         const hint = (pb?.if_k0 && pb.if_k0.length) ? `Tried variants. Consider: ${pb.if_k0.slice(0,3).join(", ")}` : "Try adding org names or dates.";
-        const msg = `I couldn't find credible sources for that query. ${hint}`;
+        const msg = meta.listFollowup
+          ? "I've already shared the reliable sites I can find right now. Try a different angle or topic."
+          : `I couldn't find credible sources for that query. ${hint}`;
         appendMessage(meta.sessionId, { role:"assistant", content: msg });
         ws.send(JSON.stringify({ type:"assistant_message", content: msg }));
       }
