@@ -221,20 +221,24 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
   }
 
   if (route.intent === "generic") {
-    const response = buildGenericResponse(text);
-    return {
-      handled: true,
-      intent: route.intent,
-      requiresBrowse: false,
-      reply: response.reply,
-      sources: response.sources,
-      facts: response.facts,
-      hasDate: response.hasDate,
-      citationsOk: response.citationsOk,
-      sectionsOk: response.sectionsOk,
-      topicKey: response.topicKey,
-      searchLogs: []
-    };
+    const cleaned = String(text || "").trim();
+    if (!cleaned) {
+      const response = buildGenericResponse(text);
+      return {
+        handled: true,
+        intent: route.intent,
+        requiresBrowse: false,
+        reply: response.reply,
+        sources: response.sources,
+        facts: response.facts,
+        hasDate: response.hasDate,
+        citationsOk: response.citationsOk,
+        sectionsOk: response.sectionsOk,
+        topicKey: response.topicKey,
+        searchLogs: []
+      };
+    }
+    return { handled: false };
   }
 
   return { handled: false };
