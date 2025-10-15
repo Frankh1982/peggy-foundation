@@ -141,6 +141,9 @@ const sessionAutoResearchSearchCount = new Map();
 const sessionLastKdnState = new Map();
 const sessionConceptSuggestions = new Map();
 const sessionAnalogyProposals = new Map();
+const sessionTopicTracker = new Map();
+
+const TOPIC_COMMAND_PREFIX_RE = /^\s*(save|link)\s+(note|concept)\b/i;
 
 function refreshNoteDemotions() {
   try {
@@ -330,6 +333,51 @@ function normalizeListItems(items) {
   });
 }
 
+function getSessionTopicRecord(sessionId) {
+  if (!sessionId) return { active: "", lastList: "", lastConcept: "" };
+  let record = sessionTopicTracker.get(sessionId);
+  if (!record) {
+    record = { active: "", lastList: "", lastConcept: "" };
+    sessionTopicTracker.set(sessionId, record);
+  }
+  return record;
+}
+
+function toConceptKey(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const colonIdx = raw.indexOf(":");
+  const body = colonIdx >= 0 ? raw.slice(colonIdx + 1) : raw;
+  return normalizeConceptKey(body);
+}
+
+function updateSessionTopicLastList(sessionId, { topicKey = "", query = "" } = {}) {
+  if (!sessionId) return;
+  const record = getSessionTopicRecord(sessionId);
+  let finalKey = toConceptKey(topicKey);
+  if (!finalKey) {
+    const candidate = String(query || "").trim();
+    if (candidate && !TOPIC_COMMAND_PREFIX_RE.test(candidate)) {
+      const normalizedTopicKey = normalizeTopicKey(candidate, "news");
+      finalKey = toConceptKey(normalizedTopicKey);
+    }
+  }
+  if (!finalKey) return;
+  record.lastList = finalKey;
+  if (!record.active) {
+    record.active = finalKey;
+  }
+}
+
+function updateSessionTopicLastConcept(sessionId, key) {
+  if (!sessionId) return;
+  const conceptKey = toConceptKey(key);
+  if (!conceptKey) return;
+  const record = getSessionTopicRecord(sessionId);
+  record.lastConcept = conceptKey;
+  record.active = conceptKey;
+}
+
 function setLastListContext(sessionId, { topicKey, qBase, items }) {
   if (!sessionId) return;
   const lastQBase = String(qBase || "").trim();
@@ -351,6 +399,7 @@ function setLastListContext(sessionId, { topicKey, qBase, items }) {
       ts: Date.now()
     }
   });
+  updateSessionTopicLastList(sessionId, { topicKey: canonicalTopicKey, query: lastQBase });
 }
 
 function getLastListContext(sessionId) {
@@ -1230,13 +1279,43 @@ function resolveNoteHost(note) {
   }
 }
 
-function autoLinkNoteToInferredConcept(ws, sessionId, noteCard) {
+function deriveConceptKey(candidate) {
+  const raw = String(candidate || "").trim();
+  if (!raw) return "";
+  if (TOPIC_COMMAND_PREFIX_RE.test(raw)) return "";
+  const direct = toConceptKey(raw);
+  if (direct) return direct;
+  const normalizedTopicKey = normalizeTopicKey(raw, "news");
+  return toConceptKey(normalizedTopicKey);
+}
+
+function inferConceptKeyForNote(sessionId, noteCard, { message: _message } = {}) {
+  const record = getSessionTopicRecord(sessionId);
+  const active = toConceptKey(record.active);
+  if (active) return active;
+  const lastList = toConceptKey(record.lastList);
+  if (lastList) return lastList;
+
+  const candidates = [];
+  const lastContext = getLastListContext(sessionId);
+  if (lastContext?.lastTopicKey) candidates.push(lastContext.lastTopicKey);
+  if (lastContext?.lastQBase) candidates.push(lastContext.lastQBase);
+  const storedSearch = sessionSearch.get(sessionId);
+  if (storedSearch?.lastTopicKey) candidates.push(storedSearch.lastTopicKey);
+  if (storedSearch?.lastQBase) candidates.push(storedSearch.lastQBase);
+
+  for (const candidate of candidates) {
+    const derived = deriveConceptKey(candidate);
+    if (derived) return derived;
+  }
+
+  return "";
+}
+
+function autoLinkNoteToInferredConcept(ws, sessionId, noteCard, { message: _message } = {}) {
   if (!noteCard || !noteCard.id) return null;
-  const inferred = inferConceptKey(noteCard);
-  if (!inferred) return null;
-  const colonIdx = inferred.indexOf(":");
-  const conceptBody = colonIdx >= 0 ? inferred.slice(colonIdx + 1) : inferred;
-  const conceptKey = normalizeConceptKey(conceptBody);
+  const inferred = inferConceptKeyForNote(sessionId, noteCard, { message: _message });
+  const conceptKey = normalizeConceptKey(inferred);
   if (!conceptKey) return null;
 
   let promoted = false;
@@ -1271,6 +1350,8 @@ function autoLinkNoteToInferredConcept(ws, sessionId, noteCard) {
   if (!result?.edge) {
     return null;
   }
+
+  updateSessionTopicLastConcept(sessionId, conceptKey);
 
   if (ws) {
     emitEventLog(ws, "auto_link", { noteId: noteCard.id, key: conceptKey, promoted });
@@ -1372,6 +1453,7 @@ function handleConceptSuggestionResponse(ws, sessionId, content) {
       registerSuggestionCooldown(sessionId, { noteId: note.id, conceptKey: suggestion.conceptKey });
       maybeAutoProposeAnalogy(ws, sessionId, suggestion.conceptKey);
     }
+    updateSessionTopicLastConcept(sessionId, suggestion.conceptKey);
     return true;
   }
 
@@ -1431,6 +1513,7 @@ function linkNoteToConcept(ws, sessionId, noteId, conceptKeyRaw, { via = "comman
   appendMessage(sessionId, { role: "assistant", content: reply });
   ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
   emitEventLog(ws, "concept_link", { noteId: cleanId, key: conceptKey, accepted: true, via });
+  updateSessionTopicLastConcept(sessionId, conceptKey);
   return true;
 }
 
@@ -1870,6 +1953,7 @@ function handleConceptCommand(ws, sessionId, content) {
     const reply = `Promoted concept "${title}" (${normalizedKey}).`;
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply, concept: { key: normalizedKey, title, id } }));
+    updateSessionTopicLastConcept(sessionId, normalizedKey);
     return true;
   }
 
@@ -3106,6 +3190,14 @@ wss.on("connection", (ws, req) => {
 
     if (msg.type !== "user_message") return;
 
+    const userId = msg.user_id || "default";
+    const sessionId = msg.session_id || "default";
+    const rawContent = (msg.content || "").toString().slice(0, 8000);
+    const segments = rawContent.split(/\r?\n+/).map(line => line.trim()).filter(Boolean);
+    const messagesToProcess = segments.length > 1
+      ? segments.map(segment => ({ ...msg, content: segment }))
+      : [{ ...msg, content: rawContent }];
+
     const turnConceptStats = new Map();
     const turnTokenMeter = { concept: 0, search: 0 };
     const bumpTurnConcept = (key, delta = {}) => {
@@ -3142,727 +3234,731 @@ wss.on("connection", (ws, req) => {
       turnFinalized = true;
     };
 
-    try {
-      const userId = msg.user_id || "default";
-      const sessionId = msg.session_id || "default";
-      resetAutoResearchSearchCount(sessionId);
-      const content = (msg.content || "").toString().slice(0, 8000);
-      const inReplyToGap = msg.in_reply_to_gap || null;
-      const topic = normalizeTopic(content);
-      const trimmedContent = content.trim();
-      const refreshMatch = trimmedContent.match(/^refresh(?:\s+(.+))?$/i);
-      const refreshArg = refreshMatch ? (refreshMatch[1] || "").trim() : "";
-      const freshRegexCue = FRESH_CUE_REGEX.test(content);
-      let freshCue = freshRegexCue;
-      if (refreshMatch) freshCue = true;
-      if (TWO_SENTENCE_REGEX.test(content) && !freshRegexCue) {
-        freshCue = false;
-      }
-      let freshnessAction = "none";
-      let freshnessTopic = topic;
-      let freshnessTopicSource = "message";
-      let note = null;
-      let stale = false;
-      let conceptContextBlock = "";
-      let conceptContextNotes = [];
-      let conceptContextKey = "";
-      let freshnessEventSent = false;
-      const sendFreshnessEvent = () => {
-        if (freshnessEventSent) return;
-        const canonicalTopic = freshnessTopic ? normalizeTopicKey(freshnessTopic, "news") : "";
-        emitEventLog(ws, "freshness_gate", {
-          cue: Boolean(freshCue),
-          note: Boolean(note),
-          stale: Boolean(stale),
-          action: freshnessAction,
-          topic: canonicalTopic
-        });
-        freshnessEventSent = true;
-      };
-
-    const shortcutNote = extractNoteShortcutCommand(content);
-    if (shortcutNote) {
-      appendMessage(sessionId, { role: "user", content });
-      const summary = shortcutNote.summary.trim().slice(0, 400);
-      if (!summary) {
-        ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_summary" }));
-        const reply = "I need a short summary to save that note.";
-        appendMessage(sessionId, { role: "assistant", content: reply });
-        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        sendFreshnessEvent();
-        return;
-      }
-
-      let payload = null;
-      let topicHint = summary;
-      let rejectMessage = "";
-      let rejectReason = "invalid_note_command";
-      let savedListIndex = null;
-      let noteTopicLabel = "";
-
-      if (shortcutNote.kind === "list_item") {
-        const sessionCtx = getLastListContext(sessionId);
-        const idx = shortcutNote.index - 1;
-        const listItems = Array.isArray(sessionCtx?.lastList?.items) ? sessionCtx.lastList.items : [];
-        const topicKey = sessionCtx?.lastTopicKey ? String(sessionCtx.lastTopicKey).trim() : "";
-        const item = listItems[idx];
-        if (item && item.url && topicKey) {
-          noteTopicLabel = topicKey;
-          const source = { url: item.url };
-          if (item.title) source.title = item.title;
-          payload = { topic: topicKey, summary, source };
-          topicHint = topicKey;
-          savedListIndex = shortcutNote.index;
-        } else {
-          if (!sessionCtx || !Array.isArray(sessionCtx?.lastList?.items) || !sessionCtx.lastList.items.length) {
-            rejectMessage = "I don't have a recent list to pull from.";
-            rejectReason = "no_list";
-          } else if (!Number.isFinite(idx) || idx < 0 || idx >= listItems.length) {
-            rejectMessage = "unknown with current context.";
-            rejectReason = "out_of_range";
-          } else if (!item?.url) {
-            rejectMessage = `I don't have a link for list item #${shortcutNote.index}.`;
-            rejectReason = "missing_source_url";
-          } else {
-            rejectMessage = "I don't have a topic saved for that list.";
-            rejectReason = "missing_topic";
+    const handleUserMessage = async (messageObj) => {
+      const content = (messageObj.content || "").toString().slice(0, 8000);
+      const inReplyToGap = messageObj.in_reply_to_gap || null;
+            const topic = normalizeTopic(content);
+            const trimmedContent = content.trim();
+            const refreshMatch = trimmedContent.match(/^refresh(?:\s+(.+))?$/i);
+            const refreshArg = refreshMatch ? (refreshMatch[1] || "").trim() : "";
+            const freshRegexCue = FRESH_CUE_REGEX.test(content);
+            let freshCue = freshRegexCue;
+            if (refreshMatch) freshCue = true;
+            if (TWO_SENTENCE_REGEX.test(content) && !freshRegexCue) {
+              freshCue = false;
+            }
+            let freshnessAction = "none";
+            let freshnessTopic = topic;
+            let freshnessTopicSource = "message";
+            let note = null;
+            let stale = false;
+            let conceptContextBlock = "";
+            let conceptContextNotes = [];
+            let conceptContextKey = "";
+            let freshnessEventSent = false;
+            const sendFreshnessEvent = () => {
+              if (freshnessEventSent) return;
+              const canonicalTopic = freshnessTopic ? normalizeTopicKey(freshnessTopic, "news") : "";
+              emitEventLog(ws, "freshness_gate", {
+                cue: Boolean(freshCue),
+                note: Boolean(note),
+                stale: Boolean(stale),
+                action: freshnessAction,
+                topic: canonicalTopic
+              });
+              freshnessEventSent = true;
+            };
+      
+          const shortcutNote = extractNoteShortcutCommand(content);
+          if (shortcutNote) {
+            appendMessage(sessionId, { role: "user", content });
+            const summary = shortcutNote.summary.trim().slice(0, 400);
+            if (!summary) {
+              ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_summary" }));
+              const reply = "I need a short summary to save that note.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendFreshnessEvent();
+              return;
+            }
+      
+            let payload = null;
+            let topicHint = summary;
+            let rejectMessage = "";
+            let rejectReason = "invalid_note_command";
+            let savedListIndex = null;
+            let noteTopicLabel = "";
+      
+            if (shortcutNote.kind === "list_item") {
+              const sessionCtx = getLastListContext(sessionId);
+              const idx = shortcutNote.index - 1;
+              const listItems = Array.isArray(sessionCtx?.lastList?.items) ? sessionCtx.lastList.items : [];
+              const topicKey = sessionCtx?.lastTopicKey ? String(sessionCtx.lastTopicKey).trim() : "";
+              const item = listItems[idx];
+              if (item && item.url && topicKey) {
+                noteTopicLabel = topicKey;
+                const source = { url: item.url };
+                if (item.title) source.title = item.title;
+                payload = { topic: topicKey, summary, source };
+                topicHint = topicKey;
+                savedListIndex = shortcutNote.index;
+              } else {
+                if (!sessionCtx || !Array.isArray(sessionCtx?.lastList?.items) || !sessionCtx.lastList.items.length) {
+                  rejectMessage = "I don't have a recent list to pull from.";
+                  rejectReason = "no_list";
+                } else if (!Number.isFinite(idx) || idx < 0 || idx >= listItems.length) {
+                  rejectMessage = "unknown with current context.";
+                  rejectReason = "out_of_range";
+                } else if (!item?.url) {
+                  rejectMessage = `I don't have a link for list item #${shortcutNote.index}.`;
+                  rejectReason = "missing_source_url";
+                } else {
+                  rejectMessage = "I don't have a topic saved for that list.";
+                  rejectReason = "missing_topic";
+                }
+              }
+            } else if (shortcutNote.kind === "last_summary" || shortcutNote.kind === "last_link") {
+              const last = getLastSummary(sessionId);
+              if (last && last.url) {
+                const topicCandidate = last.topic || last.title || summary;
+                const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
+                const topicFinal = topicValue || summary;
+                noteTopicLabel = topicFinal;
+                const source = { url: last.url };
+                if (last.title) source.title = last.title;
+                payload = { topic: topicFinal, summary, source };
+                topicHint = topicFinal;
+              } else {
+                ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_source_url" }));
+                sendGapPrompt(ws, {
+                  userId,
+                  sessionId,
+                  prompt: "Can you share the link you want me to cite?",
+                  q: "Need a source URL for the note",
+                  why: "User asked to save a note without an available link"
+                });
+                sendFreshnessEvent();
+                return;
+              }
+            }
+      
+            if (!payload) {
+              const reason = rejectMessage ? rejectReason : "invalid_note_command";
+              ws.send(JSON.stringify({ type: "note_rejected", reason }));
+              const reply = rejectMessage || "I couldn't save that note.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              if (reason === "out_of_range") {
+                sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
+              }
+              sendFreshnessEvent();
+              return;
+            }
+      
+            const result = saveNoteCardFromPayload({
+              payload,
+              explicitness: 1,
+              userId,
+              sessionId,
+              run: null,
+              reason: "user_reply",
+              topicHint
+            });
+      
+            if (result.saved) {
+              const sessionAckTopic = savedListIndex !== null
+                ? getLastListContext(sessionId)?.lastTopicKey || noteTopicLabel
+                : null;
+              const fallbackAck = noteTopicLabel || result.card.topic || "";
+              const ackTopic = (() => {
+                const raw = savedListIndex !== null ? sessionAckTopic : fallbackAck;
+                if (typeof raw === "string") return raw.trim();
+                return String(raw || "");
+              })();
+              ws.send(JSON.stringify({
+                type: "note_saved",
+                note: { topic: result.card.topic, score: Number(result.score ?? 0) }
+              }));
+              const noteId = result.card?.id ? String(result.card.id).trim() : "";
+              const idSuffix = noteId ? ` id:${noteId}` : "";
+              const successMsg = savedListIndex !== null
+                ? `note_saved: "${ackTopic}" (#${savedListIndex})${idSuffix ? ` ${idSuffix}` : ""}`
+                : `note_saved: "${ackTopic || result.card.topic}"${idSuffix ? ` ${idSuffix}` : ""}`;
+              appendMessage(sessionId, { role: "assistant", content: successMsg });
+              ws.send(JSON.stringify({ type: "assistant_message", content: successMsg }));
+              if (noteId) {
+                rememberLastSavedNoteId(sessionId, noteId);
+              }
+              autoLinkNoteToInferredConcept(ws, sessionId, result.card);
+              maybeSuggestConceptLink(ws, sessionId, result.card);
+              maybeProposeAnalogyFromNote(ws, sessionId, result.card);
+              if (updateLastEpisode({ note_saved: true })) {
+                ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
+              }
+            } else {
+              const reason = result.error || "unknown";
+              ws.send(JSON.stringify({ type: "note_rejected", reason }));
+              const reply = reason === "duplicate_note"
+                ? "That note is very similar to one I already saved for this concept."
+                : "I couldn't save that note.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+            }
+            sendFreshnessEvent();
+            return;
           }
-        }
-      } else if (shortcutNote.kind === "last_summary" || shortcutNote.kind === "last_link") {
-        const last = getLastSummary(sessionId);
-        if (last && last.url) {
-          const topicCandidate = last.topic || last.title || summary;
-          const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
-          const topicFinal = topicValue || summary;
-          noteTopicLabel = topicFinal;
-          const source = { url: last.url };
-          if (last.title) source.title = last.title;
-          payload = { topic: topicFinal, summary, source };
-          topicHint = topicFinal;
-        } else {
-          ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_source_url" }));
-          sendGapPrompt(ws, {
-            userId,
-            sessionId,
-            prompt: "Can you share the link you want me to cite?",
-            q: "Need a source URL for the note",
-            why: "User asked to save a note without an available link"
+      
+          const directNote = extractDirectNoteCommand(content);
+          if (directNote) {
+            appendMessage(sessionId, { role: "user", content });
+            const result = saveNoteCardFromPayload({
+              payload: directNote.payload,
+              explicitness: directNote.explicitness,
+              userId,
+              sessionId,
+              run: null,
+              reason: directNote.reason,
+              topicHint: directNote.payload?.topic || content
+            });
+            if (result.saved) {
+              ws.send(JSON.stringify({
+                type: "note_saved",
+                note: { topic: result.card.topic, score: Number(result.score ?? 0) }
+              }));
+              if (result.card?.id) {
+                rememberLastSavedNoteId(sessionId, result.card.id);
+              }
+              autoLinkNoteToInferredConcept(ws, sessionId, result.card);
+              maybeSuggestConceptLink(ws, sessionId, result.card);
+              maybeProposeAnalogyFromNote(ws, sessionId, result.card);
+              if (updateLastEpisode({ note_saved: true })) {
+                ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
+              }
+            } else {
+              const reason = result.error || "unknown";
+              ws.send(JSON.stringify({
+                type: "note_rejected",
+                reason
+              }));
+              if (reason === "duplicate_note") {
+                const reply = "That note looks like a duplicate of what I already have.";
+                appendMessage(sessionId, { role: "assistant", content: reply });
+                ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              }
+            }
+            sendFreshnessEvent();
+            return;
+          }
+      
+          let cards = topic ? getTopByTopic(topic, { limit: 3 }) : [];
+          cards = cards.filter(card => {
+            if (!card || card.type !== "note") return true;
+            return !isNoteDemoted(card.id);
           });
-          sendFreshnessEvent();
-          return;
-        }
-      }
-
-      if (!payload) {
-        const reason = rejectMessage ? rejectReason : "invalid_note_command";
-        ws.send(JSON.stringify({ type: "note_rejected", reason }));
-        const reply = rejectMessage || "I couldn't save that note.";
-        appendMessage(sessionId, { role: "assistant", content: reply });
-        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        if (reason === "out_of_range") {
-          sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
-        }
-        sendFreshnessEvent();
-        return;
-      }
-
-      const result = saveNoteCardFromPayload({
-        payload,
-        explicitness: 1,
-        userId,
-        sessionId,
-        run: null,
-        reason: "user_reply",
-        topicHint
-      });
-
-      if (result.saved) {
-        const sessionAckTopic = savedListIndex !== null
-          ? getLastListContext(sessionId)?.lastTopicKey || noteTopicLabel
-          : null;
-        const fallbackAck = noteTopicLabel || result.card.topic || "";
-        const ackTopic = (() => {
-          const raw = savedListIndex !== null ? sessionAckTopic : fallbackAck;
-          if (typeof raw === "string") return raw.trim();
-          return String(raw || "");
-        })();
-        ws.send(JSON.stringify({
-          type: "note_saved",
-          note: { topic: result.card.topic, score: Number(result.score ?? 0) }
-        }));
-        const noteId = result.card?.id ? String(result.card.id).trim() : "";
-        const idSuffix = noteId ? ` id:${noteId}` : "";
-        const successMsg = savedListIndex !== null
-          ? `note_saved: "${ackTopic}" (#${savedListIndex})${idSuffix ? ` ${idSuffix}` : ""}`
-          : `note_saved: "${ackTopic || result.card.topic}"${idSuffix ? ` ${idSuffix}` : ""}`;
-        appendMessage(sessionId, { role: "assistant", content: successMsg });
-        ws.send(JSON.stringify({ type: "assistant_message", content: successMsg }));
-        if (noteId) {
-          rememberLastSavedNoteId(sessionId, noteId);
-        }
-        autoLinkNoteToInferredConcept(ws, sessionId, result.card);
-        maybeSuggestConceptLink(ws, sessionId, result.card);
-        maybeProposeAnalogyFromNote(ws, sessionId, result.card);
-        if (updateLastEpisode({ note_saved: true })) {
-          ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
-        }
-      } else {
-        const reason = result.error || "unknown";
-        ws.send(JSON.stringify({ type: "note_rejected", reason }));
-        const reply = reason === "duplicate_note"
-          ? "That note is very similar to one I already saved for this concept."
-          : "I couldn't save that note.";
-        appendMessage(sessionId, { role: "assistant", content: reply });
-        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-      }
-      sendFreshnessEvent();
-      return;
-    }
-
-    const directNote = extractDirectNoteCommand(content);
-    if (directNote) {
-      appendMessage(sessionId, { role: "user", content });
-      const result = saveNoteCardFromPayload({
-        payload: directNote.payload,
-        explicitness: directNote.explicitness,
-        userId,
-        sessionId,
-        run: null,
-        reason: directNote.reason,
-        topicHint: directNote.payload?.topic || content
-      });
-      if (result.saved) {
-        ws.send(JSON.stringify({
-          type: "note_saved",
-          note: { topic: result.card.topic, score: Number(result.score ?? 0) }
-        }));
-        if (result.card?.id) {
-          rememberLastSavedNoteId(sessionId, result.card.id);
-        }
-        autoLinkNoteToInferredConcept(ws, sessionId, result.card);
-        maybeSuggestConceptLink(ws, sessionId, result.card);
-        maybeProposeAnalogyFromNote(ws, sessionId, result.card);
-        if (updateLastEpisode({ note_saved: true })) {
-          ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
-        }
-      } else {
-        const reason = result.error || "unknown";
-        ws.send(JSON.stringify({
-          type: "note_rejected",
-          reason
-        }));
-        if (reason === "duplicate_note") {
-          const reply = "That note looks like a duplicate of what I already have.";
-          appendMessage(sessionId, { role: "assistant", content: reply });
-          ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        }
-      }
-      sendFreshnessEvent();
-      return;
-    }
-
-    let cards = topic ? getTopByTopic(topic, { limit: 3 }) : [];
-    cards = cards.filter(card => {
-      if (!card || card.type !== "note") return true;
-      return !isNoteDemoted(card.id);
-    });
-    const cardsById = new Map();
-    for (const card of cards) {
-      if (card && card.id) {
-        cardsById.set(card.id, card);
-      }
-    }
-    note = cards.find(card => card?.type === "note") || null;
-    stale = note ? isStale(note, FRESH_TTL_DAYS) : false;
-    const wantsNameAnswer = /\bwhat(?:'|’)?s my name\b/i.test(content) || /\bwho am i\b/i.test(content);
-    let listIntent = detectListIntent(content);
-    const prefKeyInfo = extractPrefKey(content);
-    const profileTopicNormalized = normalizeTopic(`profile:${userId}`);
-    const touchedCardIds = new Set();
-    let cardsUsageLogged = false;
-    const touchCardOnce = (card) => {
-      if (!card || !card.id) return;
-      if (touchedCardIds.has(card.id)) return;
-      touch(card.id);
-      touchedCardIds.add(card.id);
+          const cardsById = new Map();
+          for (const card of cards) {
+            if (card && card.id) {
+              cardsById.set(card.id, card);
+            }
+          }
+          note = cards.find(card => card?.type === "note") || null;
+          stale = note ? isStale(note, FRESH_TTL_DAYS) : false;
+          const wantsNameAnswer = /\bwhat(?:'|’)?s my name\b/i.test(content) || /\bwho am i\b/i.test(content);
+          let listIntent = detectListIntent(content);
+          const prefKeyInfo = extractPrefKey(content);
+          const profileTopicNormalized = normalizeTopic(`profile:${userId}`);
+          const touchedCardIds = new Set();
+          let cardsUsageLogged = false;
+          const touchCardOnce = (card) => {
+            if (!card || !card.id) return;
+            if (touchedCardIds.has(card.id)) return;
+            touch(card.id);
+            touchedCardIds.add(card.id);
+          };
+          const tryAddCardsFromTopic = (topicKey) => {
+            if (!topicKey || cards.length >= 3) return;
+            if (topicKey === topic) return;
+            const extras = getTopByTopic(topicKey, { limit: 3 });
+            for (const extra of extras) {
+              if (!extra || !extra.id || cardsById.has(extra.id)) continue;
+              cards.push(extra);
+              cardsById.set(extra.id, extra);
+              if (cards.length >= 3) break;
+            }
+          };
+          if (cards.length < 3 && wantsNameAnswer) {
+            tryAddCardsFromTopic(profileTopicNormalized);
+          }
+          if (cards.length < 3 && prefKeyInfo?.normalized) {
+            const prefTopicNormalized = normalizeTopic(`pref:${prefKeyInfo.normalized}`);
+            tryAddCardsFromTopic(prefTopicNormalized);
+          }
+      
+          const { block: cardContextBlock, included: contextCards } = buildCardContextBlock(cards, topic);
+          for (const card of contextCards) {
+            touchCardOnce(card);
+          }
+          if (!conceptContextBlock) {
+            const candidateKeys = gatherConceptKeyCandidates({ content, topic, listIntent });
+            for (const keyCandidate of candidateKeys) {
+              const context = buildConceptContextBlock(keyCandidate);
+              if (context?.notes?.length) {
+                conceptContextBlock = context.block;
+                conceptContextNotes = context.notes.slice(0, 3);
+                conceptContextKey = context.key || keyCandidate;
+                break;
+              }
+            }
+          }
+      
+          if (conceptContextBlock && conceptContextNotes.length) {
+            for (const entry of conceptContextNotes) {
+              if (entry?.card) touchCardOnce(entry.card);
+            }
+            emitEventLog(ws, "concept_context", {
+              key: conceptContextKey,
+              cards_used: conceptContextNotes.length
+            });
+            if (!note) {
+              const conceptNote = conceptContextNotes[0]?.card || null;
+              if (conceptNote) {
+                note = conceptNote;
+                stale = isStale(note, FRESH_TTL_DAYS);
+              }
+            }
+          }
+          const conceptContextMeta = conceptContextBlock
+            ? {
+                conceptContextBlock,
+                conceptContextKey,
+                conceptContextCount: conceptContextNotes.length
+              }
+            : null;
+          const withConceptContext = (meta = {}) => {
+            const base = { ...meta, turnHooks };
+            if (!conceptContextMeta) return base;
+            return { ...base, ...conceptContextMeta };
+          };
+      
+          const flushCardUsage = () => {
+            if (cardsUsageLogged) return;
+            if (touchedCardIds.size) {
+              emitEventLog(ws, `cards_used:${touchedCardIds.size}`, { count: touchedCardIds.size });
+            }
+            cardsUsageLogged = true;
+          };
+      
+          appendMessage(sessionId, { role: "user", content });
+      
+          if (await handleAnalogyResponse(ws, sessionId, trimmedContent)) {
+            flushCardUsage();
+            sendFreshnessEvent();
+            return;
+          }
+      
+          if (handleConceptSuggestionResponse(ws, sessionId, trimmedContent)) {
+            flushCardUsage();
+            sendFreshnessEvent();
+            return;
+          }
+      
+          if (handleConceptCommand(ws, sessionId, trimmedContent)) {
+            flushCardUsage();
+            sendFreshnessEvent();
+            return;
+          }
+      
+          if (handleAnalogyCommand(ws, sessionId, trimmedContent)) {
+            flushCardUsage();
+            sendFreshnessEvent();
+            return;
+          }
+      
+          if (isGreeting(content) && !inReplyToGap) {
+            const reply = "Hi! What do you need help with?";
+            appendMessage(sessionId, { role:"assistant", content: reply });
+            ws.send(JSON.stringify({ type:"assistant_message", content: reply }));
+            sendKdn(ws, sessionId, { state:"DK", reason:"greeting/ambiguous", ambiguous:true });
+            flushCardUsage();
+            sendFreshnessEvent();
+            return;
+          }
+      
+          let fastPathReply = "";
+          let fastPathUsedCard = null;
+      
+          if (!inReplyToGap && wantsNameAnswer) {
+            const profileCard = cards.find(card => card?.type === "profile");
+            const profileName = profileCard?.value?.profile?.name || profileCard?.value?.name;
+            if (profileCard && profileName) {
+              fastPathReply = `Your name is ${profileName}.`;
+              fastPathUsedCard = profileCard;
+            }
+          }
+      
+          if (!fastPathReply && !inReplyToGap && prefKeyInfo) {
+            const targetTopic = normalizeTopic(`pref:${prefKeyInfo.normalized}`);
+            const prefCard = cards.find(card => {
+              if (!card || card.type !== "pref") return false;
+              const cardKey = String(card.value?.key || "").toLowerCase();
+              if (cardKey && cardKey === prefKeyInfo.normalized) return true;
+              const cardTopic = normalizeTopic(card.topic || "");
+              return cardTopic && targetTopic && cardTopic === targetTopic;
+            });
+            if (prefCard) {
+              let prefValue = "";
+              const rawValue = prefCard.value?.value ?? prefCard.value?.pref ?? prefCard.value?.answer;
+              if (typeof rawValue === "string") {
+                prefValue = rawValue.trim();
+              } else if (rawValue !== undefined && rawValue !== null) {
+                prefValue = JSON.stringify(rawValue);
+              } else if (typeof prefCard.summary === "string") {
+                const summaryMatch = prefCard.summary.match(/:\s*(.+)$/);
+                if (summaryMatch) prefValue = summaryMatch[1].trim();
+              }
+              if (prefValue) {
+                const prefLabel = prefKeyInfo.raw.replace(/\s+/g, " ").trim();
+                fastPathReply = `Your ${prefLabel} is ${prefValue}.`;
+                fastPathUsedCard = prefCard;
+              }
+            }
+          }
+      
+          if (fastPathReply) {
+            if (fastPathUsedCard) touchCardOnce(fastPathUsedCard);
+            appendMessage(sessionId, { role:"assistant", content: fastPathReply });
+            ws.send(JSON.stringify({ type:"assistant_message", content: fastPathReply }));
+            flushCardUsage();
+            sendFreshnessEvent();
+            return;
+          }
+      
+          const wantsBriefUpdate = /\b(update|summary|two sentences|2-?sentence)\b/i.test(content);
+          const isSearchCommand = /^\s*(search|look up)\b/i.test(content);
+      
+          if (!inReplyToGap && refreshMatch) {
+            const lastList = getLastListContext(sessionId);
+            let requestBase = refreshArg;
+            let targetTopicKey = refreshArg ? normalizeTopic(refreshArg) : "";
+            let usedLastListTopic = false;
+      
+            if (!targetTopicKey && lastList?.lastTopicKey) {
+              targetTopicKey = lastList.lastTopicKey;
+              requestBase = lastList.lastQBase || requestBase;
+              usedLastListTopic = Boolean(targetTopicKey);
+            }
+      
+            if (!targetTopicKey) {
+              freshnessAction = "gap";
+              sendFreshnessEvent();
+              flushCardUsage();
+              sendGapPrompt(ws, { userId, sessionId, prompt: "Refresh what topic?" });
+              return;
+            }
+      
+            if (!requestBase) {
+              requestBase = detokenizeTopicKey(targetTopicKey);
+            }
+      
+            const base = String(requestBase || "").trim();
+            const topicForSearch = bucketTopic(base || targetTopicKey);
+            const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
+            const runNumber = touchTopicRun(sessionId, topicForSearch);
+            const args = { q: base, qlist: qlist.slice(), k: 5 };
+            const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+            if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+              args.qlist = rotateList(args.qlist, runNumber - 1);
+            }
+            const spec = { tool: "web_search", args };
+            freshnessAction = "search";
+            const fallbackTopic = normalizeTopic(base);
+            freshnessTopic = targetTopicKey || fallbackTopic;
+            if (usedLastListTopic && freshnessTopic) {
+              freshnessTopicSource = "list";
+            } else if (fallbackTopic) {
+              freshnessTopicSource = "message";
+            }
+            sendFreshnessEvent();
+            flushCardUsage();
+            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: base, topic: topicForSearch, banditKeys: keysUsed, runNumber }));
+            return;
+          }
+      
+          if (freshCue && !listIntent) {
+            listIntent = { query: trimmedContent || content, topicless: false, forceFresh: true };
+          }
+      
+          const summarizeCommand = /^\s*summarize\s*#\d+\s*$/i.test(content);
+          const hasUrl = /https?:\/\/\S+/i.test(content);
+          const wantsTwoSentenceUpdate = TWO_SENTENCE_REGEX.test(content);
+      
+          if (!freshCue && !inReplyToGap && wantsTwoSentenceUpdate && conceptContextNotes.length && !listIntent && !isSearchCommand && !summarizeCommand) {
+            const conceptCard = conceptContextKey ? findConceptCard(conceptContextKey) : null;
+            const conceptTitle = conceptCard?.title ? String(conceptCard.title).trim() : "";
+            const conceptLabel = conceptTitle || conceptContextKey || "";
+            const enrichedNotes = conceptContextNotes.map(entry => ({
+              ...entry,
+              conceptTitle,
+              conceptKey: conceptContextKey,
+              conceptLabel
+            }));
+            const replyCandidate = twoSentenceFromNotes(enrichedNotes);
+            const reply = replyCandidate || "I don't have any notes on that yet.";
+            freshnessAction = "note";
+            registerConceptUsage(conceptContextKey, conceptContextNotes.length, conceptContextBlock.length);
+            for (const entry of conceptContextNotes) {
+              if (entry?.card) touchCardOnce(entry.card);
+            }
+            appendMessage(sessionId, { role: "assistant", content: reply });
+            ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+            sendFreshnessEvent();
+            flushCardUsage();
+            return;
+          }
+      
+          if (conceptContextBlock && conceptContextNotes.length) {
+            registerConceptUsage(conceptContextKey, conceptContextNotes.length, conceptContextBlock.length);
+          }
+      
+          let autoResearchOutcome = null;
+          try {
+            autoResearchOutcome = await maybeRunAutoResearch({
+              ws,
+              userId,
+              sessionId,
+              content,
+              topic,
+              note,
+              stale,
+              freshCue,
+              listIntent,
+              isSearchCommand,
+              summarizeCommand,
+              hasUrl,
+              inReplyToGap,
+              conceptContextBlock,
+              conceptContextKey,
+              conceptContextCount: conceptContextNotes.length,
+              turnHooks
+            });
+          } catch (err) {
+            console.error("auto_research_invoke_error", err);
+          }
+      
+          if (autoResearchOutcome?.triggered) {
+            const context = autoResearchOutcome.context || null;
+            if (context?.topic) {
+              freshnessTopic = context.topic;
+              freshnessTopicSource = "auto";
+            }
+            if (autoResearchOutcome.handled) {
+              freshnessAction = "search";
+              sendFreshnessEvent();
+              flushCardUsage();
+              return;
+            }
+            finalizeAutoResearchEvent(ws, sessionId, context);
+          }
+      
+          if (!freshCue && !inReplyToGap && note && !stale && wantsBriefUpdate && !listIntent && !isSearchCommand && !summarizeCommand) {
+            const reply = note.summary || "I don't have an update saved.";
+            freshnessAction = "note";
+            if (note) touchCardOnce(note);
+            appendMessage(sessionId, { role: "assistant", content: reply });
+            ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+            sendFreshnessEvent();
+            flushCardUsage();
+            return;
+          }
+      
+          if (!freshCue && !inReplyToGap && note && stale && !listIntent && !isSearchCommand && !summarizeCommand) {
+            const base = note.summary || "Here's the last note I saved.";
+            const reply = `${base}\n\nThis note may be stale. Say 'refresh' to update.`;
+            freshnessAction = "note+hint";
+            if (note) touchCardOnce(note);
+            appendMessage(sessionId, { role: "assistant", content: reply });
+            ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+            sendFreshnessEvent();
+            flushCardUsage();
+            return;
+          }
+      
+          // URL → auto web_get
+          if (!inReplyToGap) {
+            const urlMatch = content.match(/https?:\/\/\S+/i);
+            if (urlMatch) {
+              const spec = { tool: "web_get", args: { url: urlMatch[0] } };
+              sendFreshnessEvent();
+              flushCardUsage();
+              await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content }));
+              return;
+            }
+          }
+      
+          // Summarize a previously listed search result
+          const summarizeMatch = content.match(/^\s*summarize\s*#(\d+)\s*$/i);
+          if (summarizeMatch && !inReplyToGap) {
+            const idx = Number(summarizeMatch[1]);
+            const stored = sessionSearch.get(sessionId);
+            const items = stored?.list || [];
+            const numberValid = Number.isFinite(idx) ? idx : null;
+            if (!stored) {
+              emitEventLog(ws, "summarize_pick", { n: numberValid, ok: false, reason: "no_list" });
+              const reply = "unknown with current context.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
+              flushCardUsage();
+              sendFreshnessEvent();
+              return;
+            }
+      
+            if (!Number.isFinite(idx) || idx < 1 || idx > 5) {
+              emitEventLog(ws, "summarize_pick", { n: numberValid, ok: false, reason: "out_of_range" });
+              const reply = "unknown with current context.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
+              flushCardUsage();
+              sendFreshnessEvent();
+              return;
+            }
+      
+            if (idx > items.length) {
+              emitEventLog(ws, "summarize_pick", { n: idx, ok: false, reason: "missing_item" });
+              const reply = "unknown with current context.";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
+              flushCardUsage();
+              sendFreshnessEvent();
+              return;
+            }
+      
+            const target = items[idx - 1];
+            emitEventLog(ws, "summarize_pick", { n: idx, ok: true, reason: "ok", host: target.host || null });
+            const spec = { tool: "web_get", args: { url: target.url } };
+            sendFreshnessEvent();
+            flushCardUsage();
+            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic: stored.topic }), "auto");
+            return;
+          }
+      
+          // Search intents
+          if (listIntent) {
+            const storedList = getStoredListContext(sessionId);
+            let base = String(listIntent.query || "").trim();
+            let topic = null;
+      
+            if (listIntent.topicless) {
+              const reuseTopic = storedList?.normalizedTopic ? storedList.normalizedTopic.trim() : "";
+              const reuse = reuseTopic || (storedList?.queryForReuse ? storedList.queryForReuse.trim() : "");
+              if (reuse) {
+                base = reuse;
+              } else {
+                flushCardUsage();
+                sendGapPrompt(ws, {
+                  userId,
+                  sessionId,
+                  prompt: "What topic do you want?",
+                  q: "Need topic for list request",
+                  why: "User asked for more sources without a topic"
+                });
+                sendFreshnessEvent();
+                return;
+              }
+            }
+      
+            if (!base) {
+              base = content.trim() || content;
+            }
+      
+            if (!topic) {
+              const topicSource = listIntent.topicless && storedList?.topic ? storedList.topic : null;
+              topic = topicSource || bucketTopic(base || content);
+            }
+      
+            const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
+            const runNumber = touchTopicRun(sessionId, topic);
+            const args = { q: base, qlist: qlist.slice(), k: 5 };
+            const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+            if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+              args.qlist = rotateList(args.qlist, runNumber - 1);
+            }
+            const spec = { tool: "web_search", args };
+            if (freshCue) freshnessAction = "search";
+            const canonicalListTopic = normalizeTopic(base);
+            if (canonicalListTopic) {
+              freshnessTopic = canonicalListTopic;
+              freshnessTopicSource = "list";
+            }
+            sendFreshnessEvent();
+            flushCardUsage();
+            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
+            return;
+          }
+      
+          if (/^\s*(search|look up)\b/i.test(content)) {
+            const topic = bucketTopic(content);
+            const base = content.replace(/^\s*(search|look up)\b/i, "").trim() || content;
+            const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
+            const runNumber = touchTopicRun(sessionId, topic);
+            const args = { q: base, qlist: qlist.slice(), k: 5 };
+            const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
+            if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
+              args.qlist = rotateList(args.qlist, runNumber - 1);
+            }
+            const spec = { tool: "web_search", args };
+            if (freshCue) freshnessAction = "search";
+            const canonicalSearchTopic = normalizeTopic(base);
+            if (canonicalSearchTopic) {
+              freshnessTopic = canonicalSearchTopic;
+              freshnessTopicSource = "list";
+            }
+            sendFreshnessEvent();
+            flushCardUsage();
+            await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
+            return;
+          }
+      
+          // Default → model
+          const profile = getUserProfile(userId);
+          let systemPrompt = buildSystemPrompt(profile);
+          const contextBlocks = [];
+          if (cardContextBlock) contextBlocks.push(cardContextBlock);
+          if (conceptContextBlock) contextBlocks.push(conceptContextBlock);
+          if (contextBlocks.length) {
+            systemPrompt = `${systemPrompt}\n\n${contextBlocks.join("\n\n")}`;
+          }
+          const recent = getTrimmedHistory(sessionId);
+          const messages = [
+            { role: "system", content: systemPrompt },
+            ...recent,
+            { role: "user", content }
+          ];
+      
+          try {
+            sendFreshnessEvent();
+            flushCardUsage();
+            const { content: completion, usage } = await callOpenAI(messages);
+            await handleAssistantResponse(ws, { completion, usage, userId, sessionId }, turnHooks);
+          } catch (err) {
+            sendFreshnessEvent();
+            ws.send(JSON.stringify({ type: "assistant_message", content: "unknown with current context (API error)." }));
+            console.error(err);
+          }
     };
-    const tryAddCardsFromTopic = (topicKey) => {
-      if (!topicKey || cards.length >= 3) return;
-      if (topicKey === topic) return;
-      const extras = getTopByTopic(topicKey, { limit: 3 });
-      for (const extra of extras) {
-        if (!extra || !extra.id || cardsById.has(extra.id)) continue;
-        cards.push(extra);
-        cardsById.set(extra.id, extra);
-        if (cards.length >= 3) break;
-      }
-    };
-    if (cards.length < 3 && wantsNameAnswer) {
-      tryAddCardsFromTopic(profileTopicNormalized);
-    }
-    if (cards.length < 3 && prefKeyInfo?.normalized) {
-      const prefTopicNormalized = normalizeTopic(`pref:${prefKeyInfo.normalized}`);
-      tryAddCardsFromTopic(prefTopicNormalized);
-    }
 
-    const { block: cardContextBlock, included: contextCards } = buildCardContextBlock(cards, topic);
-    for (const card of contextCards) {
-      touchCardOnce(card);
-    }
-    if (!conceptContextBlock) {
-      const candidateKeys = gatherConceptKeyCandidates({ content, topic, listIntent });
-      for (const keyCandidate of candidateKeys) {
-        const context = buildConceptContextBlock(keyCandidate);
-        if (context?.notes?.length) {
-          conceptContextBlock = context.block;
-          conceptContextNotes = context.notes.slice(0, 3);
-          conceptContextKey = context.key || keyCandidate;
-          break;
-        }
-      }
-    }
-
-    if (conceptContextBlock && conceptContextNotes.length) {
-      for (const entry of conceptContextNotes) {
-        if (entry?.card) touchCardOnce(entry.card);
-      }
-      emitEventLog(ws, "concept_context", {
-        key: conceptContextKey,
-        cards_used: conceptContextNotes.length
-      });
-      if (!note) {
-        const conceptNote = conceptContextNotes[0]?.card || null;
-        if (conceptNote) {
-          note = conceptNote;
-          stale = isStale(note, FRESH_TTL_DAYS);
-        }
-      }
-    }
-    const conceptContextMeta = conceptContextBlock
-      ? {
-          conceptContextBlock,
-          conceptContextKey,
-          conceptContextCount: conceptContextNotes.length
-        }
-      : null;
-    const withConceptContext = (meta = {}) => {
-      const base = { ...meta, turnHooks };
-      if (!conceptContextMeta) return base;
-      return { ...base, ...conceptContextMeta };
-    };
-
-    const flushCardUsage = () => {
-      if (cardsUsageLogged) return;
-      if (touchedCardIds.size) {
-        emitEventLog(ws, `cards_used:${touchedCardIds.size}`, { count: touchedCardIds.size });
-      }
-      cardsUsageLogged = true;
-    };
-
-    appendMessage(sessionId, { role: "user", content });
-
-    if (await handleAnalogyResponse(ws, sessionId, trimmedContent)) {
-      flushCardUsage();
-      sendFreshnessEvent();
-      return;
-    }
-
-    if (handleConceptSuggestionResponse(ws, sessionId, trimmedContent)) {
-      flushCardUsage();
-      sendFreshnessEvent();
-      return;
-    }
-
-    if (handleConceptCommand(ws, sessionId, trimmedContent)) {
-      flushCardUsage();
-      sendFreshnessEvent();
-      return;
-    }
-
-    if (handleAnalogyCommand(ws, sessionId, trimmedContent)) {
-      flushCardUsage();
-      sendFreshnessEvent();
-      return;
-    }
-
-    if (isGreeting(content) && !inReplyToGap) {
-      const reply = "Hi! What do you need help with?";
-      appendMessage(sessionId, { role:"assistant", content: reply });
-      ws.send(JSON.stringify({ type:"assistant_message", content: reply }));
-      sendKdn(ws, sessionId, { state:"DK", reason:"greeting/ambiguous", ambiguous:true });
-      flushCardUsage();
-      sendFreshnessEvent();
-      return;
-    }
-
-    let fastPathReply = "";
-    let fastPathUsedCard = null;
-
-    if (!inReplyToGap && wantsNameAnswer) {
-      const profileCard = cards.find(card => card?.type === "profile");
-      const profileName = profileCard?.value?.profile?.name || profileCard?.value?.name;
-      if (profileCard && profileName) {
-        fastPathReply = `Your name is ${profileName}.`;
-        fastPathUsedCard = profileCard;
-      }
-    }
-
-    if (!fastPathReply && !inReplyToGap && prefKeyInfo) {
-      const targetTopic = normalizeTopic(`pref:${prefKeyInfo.normalized}`);
-      const prefCard = cards.find(card => {
-        if (!card || card.type !== "pref") return false;
-        const cardKey = String(card.value?.key || "").toLowerCase();
-        if (cardKey && cardKey === prefKeyInfo.normalized) return true;
-        const cardTopic = normalizeTopic(card.topic || "");
-        return cardTopic && targetTopic && cardTopic === targetTopic;
-      });
-      if (prefCard) {
-        let prefValue = "";
-        const rawValue = prefCard.value?.value ?? prefCard.value?.pref ?? prefCard.value?.answer;
-        if (typeof rawValue === "string") {
-          prefValue = rawValue.trim();
-        } else if (rawValue !== undefined && rawValue !== null) {
-          prefValue = JSON.stringify(rawValue);
-        } else if (typeof prefCard.summary === "string") {
-          const summaryMatch = prefCard.summary.match(/:\s*(.+)$/);
-          if (summaryMatch) prefValue = summaryMatch[1].trim();
-        }
-        if (prefValue) {
-          const prefLabel = prefKeyInfo.raw.replace(/\s+/g, " ").trim();
-          fastPathReply = `Your ${prefLabel} is ${prefValue}.`;
-          fastPathUsedCard = prefCard;
-        }
-      }
-    }
-
-    if (fastPathReply) {
-      if (fastPathUsedCard) touchCardOnce(fastPathUsedCard);
-      appendMessage(sessionId, { role:"assistant", content: fastPathReply });
-      ws.send(JSON.stringify({ type:"assistant_message", content: fastPathReply }));
-      flushCardUsage();
-      sendFreshnessEvent();
-      return;
-    }
-
-    const wantsBriefUpdate = /\b(update|summary|two sentences|2-?sentence)\b/i.test(content);
-    const isSearchCommand = /^\s*(search|look up)\b/i.test(content);
-
-    if (!inReplyToGap && refreshMatch) {
-      const lastList = getLastListContext(sessionId);
-      let requestBase = refreshArg;
-      let targetTopicKey = refreshArg ? normalizeTopic(refreshArg) : "";
-      let usedLastListTopic = false;
-
-      if (!targetTopicKey && lastList?.lastTopicKey) {
-        targetTopicKey = lastList.lastTopicKey;
-        requestBase = lastList.lastQBase || requestBase;
-        usedLastListTopic = Boolean(targetTopicKey);
-      }
-
-      if (!targetTopicKey) {
-        freshnessAction = "gap";
-        sendFreshnessEvent();
-        flushCardUsage();
-        sendGapPrompt(ws, { userId, sessionId, prompt: "Refresh what topic?" });
-        return;
-      }
-
-      if (!requestBase) {
-        requestBase = detokenizeTopicKey(targetTopicKey);
-      }
-
-      const base = String(requestBase || "").trim();
-      const topicForSearch = bucketTopic(base || targetTopicKey);
-      const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
-      const runNumber = touchTopicRun(sessionId, topicForSearch);
-      const args = { q: base, qlist: qlist.slice(), k: 5 };
-      const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
-      if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
-        args.qlist = rotateList(args.qlist, runNumber - 1);
-      }
-      const spec = { tool: "web_search", args };
-      freshnessAction = "search";
-      const fallbackTopic = normalizeTopic(base);
-      freshnessTopic = targetTopicKey || fallbackTopic;
-      if (usedLastListTopic && freshnessTopic) {
-        freshnessTopicSource = "list";
-      } else if (fallbackTopic) {
-        freshnessTopicSource = "message";
-      }
-      sendFreshnessEvent();
-      flushCardUsage();
-      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: base, topic: topicForSearch, banditKeys: keysUsed, runNumber }));
-      return;
-    }
-
-    if (freshCue && !listIntent) {
-      listIntent = { query: trimmedContent || content, topicless: false, forceFresh: true };
-    }
-
-    const summarizeCommand = /^\s*summarize\s*#\d+\s*$/i.test(content);
-    const hasUrl = /https?:\/\/\S+/i.test(content);
-    const wantsTwoSentenceUpdate = TWO_SENTENCE_REGEX.test(content);
-
-    if (!freshCue && !inReplyToGap && wantsTwoSentenceUpdate && conceptContextNotes.length && !listIntent && !isSearchCommand && !summarizeCommand) {
-      const conceptCard = conceptContextKey ? findConceptCard(conceptContextKey) : null;
-      const conceptTitle = conceptCard?.title ? String(conceptCard.title).trim() : "";
-      const conceptLabel = conceptTitle || conceptContextKey || "";
-      const enrichedNotes = conceptContextNotes.map(entry => ({
-        ...entry,
-        conceptTitle,
-        conceptKey: conceptContextKey,
-        conceptLabel
-      }));
-      const replyCandidate = twoSentenceFromNotes(enrichedNotes);
-      const reply = replyCandidate || "I don't have any notes on that yet.";
-      freshnessAction = "note";
-      registerConceptUsage(conceptContextKey, conceptContextNotes.length, conceptContextBlock.length);
-      for (const entry of conceptContextNotes) {
-        if (entry?.card) touchCardOnce(entry.card);
-      }
-      appendMessage(sessionId, { role: "assistant", content: reply });
-      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-      sendFreshnessEvent();
-      flushCardUsage();
-      return;
-    }
-
-    if (conceptContextBlock && conceptContextNotes.length) {
-      registerConceptUsage(conceptContextKey, conceptContextNotes.length, conceptContextBlock.length);
-    }
-
-    let autoResearchOutcome = null;
+    resetAutoResearchSearchCount(sessionId);
     try {
-      autoResearchOutcome = await maybeRunAutoResearch({
-        ws,
-        userId,
-        sessionId,
-        content,
-        topic,
-        note,
-        stale,
-        freshCue,
-        listIntent,
-        isSearchCommand,
-        summarizeCommand,
-        hasUrl,
-        inReplyToGap,
-        conceptContextBlock,
-        conceptContextKey,
-        conceptContextCount: conceptContextNotes.length,
-        turnHooks
-      });
+      for (const messageObj of messagesToProcess) {
+        await handleUserMessage(messageObj);
+      }
     } catch (err) {
-      console.error("auto_research_invoke_error", err);
+      console.error("chat_turn_error", err);
+    } finally {
+      finalizeTurn();
     }
-
-    if (autoResearchOutcome?.triggered) {
-      const context = autoResearchOutcome.context || null;
-      if (context?.topic) {
-        freshnessTopic = context.topic;
-        freshnessTopicSource = "auto";
-      }
-      if (autoResearchOutcome.handled) {
-        freshnessAction = "search";
-        sendFreshnessEvent();
-        flushCardUsage();
-        return;
-      }
-      finalizeAutoResearchEvent(ws, sessionId, context);
-    }
-
-    if (!freshCue && !inReplyToGap && note && !stale && wantsBriefUpdate && !listIntent && !isSearchCommand && !summarizeCommand) {
-      const reply = note.summary || "I don't have an update saved.";
-      freshnessAction = "note";
-      if (note) touchCardOnce(note);
-      appendMessage(sessionId, { role: "assistant", content: reply });
-      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-      sendFreshnessEvent();
-      flushCardUsage();
-      return;
-    }
-
-    if (!freshCue && !inReplyToGap && note && stale && !listIntent && !isSearchCommand && !summarizeCommand) {
-      const base = note.summary || "Here's the last note I saved.";
-      const reply = `${base}\n\nThis note may be stale. Say 'refresh' to update.`;
-      freshnessAction = "note+hint";
-      if (note) touchCardOnce(note);
-      appendMessage(sessionId, { role: "assistant", content: reply });
-      ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-      sendFreshnessEvent();
-      flushCardUsage();
-      return;
-    }
-
-    // URL → auto web_get
-    if (!inReplyToGap) {
-      const urlMatch = content.match(/https?:\/\/\S+/i);
-      if (urlMatch) {
-        const spec = { tool: "web_get", args: { url: urlMatch[0] } };
-        sendFreshnessEvent();
-        flushCardUsage();
-        await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content }));
-        return;
-      }
-    }
-
-    // Summarize a previously listed search result
-    const summarizeMatch = content.match(/^\s*summarize\s*#(\d+)\s*$/i);
-    if (summarizeMatch && !inReplyToGap) {
-      const idx = Number(summarizeMatch[1]);
-      const stored = sessionSearch.get(sessionId);
-      const items = stored?.list || [];
-      const numberValid = Number.isFinite(idx) ? idx : null;
-      if (!stored) {
-        emitEventLog(ws, "summarize_pick", { n: numberValid, ok: false, reason: "no_list" });
-        const reply = "unknown with current context.";
-        appendMessage(sessionId, { role: "assistant", content: reply });
-        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
-        flushCardUsage();
-        sendFreshnessEvent();
-        return;
-      }
-
-      if (!Number.isFinite(idx) || idx < 1 || idx > 5) {
-        emitEventLog(ws, "summarize_pick", { n: numberValid, ok: false, reason: "out_of_range" });
-        const reply = "unknown with current context.";
-        appendMessage(sessionId, { role: "assistant", content: reply });
-        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
-        flushCardUsage();
-        sendFreshnessEvent();
-        return;
-      }
-
-      if (idx > items.length) {
-        emitEventLog(ws, "summarize_pick", { n: idx, ok: false, reason: "missing_item" });
-        const reply = "unknown with current context.";
-        appendMessage(sessionId, { role: "assistant", content: reply });
-        ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-        sendKdn(ws, sessionId, { state: "DK", reason: "explicit unknown", ambiguous: false });
-        flushCardUsage();
-        sendFreshnessEvent();
-        return;
-      }
-
-      const target = items[idx - 1];
-      emitEventLog(ws, "summarize_pick", { n: idx, ok: true, reason: "ok", host: target.host || null });
-      const spec = { tool: "web_get", args: { url: target.url } };
-      sendFreshnessEvent();
-      flushCardUsage();
-      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic: stored.topic }), "auto");
-      return;
-    }
-
-    // Search intents
-    if (listIntent) {
-      const storedList = getStoredListContext(sessionId);
-      let base = String(listIntent.query || "").trim();
-      let topic = null;
-
-      if (listIntent.topicless) {
-        const reuseTopic = storedList?.normalizedTopic ? storedList.normalizedTopic.trim() : "";
-        const reuse = reuseTopic || (storedList?.queryForReuse ? storedList.queryForReuse.trim() : "");
-        if (reuse) {
-          base = reuse;
-        } else {
-          flushCardUsage();
-          sendGapPrompt(ws, {
-            userId,
-            sessionId,
-            prompt: "What topic do you want?",
-            q: "Need topic for list request",
-            why: "User asked for more sources without a topic"
-          });
-          sendFreshnessEvent();
-          return;
-        }
-      }
-
-      if (!base) {
-        base = content.trim() || content;
-      }
-
-      if (!topic) {
-        const topicSource = listIntent.topicless && storedList?.topic ? storedList.topic : null;
-        topic = topicSource || bucketTopic(base || content);
-      }
-
-      const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
-      const runNumber = touchTopicRun(sessionId, topic);
-      const args = { q: base, qlist: qlist.slice(), k: 5 };
-      const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
-      if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
-        args.qlist = rotateList(args.qlist, runNumber - 1);
-      }
-      const spec = { tool: "web_search", args };
-      if (freshCue) freshnessAction = "search";
-      const canonicalListTopic = normalizeTopic(base);
-      if (canonicalListTopic) {
-        freshnessTopic = canonicalListTopic;
-        freshnessTopicSource = "list";
-      }
-      sendFreshnessEvent();
-      flushCardUsage();
-      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
-      return;
-    }
-
-    if (/^\s*(search|look up)\b/i.test(content)) {
-      const topic = bucketTopic(content);
-      const base = content.replace(/^\s*(search|look up)\b/i, "").trim() || content;
-      const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
-      const runNumber = touchTopicRun(sessionId, topic);
-      const args = { q: base, qlist: qlist.slice(), k: 5 };
-      const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
-      if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
-        args.qlist = rotateList(args.qlist, runNumber - 1);
-      }
-      const spec = { tool: "web_search", args };
-      if (freshCue) freshnessAction = "search";
-      const canonicalSearchTopic = normalizeTopic(base);
-      if (canonicalSearchTopic) {
-        freshnessTopic = canonicalSearchTopic;
-        freshnessTopicSource = "list";
-      }
-      sendFreshnessEvent();
-      flushCardUsage();
-      await executeTool(ws, withConceptContext({ userId, sessionId, spec, requestText: content, topic, banditKeys: keysUsed, runNumber }));
-      return;
-    }
-
-    // Default → model
-    const profile = getUserProfile(userId);
-    let systemPrompt = buildSystemPrompt(profile);
-    const contextBlocks = [];
-    if (cardContextBlock) contextBlocks.push(cardContextBlock);
-    if (conceptContextBlock) contextBlocks.push(conceptContextBlock);
-    if (contextBlocks.length) {
-      systemPrompt = `${systemPrompt}\n\n${contextBlocks.join("\n\n")}`;
-    }
-    const recent = getTrimmedHistory(sessionId);
-    const messages = [
-      { role: "system", content: systemPrompt },
-      ...recent,
-      { role: "user", content }
-    ];
-
-    try {
-      sendFreshnessEvent();
-      flushCardUsage();
-      const { content: completion, usage } = await callOpenAI(messages);
-      await handleAssistantResponse(ws, { completion, usage, userId, sessionId }, turnHooks);
-    } catch (err) {
-      sendFreshnessEvent();
-      ws.send(JSON.stringify({ type: "assistant_message", content: "unknown with current context (API error)." }));
-      console.error(err);
-    }
-  } catch (err) {
-    console.error("chat_turn_error", err);
-  } finally {
-    finalizeTurn();
-  }
   });
 });
 
