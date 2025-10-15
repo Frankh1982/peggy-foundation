@@ -10,7 +10,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeConceptKey, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance, canonicalizeFacet } from "./cards.js";
+import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeConceptKey, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance, canonicalizeFacet, buildAnalogyQuery } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -99,6 +99,7 @@ const ANALOGY_MAX_PROPOSALS_PER_DAY = (() => {
 })();
 const ANALOGY_AUTO_STATE = { dateKey: "", total: 0 };
 const ANALOGY_CONCEPT_DAILY = new Map();
+const ANALOGY_LATEST_WINDOW_MS = 10 * 60 * 1000;
 
 const NOTE_DEMOTE_INTERVAL_MS = 5 * 60 * 1000;
 const SIMHASH_DUP_THRESHOLD = 6;
@@ -1766,16 +1767,6 @@ function formatAnalogyProposalMessage(suggestion) {
   return lines.join("\n");
 }
 
-function buildAnalogySearchQuery(suggestion) {
-  const facets = Array.isArray(suggestion.sharedFacets) ? suggestion.sharedFacets : [];
-  const parties = Array.isArray(suggestion.targetParties) ? suggestion.targetParties : [];
-  const facetTerms = facets.map(labelFacet).join(" ");
-  const partyTerms = parties.join(" ");
-  const raw = `${facetTerms} ${partyTerms}`.trim();
-  if (raw) return raw;
-  return suggestion.to || "";
-}
-
 function buildAnalogySuggestion({ fromKey, sourceConcept, toConcept, sourceSig, targetSig, sharedFacets, score }) {
   const targetKey = toConcept?.key || "";
   const sourceParties = gatherParties(sourceSig, sourceConcept || getConcept(fromKey) || { key: fromKey });
@@ -2076,7 +2067,7 @@ function handleAnalogyCommand(ws, sessionId, content) {
   return true;
 }
 
-async function handleAnalogyResponse(ws, sessionId, content) {
+async function handleAnalogyResponse(ws, sessionId, userId, content, turnHooks) {
   const suggestion = sessionAnalogyProposals.get(sessionId);
   if (!suggestion) return false;
   const normalized = String(content || "").trim().toLowerCase();
@@ -2101,12 +2092,56 @@ async function handleAnalogyResponse(ws, sessionId, content) {
       ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
       return true;
     }
-    const searchQuery = buildAnalogySearchQuery(suggestion);
-    const lines = [`Analogy saved.`, `search: "${searchQuery}"`];
+    const topicRecord = getSessionTopicRecord(sessionId);
+    const now = Date.now();
+    const normalizedFrom = normalizeConceptKey(suggestion.from);
+    let freshnessHint = null;
+    if (normalizedFrom && topicRecord) {
+      const activeKey = toConceptKey(topicRecord.active);
+      const lastConceptTs = Number(topicRecord?.lastConcept?.ts) || 0;
+      if (activeKey && activeKey === normalizedFrom && now - lastConceptTs <= ANALOGY_LATEST_WINDOW_MS) {
+        const afterDate = new Date(now - 120 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        freshnessHint = { after: afterDate };
+      } else {
+        const lastListKey = getSlotConceptKey(topicRecord.lastList);
+        const lastListTs = Number(topicRecord?.lastList?.ts) || 0;
+        if (lastListKey && lastListKey === normalizedFrom && now - lastListTs <= ANALOGY_LATEST_WINDOW_MS) {
+          const afterDate = new Date(now - 120 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+          freshnessHint = { after: afterDate };
+        }
+      }
+    }
+    const searchQuery = buildAnalogyQuery({
+      fromKey: suggestion.from,
+      toKey: suggestion.to,
+      overlap: suggestion.sharedFacets || [],
+      entities: suggestion.targetParties || [],
+      freshness: freshnessHint,
+      domainPrefs: DOMAIN_PREFS
+    });
+    const lines = [`Analogy saved.`, `follow-up search: "${searchQuery}"`];
     const reply = lines.join("\n");
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
     emitEventLog(ws, "analogy_saved", { id, from: suggestion.from, to: suggestion.to });
+    emitInspectorEvent(ws, "analogy_followup", { query: searchQuery, to: suggestion.to });
+    if (searchQuery && userId) {
+      try {
+        const { qlist, keysUsed } = buildQueryList(searchQuery, { max: 6 });
+        const args = { q: searchQuery, qlist: qlist.slice(), k: 5 };
+        await executeTool(ws, {
+          userId,
+          sessionId,
+          spec: { tool: "web_search", args },
+          requestText: searchQuery,
+          topic: bucketTopic(searchQuery),
+          banditKeys: keysUsed,
+          turnHooks
+        }, "analogy_followup");
+      } catch (err) {
+        console.error("analogy_followup_search_error", err);
+      }
+    }
     return true;
   }
   if (negative) {
@@ -3038,10 +3073,18 @@ function extractNoteShortcutCommand(text) {
 function rememberLastSummary(sessionId, info) {
   if (!sessionId) return;
   if (!info || !info.url) return;
+  const url = String(info.url).trim();
+  if (!url) return;
+  const title = String(info.title || "").trim();
+  const topic = String(info.topic || "").trim();
+  const host = info.host ? String(info.host).trim() : extractDomain(url) || "";
+  const conceptKey = normalizeConceptKey(info.conceptKey || "");
   const record = {
-    url: String(info.url).trim(),
-    title: String(info.title || "").trim(),
-    topic: String(info.topic || "").trim(),
+    url,
+    title,
+    topic,
+    host,
+    conceptKey,
     ts: Date.now()
   };
   sessionLastSummary.set(sessionId, record);
@@ -3540,6 +3583,7 @@ wss.on("connection", (ws, req) => {
             let rejectReason = "invalid_note_command";
             let savedListIndex = null;
             let noteTopicLabel = "";
+            let lastSummaryConceptKey = "";
       
             if (shortcutNote.kind === "list_item") {
               const sessionCtx = getLastListContext(sessionId);
@@ -3572,21 +3616,29 @@ wss.on("connection", (ws, req) => {
             } else if (shortcutNote.kind === "last_summary" || shortcutNote.kind === "last_link") {
               const last = getLastSummary(sessionId);
               if (last && last.url) {
-                const topicCandidate = last.topic || last.title || summary;
+                const topicRecord = getSessionTopicRecord(sessionId);
+                const conceptKey = shortcutNote.kind === "last_summary"
+                  ? (last.conceptKey || toConceptKey(topicRecord.active) || getSlotConceptKey(topicRecord.lastList))
+                  : "";
+                if (conceptKey) {
+                  lastSummaryConceptKey = conceptKey;
+                }
+                const topicCandidate = conceptKey ? detokenizeTopicKey(conceptKey) : (last.topic || last.title || summary);
                 const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
                 const topicFinal = topicValue || summary;
                 noteTopicLabel = topicFinal;
                 const source = { url: last.url };
                 if (last.title) source.title = last.title;
+                if (last.host) source.host = last.host;
                 payload = { topic: topicFinal, summary, source };
-                topicHint = topicFinal;
+                topicHint = conceptKey || topicFinal;
               } else {
                 ws.send(JSON.stringify({ type: "note_rejected", reason: "missing_source_url" }));
                 sendGapPrompt(ws, {
                   userId,
                   sessionId,
-                  prompt: "Can you share the link you want me to cite?",
-                  q: "Need a source URL for the note",
+                  prompt: "Which source? (paste a link or say #n)",
+                  q: "Need a source for the last summary note",
                   why: "User asked to save a note without an available link"
                 });
                 sendFreshnessEvent();
@@ -3642,9 +3694,15 @@ wss.on("connection", (ws, req) => {
                 rememberLastSavedNoteId(sessionId, noteId);
               }
               const linkResult = autoLinkNoteToTopic(ws, sessionId, result.card);
+              const inspectorTopic = shortcutNote.kind === "last_summary"
+                ? (lastSummaryConceptKey || linkResult?.conceptKey || "")
+                : (linkResult?.conceptKey || "");
+              const inspectorSource = shortcutNote.kind === "last_summary"
+                ? "lastSummary"
+                : (linkResult?.source || "");
               emitInspectorEvent(ws, "user_note_attributed", {
-                topic: linkResult?.conceptKey || "",
-                source: linkResult?.source || ""
+                topic: inspectorTopic,
+                source: inspectorSource
               });
               maybeSuggestConceptLink(ws, sessionId, result.card);
               maybeProposeAnalogyFromNote(ws, sessionId, result.card, linkResult?.conceptKey);
@@ -3823,7 +3881,7 @@ wss.on("connection", (ws, req) => {
             return;
           }
 
-          if (await handleAnalogyResponse(ws, sessionId, trimmedContent)) {
+          if (await handleAnalogyResponse(ws, sessionId, userId, trimmedContent, turnHooks)) {
             flushCardUsage();
             sendFreshnessEvent();
             return;
@@ -4255,10 +4313,16 @@ async function executeTool(ws, meta, call_id="auto") {
         meta.turnHooks.registerSearchTokens(Math.round((result?.chars || 0) / 4));
       }
 
+      const topicRecord = getSessionTopicRecord(meta.sessionId);
+      const activeConceptKey = toConceptKey(topicRecord?.active);
+      const lastListConceptKey = getSlotConceptKey(topicRecord?.lastList);
+      const summaryConceptKey = activeConceptKey || lastListConceptKey || "";
       rememberLastSummary(meta.sessionId, {
         url: result.url,
         title: result.title,
-        topic: meta.topic || bucketTopic(meta.requestText || result.title || "")
+        topic: meta.topic || bucketTopic(meta.requestText || result.title || ""),
+        host: result.url ? extractDomain(result.url) : "",
+        conceptKey: summaryConceptKey
       });
 
       await callModelWithGetResult(ws, meta, run);
