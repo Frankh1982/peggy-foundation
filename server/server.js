@@ -60,6 +60,18 @@ const MIN_QUERY_LEN = (() => {
   if (!Number.isFinite(numeric) || numeric <= 0) return 3;
   return Math.min(8, Math.max(1, Math.floor(numeric)));
 })();
+const envFollowupContext = (process.env.FOLLOWUP_CONTEXT_SECONDS ?? "").trim();
+const FOLLOWUP_CONTEXT_SECONDS = (() => {
+  const numeric = Number(envFollowupContext);
+  if (!Number.isFinite(numeric) || numeric < 0) return 600;
+  return Math.max(0, Math.floor(numeric));
+})();
+const envSearchK = (process.env.SEARCH_K ?? "").trim();
+const SEARCH_K = (() => {
+  const numeric = Number(envSearchK);
+  if (!Number.isFinite(numeric) || numeric <= 0) return 5;
+  return Math.min(8, Math.max(1, Math.floor(numeric)));
+})();
 const NORMALIZE_QUOTES = (process.env.NORMALIZE_QUOTES || "").trim() === "1";
 const STRICT_FOLLOWUP = (process.env.STRICT_FOLLOWUP || "").trim() === "1";
 const RESET_OFFSET_ON_TOPIC_CHANGE = (process.env.RESET_OFFSET_ON_TOPIC_CHANGE || "").trim() === "1";
@@ -81,6 +93,7 @@ const LEARN_BUDGET_PER_DAY = (() => {
 const NEWS_ALLOWLIST = parseHostList(process.env.NEWS_ALLOWLIST || "");
 const NEWS_DOWNRANK = parseHostList(process.env.NEWS_DOWNRANK || "");
 const OFFICIAL_PR_DOMAINS = parseHostList(process.env.OFFICIAL_PR_DOMAINS || process.env.PR_ALLOWLIST || "");
+const PRIORITIZE_OFFICIAL_PR = parseHostList(process.env.PRIORITIZE_OFFICIAL_PR || "");
 const FOLLOWUP_KEYWORD_REGEX = /^(?:find\s+more(?:\s+(?:sites?|sources?|links?|stories))?|more(?:\s+(?:sites?|sources?|links?|stories))?|more)$/i;
 const AUTO_RESEARCH_CONFIG = {
   max_searches_per_turn: MAX_AUTO_SEARCHES_PER_TURN,
@@ -388,6 +401,167 @@ const pendingAnalogyTimers = new Map();
 const sessionStateStore = new Map();
 const newsCardCooldown = new Map();
 const newsCardDaily = { dateKey: "", total: 0 };
+
+const listFollowupStore = new Map();
+
+function getFollowupState(sessionId) {
+  const base = { lastTopicKey: "", pageOffsetFor: {}, lastQueryFor: {}, updatedAt: 0 };
+  if (!sessionId) return { ...base };
+  let state = listFollowupStore.get(sessionId);
+  const now = Date.now();
+  if (!state) {
+    state = { ...base };
+    listFollowupStore.set(sessionId, state);
+  }
+  if (typeof state.lastTopicKey !== "string") {
+    state.lastTopicKey = state.lastTopicKey ? String(state.lastTopicKey) : "";
+  }
+  if (!state.pageOffsetFor || typeof state.pageOffsetFor !== "object") {
+    state.pageOffsetFor = {};
+  }
+  if (!state.lastQueryFor || typeof state.lastQueryFor !== "object") {
+    state.lastQueryFor = {};
+  }
+  if (!Number.isFinite(state.updatedAt)) {
+    state.updatedAt = 0;
+  }
+  if (FOLLOWUP_CONTEXT_SECONDS > 0 && state.updatedAt > 0) {
+    const maxAgeMs = FOLLOWUP_CONTEXT_SECONDS * 1000;
+    if (now - state.updatedAt > maxAgeMs) {
+      state.lastTopicKey = "";
+      state.pageOffsetFor = {};
+      state.lastQueryFor = {};
+      state.updatedAt = now;
+    }
+  }
+  return state;
+}
+
+function slugTopic(raw) {
+  const text = sanitizeQuery(raw || "");
+  if (!text) return "";
+  const normalizedKey = normalizeTopicKey(text, "news");
+  if (normalizedKey) return normalizedKey;
+  const normalizedTopic = normalizeTopic(text);
+  if (normalizedTopic) return normalizedTopic;
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function resetOffset(state, key) {
+  if (!state) return;
+  if (!key) {
+    state.pageOffsetFor = {};
+    return;
+  }
+  if (!state.pageOffsetFor || typeof state.pageOffsetFor !== "object") {
+    state.pageOffsetFor = {};
+  }
+  state.pageOffsetFor[key] = 0;
+}
+
+function rememberFollowupState(sessionId, topicKey, query, offset = 0) {
+  if (!sessionId) return;
+  const state = getFollowupState(sessionId);
+  const cleanKey = topicKey ? normalizeTopicKey(topicKey, "news") || topicKey : "";
+  if (cleanKey) {
+    state.lastTopicKey = cleanKey;
+    state.pageOffsetFor[cleanKey] = Math.max(0, Number(offset) || 0);
+    if (query) {
+      state.lastQueryFor[cleanKey] = sanitizeQuery(query);
+    }
+  }
+  state.updatedAt = Date.now();
+  listFollowupStore.set(sessionId, state);
+}
+
+function resolveTopicKey(userText, state) {
+  const text = String(userText || "");
+  const findMore = /\bfind (more )?sites\b/i.test(text);
+  if (findMore) {
+    if (STRICT_FOLLOWUP && !state?.lastTopicKey) {
+      return { reject: true, reason: "no-last-topic" };
+    }
+    return { topicKey: state?.lastTopicKey || "", advanceOffset: true };
+  }
+  const key = slugTopic(text);
+  if (RESET_OFFSET_ON_TOPIC_CHANGE && key) resetOffset(state, key);
+  return { topicKey: key, advanceOffset: false };
+}
+
+function cleanNewsText(text) {
+  return String(text || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function ensureSentence(text) {
+  const clean = cleanNewsText(text);
+  if (!clean) return "";
+  const hasTerminal = /[.!?]$/.test(clean);
+  return hasTerminal ? clean : `${clean}.`;
+}
+
+function headlineOneLiner(cites = []) {
+  if (!Array.isArray(cites) || !cites.length) {
+    return "No major developments found.";
+  }
+  const sentences = [];
+  for (const cite of cites.slice(0, 2)) {
+    const snippet = cleanNewsText(cite?.snippet || cite?.title || "");
+    if (!snippet) continue;
+    const sentence = ensureSentence(snippet);
+    if (!sentence) continue;
+    if (!sentences.includes(sentence)) {
+      sentences.push(sentence);
+    }
+    if (sentences.length >= 2) break;
+  }
+  if (!sentences.length) {
+    const fallback = cleanNewsText(cites[0]?.title || cites[0]?.snippet || "");
+    if (fallback) {
+      sentences.push(ensureSentence(fallback));
+    }
+  }
+  if (!sentences.length) {
+    return "Monitoring for fresh coverage.";
+  }
+  return sentences.join(" ");
+}
+
+function watchItem(cites = []) {
+  if (!Array.isArray(cites)) return "";
+  const patterns = /\b(will|plans?|expected|set to|upcoming|pending|could|watch|awaits?|looking to)\b/i;
+  for (const cite of cites) {
+    const snippet = cleanNewsText(cite?.snippet || "");
+    if (!snippet) continue;
+    if (patterns.test(snippet)) {
+      return snippet.endsWith(".") ? snippet.slice(0, -1).trim() : snippet;
+    }
+  }
+  return "";
+}
+
+function hostLabelFromCite(cite) {
+  if (!cite) return "";
+  if (cite.domain) return cite.domain;
+  return extractDomain(cite.url || "") || "source";
+}
+
+function fallbackFromLastReliable(cites = []) {
+  if (!Array.isArray(cites) || !cites.length) {
+    return "No authoritative updates in the last 72 h.";
+  }
+  const primary = cites[0];
+  const host = hostLabelFromCite(primary);
+  const title = cleanNewsText(primary?.title || "");
+  const citeLine = `[1] ${title || primary?.url || host} — ${primary?.url || "(no url)"}`;
+  const summary = title ? `Last reliable report from ${host} said ${title}.` : `Last reliable report came from ${host}.`;
+  return [`No authoritative updates in the last 72 h. ${summary}`, "Sources: [1]", citeLine].join("\n");
+}
 
 export const inspector = new EventEmitter();
 
@@ -1134,7 +1308,7 @@ async function ensureCard(topicKey, intent, { sessionId = null, userId = null } 
   }
 
   const effectiveQuery = isMeaningfulQuery(sanitizedQuery) ? sanitizedQuery : query;
-  const searchArgs = { q: effectiveQuery, k: 5 };
+  const searchArgs = { q: effectiveQuery, k: SEARCH_K };
   if (offset > 0) {
     searchArgs.offset = offset;
   }
@@ -1343,7 +1517,7 @@ async function maybeRunAutoResearch({
   const { qlist, keysUsed } = buildQueryList(query, { max: 8 });
   const topicForSearch = bucketTopic(query);
   const runNumber = touchTopicRun(sessionId, topicForSearch);
-  const args = { q: query, qlist: qlist.slice(), k: 5 };
+  const args = { q: query, qlist: qlist.slice(), k: SEARCH_K };
   const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
   if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
     args.qlist = rotateList(args.qlist, runNumber - 1);
@@ -1423,7 +1597,7 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
   const { qlist, keysUsed } = buildQueryList(query, { max: 8 });
   const topicForSearch = bucketTopic(query);
   const runNumber = touchTopicRun(sessionId, topicForSearch);
-  const args = { q: query, qlist: qlist.slice(), k: 5 };
+  const args = { q: query, qlist: qlist.slice(), k: SEARCH_K };
   const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
   if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
     args.qlist = rotateList(args.qlist, runNumber - 1);
@@ -2655,7 +2829,7 @@ async function handleAnalogyResponse(ws, sessionId, userId, content, turnHooks) 
     if (cleanedSearchQuery && userId) {
       try {
         const { qlist, keysUsed } = buildQueryList(cleanedSearchQuery, { max: 6 });
-        const args = { q: cleanedSearchQuery, qlist: qlist.slice(), k: 5 };
+        const args = { q: cleanedSearchQuery, qlist: qlist.slice(), k: SEARCH_K };
         await executeTool(ws, {
           userId,
           sessionId,
@@ -4605,7 +4779,7 @@ wss.on("connection", (ws, req) => {
             const topicForSearch = bucketTopic(base || targetTopicKey);
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topicForSearch);
-            const args = { q: base, qlist: qlist.slice(), k: 5 };
+            const args = { q: base, qlist: qlist.slice(), k: SEARCH_K };
             const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
             if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
               args.qlist = rotateList(args.qlist, runNumber - 1);
@@ -4789,6 +4963,19 @@ wss.on("connection", (ws, req) => {
           // Search intents
           if (listIntent) {
             const storedList = getStoredListContext(sessionId);
+            const followupState = getFollowupState(sessionId);
+            const resolvedFollowup = resolveTopicKey(content, followupState);
+            if (resolvedFollowup?.reject) {
+              flushCardUsage();
+              const reply = "Which topic?";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendFreshnessEvent();
+              return;
+            }
+            let resolvedTopicKey = resolvedFollowup?.topicKey || "";
+            const advanceOffset = Boolean(resolvedFollowup?.advanceOffset);
+
             let baseRaw = String(listIntent.query || "").trim();
             let base = sanitizeQuery(baseRaw);
             let topic = null;
@@ -4798,7 +4985,25 @@ wss.on("connection", (ws, req) => {
             const storedTopicKey = storedList?.lastTopicKey || previous?.lastTopicKey || "";
             let followupMode = false;
 
-            if (listIntent.topicless) {
+            if (advanceOffset && resolvedTopicKey) {
+              const storedQueryForTopic = sanitizeQuery(followupState.lastQueryFor[resolvedTopicKey] || "");
+              if (storedQueryForTopic) {
+                base = storedQueryForTopic;
+                baseRaw = storedQueryForTopic;
+                followupMode = true;
+              } else if (storedReuse) {
+                base = storedReuse;
+                baseRaw = storedReuse;
+                followupMode = true;
+              } else {
+                flushCardUsage();
+                const reply = "I need the topic again to keep searching.";
+                appendMessage(sessionId, { role: "assistant", content: reply });
+                ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+                sendFreshnessEvent();
+                return;
+              }
+            } else if (listIntent.topicless) {
               if (storedReuse) {
                 base = storedReuse;
                 followupMode = true;
@@ -4823,7 +5028,7 @@ wss.on("connection", (ws, req) => {
             const policyCheck = evaluatePolicyGate(content, base);
             if (policyCheck.blocked) {
               flushCardUsage();
-              const topicCandidate = normalizeTopicKey(base || content, "news") || storedTopicKey || "";
+              const topicCandidate = normalizeTopicKey(base || content, "news") || storedTopicKey || resolvedTopicKey || "";
               emitInspectorEvent(ws, "policy_gate", { reason: policyCheck.reason, topicKey: topicCandidate });
               const reply = policyCheck.reason === "voter_info"
                 ? "For official voting information, please visit Vote.gov or your local election office."
@@ -4836,10 +5041,10 @@ wss.on("connection", (ws, req) => {
             const searchIntent = policyCheck.intent || "";
 
             const shortOrFollowup = !isMeaningfulQuery(base) || FOLLOWUP_KEYWORD_REGEX.test(baseRaw.trim().toLowerCase());
-            if (shortOrFollowup && storedReuse) {
+            if (!advanceOffset && shortOrFollowup && storedReuse) {
               base = storedReuse;
               followupMode = true;
-            } else if (shortOrFollowup && !storedReuse) {
+            } else if (!advanceOffset && shortOrFollowup && !storedReuse) {
               if (STRICT_FOLLOWUP) {
                 const reply = "I need the topic again to keep searching.";
                 appendMessage(sessionId, { role: "assistant", content: reply });
@@ -4849,26 +5054,26 @@ wss.on("connection", (ws, req) => {
               }
             }
 
-            if (!base) {
+            const trimmedBase = base.trim();
+            if (!trimmedBase || trimmedBase === "." || trimmedBase.length < MIN_QUERY_LEN) {
               flushCardUsage();
-              sendGapPrompt(ws, {
-                userId,
-                sessionId,
-                prompt: "What topic do you want?",
-                q: "Need topic for list request",
-                why: "User asked for sources without a usable query"
-              });
+              const reply = "Tell me what to look up (e.g., \"latest on OpenAI–AMD deal\").";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
               sendFreshnessEvent();
               return;
             }
 
             if (!topic) {
-              const topicSource = followupMode && storedTopic ? storedTopic : (listIntent.topicless && storedList?.topic ? storedList.topic : null);
+              const topicSource = followupMode && storedTopic
+                ? storedTopic
+                : (listIntent.topicless && storedList?.topic ? storedList.topic : null);
               topic = topicSource || bucketTopic(base || content);
             }
 
             const canonicalListKey = (() => {
               const options = [
+                resolvedTopicKey,
                 storedTopicKey,
                 storedList?.topic,
                 ensureTopic(base || content, sessionId)
@@ -4881,35 +5086,60 @@ wss.on("connection", (ws, req) => {
               return "";
             })();
 
+            if (!resolvedTopicKey && canonicalListKey) {
+              resolvedTopicKey = canonicalListKey;
+            }
+
             const persistentInfo = canonicalListKey ? getPersistentSeenHosts(canonicalListKey) : { offset: 0 };
 
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topic);
-            const args = { q: base, qlist: qlist.slice(), k: 5 };
-            let pageIndex = 0;
+            const args = { q: base, qlist: qlist.slice(), k: SEARCH_K };
             const previousTopicKey = previous?.lastTopicKey || "";
-            if (followupMode) {
+            let pageIndex = 0;
+            let offsetToUse = 0;
+
+            if (advanceOffset && resolvedTopicKey) {
+              const prevOffset = Number(followupState.pageOffsetFor[resolvedTopicKey]) || 0;
+              offsetToUse = prevOffset + SEARCH_K;
+              pageIndex = Math.max(1, Math.floor(offsetToUse / SEARCH_K));
+            } else if (followupMode) {
               const prevPage = Number(previous?.pageIndex);
               pageIndex = Number.isFinite(prevPage) && prevPage >= 0 ? prevPage + 1 : 1;
               if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
                 pageIndex = 1;
               }
-            } else if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
+              if (pageIndex > 0) {
+                offsetToUse = pageIndex * SEARCH_K;
+              }
+            }
+
+            if (!followupMode && !advanceOffset && RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
+              offsetToUse = 0;
               pageIndex = 0;
             }
-            const computedOffset = pageIndex > 0 ? pageIndex * 5 : 0;
-            let offsetToUse = Number.isFinite(persistentInfo?.offset) ? persistentInfo.offset : 0;
-            if (followupMode) {
-              offsetToUse = Math.max(offsetToUse, computedOffset);
-            } else if (computedOffset > 0) {
-              offsetToUse = computedOffset;
+
+            const persistentOffset = Number.isFinite(persistentInfo?.offset) ? Number(persistentInfo.offset) : 0;
+            if (persistentOffset > 0) {
+              offsetToUse = Math.max(offsetToUse, persistentOffset);
+              if (offsetToUse > 0) {
+                pageIndex = Math.max(pageIndex, Math.floor(offsetToUse / SEARCH_K));
+              }
             }
+
             if (offsetToUse > 0) {
               args.offset = offsetToUse;
             }
+
+            if (advanceOffset && resolvedTopicKey) {
+              followupState.pageOffsetFor[resolvedTopicKey] = offsetToUse;
+            } else if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && !advanceOffset) {
+              followupState.pageOffsetFor[canonicalListKey] = offsetToUse;
+            }
+
             const canonicalListTopic = normalizeTopic(base);
-            if (followupMode) {
-              const followupKey = canonicalListKey || storedTopicKey || normalizeTopicKey(base || content, "news") || "";
+            if (followupMode || advanceOffset) {
+              const followupKey = resolvedTopicKey || canonicalListKey || storedTopicKey || normalizeTopicKey(base || content, "news") || "";
               if (followupKey) {
                 emitInspectorEvent(ws, "followup_resolved", { topicKey: followupKey, offset: pageIndex });
               }
@@ -4935,9 +5165,10 @@ wss.on("connection", (ws, req) => {
               banditKeys: keysUsed,
               runNumber,
               canonicalTopicKey: canonicalListKey,
-              listFollowup: Boolean(listIntent.topicless || followupMode),
+              listFollowup: Boolean(listIntent.topicless || followupMode || advanceOffset),
               pageIndex,
-              searchIntent
+              searchIntent,
+              intent: "news_latest"
             }));
             return;
           }
@@ -4958,6 +5189,14 @@ wss.on("connection", (ws, req) => {
                 return;
               }
             }
+            const trimmedSearchBase = base.trim();
+            if (!trimmedSearchBase || trimmedSearchBase === "." || trimmedSearchBase.length < MIN_QUERY_LEN) {
+              const reply = "Tell me what to look up (e.g., \"latest on OpenAI–AMD deal\").";
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendFreshnessEvent();
+              return;
+            }
             const policyCheck = evaluatePolicyGate(content, base);
             if (policyCheck.blocked) {
               flushCardUsage();
@@ -4974,7 +5213,7 @@ wss.on("connection", (ws, req) => {
             const searchIntent = policyCheck.intent || "";
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topic);
-            const args = { q: base, qlist: qlist.slice(), k: 5 };
+            const args = { q: base, qlist: qlist.slice(), k: SEARCH_K };
             const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
             if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
               args.qlist = rotateList(args.qlist, runNumber - 1);
@@ -5110,6 +5349,46 @@ async function executeTool(ws, meta, call_id="auto") {
       const searchIntent = typeof meta?.searchIntent === "string" ? meta.searchIntent : "";
       const adjustmentLog = [];
 
+      const normalizeHost = (host) => {
+        const clean = String(host || "").trim().toLowerCase();
+        if (!clean) return "";
+        return clean;
+      };
+      const manualDownrank = new Set();
+      const manualAllow = new Set();
+      const manualPrioritize = new Set();
+      const matchesHostSet = (domain, hostSet) => {
+        if (!domain || !hostSet || !hostSet.size) return false;
+        for (const host of hostSet) {
+          if (domainMatches(domain, host)) return true;
+        }
+        return false;
+      };
+      const downrankHosts = (hosts = []) => {
+        for (const host of hosts || []) {
+          const clean = normalizeHost(host);
+          if (clean) manualDownrank.add(clean);
+        }
+      };
+      const allowlistHosts = (hosts = []) => {
+        for (const host of hosts || []) {
+          const clean = normalizeHost(host);
+          if (clean) manualAllow.add(clean);
+        }
+      };
+      const prioritizeHosts = (hosts = []) => {
+        for (const host of hosts || []) {
+          const clean = normalizeHost(host);
+          if (clean) manualPrioritize.add(clean);
+        }
+      };
+
+      if (meta.intent === "news_latest") {
+        downrankHosts(["apps.apple.com", "play.google.com"]);
+        allowlistHosts(Array.from(NEWS_ALLOWLIST));
+        prioritizeHosts(Array.from(PRIORITIZE_OFFICIAL_PR));
+      }
+
       const scoreEntries = (entries, baseIdx = 0, logArray = adjustmentLog) => {
         return (entries || []).map((entry, idx) => {
           const domain = extractDomain(entry?.url || "");
@@ -5119,6 +5398,9 @@ async function executeTool(ws, meta, call_id="auto") {
           let adjustment = 0;
           if (domain && NEWS_ALLOWLIST.has(domain)) adjustment += 0.15;
           if (domain && NEWS_DOWNRANK.has(domain)) adjustment -= 0.25;
+          if (domain && matchesHostSet(domain, manualAllow)) adjustment += 0.12;
+          if (domain && matchesHostSet(domain, manualPrioritize)) adjustment += 0.18;
+          if (domain && matchesHostSet(domain, manualDownrank)) adjustment -= 0.45;
           if (domain && searchIntent === "press_release" && OFFICIAL_PR_DOMAINS.has(domain)) adjustment += 0.1;
           const score = baseScore + adjustment;
           if (logArray) {
@@ -5368,6 +5650,9 @@ async function executeTool(ws, meta, call_id="auto") {
           pageIndex: Number.isFinite(meta?.pageIndex) ? Math.max(0, Number(meta.pageIndex)) : 0
         });
 
+        const usedOffset = Number.isFinite(meta?.spec?.args?.offset) ? Math.max(0, Number(meta.spec.args.offset)) : 0;
+        rememberFollowupState(meta.sessionId, canonicalTopicKey || canonicalHintKey || "", baseQuery || normalizedQuery, usedOffset);
+
         const averageScore = selected.length
           ? selected.reduce((sum, entry) => sum + (Number(entry.score) || 0), 0) / selected.length
           : 0;
@@ -5384,9 +5669,49 @@ async function executeTool(ws, meta, call_id="auto") {
 
       if (selected.length) {
         const lines = selected.map((r,i) => `#${i+1} — ${r.title || "(no title)"} (score ${formatScore(r.score)}) — ${r.url}`).join("\n");
-        const msg = `Here are ${selected.length} sources:\n${lines}`;
-        appendMessage(meta.sessionId, { role:"assistant", content: msg });
-        ws.send(JSON.stringify({ type:"assistant_message", content: msg }));
+        const citeEntries = selected.slice(0, 5).map((entry, idx) => ({
+          index: idx + 1,
+          title: entry?.title || "",
+          url: entry?.url || "",
+          domain: entry?.domain || extractDomain(entry?.url || "") || "",
+          snippet: entry?.snippet || ""
+        }));
+        const citeCount = citeEntries.filter(c => c.url).length;
+        const sendAssistant = (text) => {
+          appendMessage(meta.sessionId, { role: "assistant", content: text });
+          ws.send(JSON.stringify({ type: "assistant_message", content: text }));
+        };
+
+        if (meta.intent === "news_latest") {
+          const today = new Date().toISOString().slice(0, 10);
+          const summaryLine = headlineOneLiner(citeEntries);
+          const watchLine = watchItem(citeEntries);
+          const sourcesLine = citeEntries.length
+            ? `Sources: ${citeEntries.map(c => `[${c.index}]`).join(" ")}`
+            : "Sources: (none)";
+          const detailLines = citeEntries.map(c => {
+            const title = cleanNewsText(c.title || c.url || c.domain);
+            return `[${c.index}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
+          });
+          const composed = [
+            `As of ${today}: ${summaryLine}`,
+            watchLine ? `What’s next: • ${watchLine}` : null,
+            sourcesLine,
+            ...detailLines
+          ].filter(Boolean).join("\n");
+          const hasDate = /\d{4}-\d{2}-\d{2}/.test(composed);
+          emitInspectorEvent(ws, "compose.qa", { has_date: hasDate, citations: citeCount, sections_ok: true });
+          if (hasDate && citeCount >= 2) {
+            sendAssistant(composed);
+          } else {
+            sendAssistant(fallbackFromLastReliable(citeEntries));
+          }
+          handedToModel = true;
+        } else {
+          const msg = `Here are ${selected.length} sources:\n${lines}`;
+          sendAssistant(msg);
+        }
+
         ws.send(JSON.stringify({ type: "list_posted", explore: exploreFlag, reason: exploreReason, hosts: selectedHosts }));
         const canonicalListTopic = (targetConceptKey ? normalizeTopicKey(targetConceptKey, "news") : (canonicalHintKey || canonicalTopicKey))
           || normalizeTopicKey(normalizedTopic || "", "news")
@@ -5520,6 +5845,11 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     if (!fallbackText) return false;
     const listIntent = detectListIntent(fallbackText);
     const storedList = getStoredListContext(sessionId);
+    const followupState = getFollowupState(sessionId);
+    const resolvedFollowup = resolveTopicKey(fallbackText, followupState);
+    if (resolvedFollowup?.reject) return false;
+    let resolvedTopicKey = resolvedFollowup?.topicKey || "";
+    const advanceOffset = Boolean(resolvedFollowup?.advanceOffset);
     const previous = sessionSearch.get(sessionId) || null;
     let baseRaw = String(listIntent?.query || "").trim();
     let base = sanitizeQuery(baseRaw);
@@ -5528,38 +5858,63 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     const storedTopic = storedList?.topic || previous?.topic || "";
     const storedTopicKey = storedList?.lastTopicKey || previous?.lastTopicKey || "";
     let followupMode = false;
-    if (listIntent?.topicless) {
+
+    if (advanceOffset && resolvedTopicKey) {
+      const storedQueryForTopic = sanitizeQuery(followupState.lastQueryFor[resolvedTopicKey] || "");
+      if (storedQueryForTopic) {
+        base = storedQueryForTopic;
+        baseRaw = storedQueryForTopic;
+        followupMode = true;
+      } else if (storedReuse) {
+        base = storedReuse;
+        baseRaw = storedReuse;
+        followupMode = true;
+      } else {
+        return false;
+      }
+    } else if (listIntent?.topicless) {
       if (!storedReuse) return false;
       base = storedReuse;
       followupMode = true;
       topic = storedTopicKey || storedTopic || bucketTopic(base);
     }
+
     if (!base) {
       base = sanitizeQuery(fallbackText.trim());
     }
     if (!base) return false;
+
     const shortOrFollowup = !isMeaningfulQuery(base) || FOLLOWUP_KEYWORD_REGEX.test(baseRaw.trim().toLowerCase());
-    if (shortOrFollowup && storedReuse) {
+    if (!advanceOffset && shortOrFollowup && storedReuse) {
       base = storedReuse;
       followupMode = true;
-    } else if (shortOrFollowup && !storedReuse) {
+    } else if (!advanceOffset && shortOrFollowup && !storedReuse) {
       if (STRICT_FOLLOWUP) return false;
     }
+
+    const trimmedBase = base.trim();
+    if (!trimmedBase || trimmedBase === "." || trimmedBase.length < MIN_QUERY_LEN) {
+      return false;
+    }
+
     const policyCheck = evaluatePolicyGate(fallbackText, base);
     if (policyCheck.blocked) {
-      const topicCandidate = normalizeTopicKey(base || fallbackText, "news") || storedTopicKey || "";
+      const topicCandidate = normalizeTopicKey(base || fallbackText, "news") || storedTopicKey || resolvedTopicKey || "";
       emitInspectorEvent(ws, "policy_gate", { reason: policyCheck.reason, topicKey: topicCandidate });
       return false;
     }
     const searchIntent = policyCheck.intent || "";
     if (!topic) {
-      const topicSource = followupMode && storedTopic ? storedTopic : (listIntent?.topicless && storedList?.lastTopicKey
-        ? storedList.lastTopicKey
-        : storedList?.topic);
+      const topicSource = followupMode && storedTopic
+        ? storedTopic
+        : (listIntent?.topicless && storedList?.lastTopicKey
+          ? storedList.lastTopicKey
+          : storedList?.topic);
       topic = topicSource || bucketTopic(base || fallbackText);
     }
+
     const canonicalListKey = (() => {
-      const options = [storedTopicKey, storedList?.topic, ensureTopic(base || fallbackText, sessionId)];
+      const options = [resolvedTopicKey, storedTopicKey, storedList?.topic, ensureTopic(base || fallbackText, sessionId)];
       for (const candidate of options) {
         if (!candidate) continue;
         const normalized = normalizeTopicKey(candidate, "news");
@@ -5567,36 +5922,64 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
       }
       return "";
     })();
+
+    if (!resolvedTopicKey && canonicalListKey) {
+      resolvedTopicKey = canonicalListKey;
+    }
+
     const persistentInfo = canonicalListKey ? getPersistentSeenHosts(canonicalListKey) : { offset: 0 };
     const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
     const runNumber = touchTopicRun(sessionId, topic);
-    const args = { q: base, qlist: qlist.slice(), k: 5 };
-    let pageIndex = 0;
+    const args = { q: base, qlist: qlist.slice(), k: SEARCH_K };
     const previousTopicKey = previous?.lastTopicKey || "";
-    if (followupMode) {
+    let pageIndex = 0;
+    let offsetToUse = 0;
+
+    if (advanceOffset && resolvedTopicKey) {
+      const prevOffset = Number(followupState.pageOffsetFor[resolvedTopicKey]) || 0;
+      offsetToUse = prevOffset + SEARCH_K;
+      pageIndex = Math.max(1, Math.floor(offsetToUse / SEARCH_K));
+    } else if (followupMode) {
       const prevPage = Number(previous?.pageIndex);
       pageIndex = Number.isFinite(prevPage) && prevPage >= 0 ? prevPage + 1 : 1;
       if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
         pageIndex = 1;
       }
+      if (pageIndex > 0) {
+        offsetToUse = pageIndex * SEARCH_K;
+      }
     }
-    const computedOffset = pageIndex > 0 ? pageIndex * 5 : 0;
-    let offsetToUse = Number.isFinite(persistentInfo?.offset) ? persistentInfo.offset : 0;
-    if (followupMode) {
-      offsetToUse = Math.max(offsetToUse, computedOffset);
-    } else if (computedOffset > 0) {
-      offsetToUse = computedOffset;
+
+    if (!followupMode && !advanceOffset && RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && previousTopicKey && previousTopicKey !== canonicalListKey) {
+      offsetToUse = 0;
+      pageIndex = 0;
     }
+
+    const persistentOffset = Number.isFinite(persistentInfo?.offset) ? Number(persistentInfo.offset) : 0;
+    if (persistentOffset > 0) {
+      offsetToUse = Math.max(offsetToUse, persistentOffset);
+      if (offsetToUse > 0) {
+        pageIndex = Math.max(pageIndex, Math.floor(offsetToUse / SEARCH_K));
+      }
+    }
+
     if (offsetToUse > 0) {
       args.offset = offsetToUse;
     }
+
+    if (advanceOffset && resolvedTopicKey) {
+      followupState.pageOffsetFor[resolvedTopicKey] = offsetToUse;
+    } else if (RESET_OFFSET_ON_TOPIC_CHANGE && canonicalListKey && !advanceOffset) {
+      followupState.pageOffsetFor[canonicalListKey] = offsetToUse;
+    }
+
     const hasBrave = Boolean((process.env.BRAVE_API_KEY || "").trim());
     if (!hasBrave && runNumber > 1 && args.qlist.length > 1) {
       args.qlist = rotateList(args.qlist, runNumber - 1);
     }
     const spec = { tool: "web_search", args };
-    if (followupMode) {
-      const followupKey = canonicalListKey || storedTopicKey || normalizeTopicKey(base || fallbackText, "news") || "";
+    if (followupMode || advanceOffset) {
+      const followupKey = resolvedTopicKey || canonicalListKey || storedTopicKey || normalizeTopicKey(base || fallbackText, "news") || "";
       if (followupKey) {
         emitInspectorEvent(ws, "followup_resolved", { topicKey: followupKey, offset: pageIndex });
       }
@@ -5611,7 +5994,22 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
             : []
         }
       : {};
-    await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber, pageIndex, canonicalTopicKey: canonicalListKey, searchIntent, ...conceptMeta, turnHooks });
+    await executeTool(ws, {
+      userId,
+      sessionId,
+      spec,
+      requestText: fallbackText,
+      topic,
+      banditKeys: keysUsed,
+      runNumber,
+      pageIndex,
+      canonicalTopicKey: canonicalListKey,
+      searchIntent,
+      intent: "news_latest",
+      listFollowup: Boolean(followupMode || advanceOffset),
+      ...conceptMeta,
+      turnHooks
+    });
     return true;
   };
 
