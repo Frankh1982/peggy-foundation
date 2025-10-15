@@ -973,6 +973,24 @@ const FACET_EQUIV = {
   governance: ["governance conditions", "conditions"]
 };
 
+const ENTITY_TITLE_OVERRIDES = new Map([
+  ["ai", "AI"],
+  ["usa", "USA"],
+  ["us", "US"],
+  ["uk", "UK"],
+  ["eu", "EU"],
+  ["nasa", "NASA"],
+  ["nvidia", "NVIDIA"],
+  ["amd", "AMD"],
+  ["ibm", "IBM"],
+  ["ftx", "FTX"],
+  ["gpt", "GPT"],
+  ["openai", "OpenAI"],
+  ["google", "Google"],
+  ["meta", "Meta"],
+  ["tesla", "Tesla"]
+]);
+
 const FACET_EQUIV_LOOKUP = (() => {
   const map = new Map();
   for (const [canonical, variants] of Object.entries(FACET_EQUIV)) {
@@ -1001,6 +1019,224 @@ export function canonicalizeFacet(value) {
   if (FACET_EQUIV_LOOKUP.has(collapsed)) return FACET_EQUIV_LOOKUP.get(collapsed);
   if (FACET_EQUIV_LOOKUP.has(lowered)) return FACET_EQUIV_LOOKUP.get(lowered);
   return collapsed;
+}
+
+function facetSynonyms(facet) {
+  const canonical = canonicalizeFacet(facet);
+  if (!canonical) return [];
+  const variants = Array.isArray(FACET_EQUIV[canonical]) ? FACET_EQUIV[canonical] : [];
+  const values = [canonical, ...variants]
+    .map(value => String(value || "").trim())
+    .filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const value of values) {
+    const lowered = value.toLowerCase();
+    if (seen.has(lowered)) continue;
+    seen.add(lowered);
+    out.push(value);
+  }
+  return out;
+}
+
+function scoreFacetTerm(term) {
+  if (!term) return 0;
+  const words = term.trim().split(/\s+/).length;
+  const length = term.trim().length;
+  const hasSpace = /\s/.test(term);
+  return (hasSpace ? 100 : 0) + words * 10 + length;
+}
+
+function choosePrimaryFacetTerm(terms = []) {
+  if (!Array.isArray(terms) || !terms.length) return "";
+  let best = terms[0];
+  let bestScore = scoreFacetTerm(best);
+  for (const term of terms.slice(1)) {
+    const score = scoreFacetTerm(term);
+    if (score > bestScore) {
+      best = term;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function detokenizeAnalogyKey(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw
+    .split(/[\s/]+/)
+    .map(token => {
+      const trimmed = token.trim();
+      if (!trimmed) return "";
+      if (/^[A-Z0-9]+$/.test(trimmed)) return trimmed;
+      if (/^[a-z]{1,3}$/.test(trimmed)) return trimmed.toUpperCase();
+      return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
+function quoteTerm(term, { allowBare = false } = {}) {
+  if (!term) return "";
+  const cleaned = String(term).replace(/"/g, "\"").trim();
+  if (!cleaned) return "";
+  if (allowBare && /^[\w.-]+$/i.test(cleaned)) {
+    return cleaned;
+  }
+  return `"${cleaned}"`;
+}
+
+function formatEntityLabel(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw
+    .split(/[\s/]+/)
+    .map(token => {
+      const trimmed = token.trim();
+      if (!trimmed) return "";
+      const lower = trimmed.toLowerCase();
+      if (ENTITY_TITLE_OVERRIDES.has(lower)) return ENTITY_TITLE_OVERRIDES.get(lower);
+      if (/^[A-Z0-9]+$/.test(trimmed)) return trimmed;
+      if (/^[a-z]{1,3}$/.test(lower)) return lower.toUpperCase();
+      return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+    })
+    .filter(Boolean)
+    .join(" ");
+}
+
+function normalizeEntityTerm(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const cleaned = formatEntityLabel(raw.replace(/[\r\n]+/g, " "));
+  if (!cleaned) return "";
+  if (/^[\w.&-]+$/i.test(cleaned)) {
+    return cleaned;
+  }
+  return `"${cleaned.replace(/"/g, "\"")}"`;
+}
+
+function extractEntitiesFromKey(key) {
+  const raw = String(key || "").trim();
+  if (!raw) return [];
+  const parts = raw
+    .split(/[/:]+/)
+    .map(part => part.replace(/[_\s]+/g, " ").trim())
+    .filter(part => part && part.length > 2);
+  const seen = new Set();
+  const entities = [];
+  for (const part of parts) {
+    const lowered = part.toLowerCase();
+    if (seen.has(lowered)) continue;
+    seen.add(lowered);
+    entities.push(part);
+  }
+  return entities;
+}
+
+function cleanDomainForExclusion(domain) {
+  if (!domain) return "";
+  let working = String(domain).trim().toLowerCase();
+  if (!working) return "";
+  working = working.replace(/^https?:\/\//i, "");
+  working = working.replace(/^\*+\./, "");
+  working = working.replace(/\/.*$/, "");
+  working = working.replace(/[^a-z0-9.-]/g, "");
+  if (!working) return "";
+  return working;
+}
+
+export function buildAnalogyQuery({
+  fromKey = "",
+  toKey = "",
+  overlap = [],
+  entities = [],
+  freshness = null,
+  domainPrefs = null
+} = {}) {
+  const canonicalFacets = Array.isArray(overlap)
+    ? Array.from(new Set(overlap.map(value => canonicalizeFacet(value)).filter(Boolean)))
+    : [];
+
+  const facetClauses = [];
+  canonicalFacets.slice(0, 3).forEach((facet, idx) => {
+    const variants = facetSynonyms(facet);
+    if (!variants.length) return;
+    if (idx === 0) {
+      const primary = choosePrimaryFacetTerm(variants);
+      if (primary) {
+        facetClauses.push(quoteTerm(primary));
+      }
+      return;
+    }
+    const formatted = variants.map(value => quoteTerm(value)).filter(Boolean);
+    if (!formatted.length) return;
+    if (formatted.length === 1) {
+      facetClauses.push(formatted[0]);
+    } else {
+      facetClauses.push(`(${formatted.join(" OR ")})`);
+    }
+  });
+
+  const entitySource = Array.isArray(entities) && entities.length ? entities : extractEntitiesFromKey(toKey);
+  const entityTerms = [];
+  const seenEntities = new Set();
+  for (const entity of entitySource) {
+    const formatted = normalizeEntityTerm(entity);
+    if (!formatted) continue;
+    const lowered = formatted.toLowerCase();
+    if (seenEntities.has(lowered)) continue;
+    seenEntities.add(lowered);
+    entityTerms.push(formatted);
+  }
+  if (!entityTerms.length && toKey) {
+    const fallback = extractEntitiesFromKey(fromKey)
+      .map(normalizeEntityTerm)
+      .filter(Boolean);
+    for (const term of fallback) {
+      const lowered = term.toLowerCase();
+      if (seenEntities.has(lowered)) continue;
+      seenEntities.add(lowered);
+      entityTerms.push(term);
+      if (entityTerms.length >= 3) break;
+    }
+  }
+
+  const clauses = facetClauses.slice();
+  if (entityTerms.length === 1) {
+    clauses.push(entityTerms[0]);
+  } else if (entityTerms.length > 1) {
+    clauses.push(`(${entityTerms.join(" OR ")})`);
+  }
+
+  const freshnessClause = (() => {
+    if (!freshness) return "";
+    if (typeof freshness === "string") return freshness.trim();
+    if (freshness.after) return `after:${freshness.after}`;
+    if (freshness.range) return freshness.range.trim();
+    return "";
+  })();
+  if (freshnessClause) {
+    clauses.push(freshnessClause);
+  }
+
+  let query = clauses.filter(Boolean).join(" AND ");
+  if (!query) {
+    const fallback = entityTerms[0] || quoteTerm(detokenizeAnalogyKey(toKey) || detokenizeAnalogyKey(fromKey) || "");
+    query = fallback || "";
+  }
+
+  if (domainPrefs && Array.isArray(domainPrefs.exclude) && domainPrefs.exclude.length) {
+    const exclusions = domainPrefs.exclude
+      .map(cleanDomainForExclusion)
+      .filter(Boolean)
+      .map(domain => `-site:${domain}`);
+    if (exclusions.length) {
+      query = `${query} ${exclusions.join(" ")}`.trim();
+    }
+  }
+
+  return query.trim();
 }
 
 const ANALOGY_FACET_RULES = [
