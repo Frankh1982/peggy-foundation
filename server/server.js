@@ -2136,7 +2136,8 @@ async function handleAnalogyResponse(ws, sessionId, userId, content, turnHooks) 
           requestText: searchQuery,
           topic: bucketTopic(searchQuery),
           banditKeys: keysUsed,
-          turnHooks
+          turnHooks,
+          targetConceptKey: suggestion.to
         }, "analogy_followup");
       } catch (err) {
         console.error("analogy_followup_search_error", err);
@@ -3617,13 +3618,16 @@ wss.on("connection", (ws, req) => {
               const last = getLastSummary(sessionId);
               if (last && last.url) {
                 const topicRecord = getSessionTopicRecord(sessionId);
+                const summaryConceptKey = toConceptKey(last.conceptKey);
+                const activeConceptKey = toConceptKey(topicRecord.active);
+                const lastListConceptKey = getSlotConceptKey(topicRecord.lastList);
                 const conceptKey = shortcutNote.kind === "last_summary"
-                  ? (last.conceptKey || toConceptKey(topicRecord.active) || getSlotConceptKey(topicRecord.lastList))
+                  ? (summaryConceptKey || activeConceptKey || lastListConceptKey)
                   : "";
                 if (conceptKey) {
                   lastSummaryConceptKey = conceptKey;
                 }
-                const topicCandidate = conceptKey ? detokenizeTopicKey(conceptKey) : (last.topic || last.title || summary);
+                const topicCandidate = conceptKey ? detokenizeTopicKey(conceptKey) : (last.title || summary);
                 const topicValue = topicCandidate ? String(topicCandidate).trim() : summary;
                 const topicFinal = topicValue || summary;
                 noteTopicLabel = topicFinal;
@@ -4516,7 +4520,10 @@ async function executeTool(ws, meta, call_id="auto") {
         })();
         const humanQuery = String(meta.requestText || baseQuery || "").trim();
         const originalUserQuery = humanQuery || baseQuery || "";
-        const canonicalTopicKey = (() => {
+        const targetConceptKey = call_id === "analogy_followup"
+          ? toConceptKey(meta?.targetConceptKey)
+          : "";
+        let canonicalTopicKey = (() => {
           const candidates = [
             originalUserQuery,
             normalizedTopic,
@@ -4532,6 +4539,9 @@ async function executeTool(ws, meta, call_id="auto") {
           }
           return "";
         })();
+        if (targetConceptKey) {
+          canonicalTopicKey = targetConceptKey;
+        }
         const listItems = selected.map(r => ({ title: r.title || "", url: r.url, host: r.domain || null }));
         setLastListContext(meta.sessionId, {
           topicKey: canonicalTopicKey,
@@ -4560,7 +4570,7 @@ async function executeTool(ws, meta, call_id="auto") {
         appendMessage(meta.sessionId, { role:"assistant", content: msg });
         ws.send(JSON.stringify({ type:"assistant_message", content: msg }));
         ws.send(JSON.stringify({ type: "list_posted", explore: exploreFlag, reason: exploreReason, hosts: selectedHosts }));
-        const canonicalListTopic = canonicalTopicKey
+        const canonicalListTopic = (targetConceptKey ? normalizeTopicKey(targetConceptKey, "news") : canonicalTopicKey)
           || normalizeTopicKey(normalizedTopic || "", "news")
           || normalizeTopicKey(humanQuery || normalizedQuery || topicToSearchPhrase(topic) || topic, "news");
         emitEventLog(ws, "list_posted", {
