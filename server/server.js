@@ -814,6 +814,7 @@ async function maybeRunAutoResearch({
   conceptContextBlock = "",
   conceptContextKey = "",
   conceptContextCount = 0,
+  conceptContextFacets = [],
   turnHooks = null
 }) {
   if (!sessionId || !userId) return null;
@@ -879,6 +880,7 @@ async function maybeRunAutoResearch({
     if (conceptContextBlock) conceptMeta.conceptContextBlock = conceptContextBlock;
     if (conceptContextKey) conceptMeta.conceptContextKey = conceptContextKey;
     if (conceptContextCount) conceptMeta.conceptContextCount = conceptContextCount;
+    if (conceptContextFacets?.length) conceptMeta.conceptContextFacets = conceptContextFacets.slice(0, 3);
     await executeTool(ws, {
       userId,
       sessionId,
@@ -2313,8 +2315,33 @@ function buildConceptContextBlock(conceptKey, { limit = 3 } = {}) {
   }
 
   if (!included.length) return { block: "", notes: [], key: normalizedKey };
+
+  const signature = extractFacetsFromNotes(included, { topN: 3 });
+  const rawFacets = Array.isArray(signature?.facets) ? signature.facets : [];
+  const facets = (() => {
+    const seen = new Set();
+    const list = [];
+    for (const facet of rawFacets) {
+      const display = String(facet || "").trim().replace(/[_\s]+/g, " ").trim();
+      if (!display) continue;
+      const key = display.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      list.push(display);
+      if (list.length >= 3) break;
+    }
+    return list;
+  })();
+
+  if (facets.length) {
+    const line = `\nKey facets: ${facets.join(", ")}`;
+    if (block.length + line.length + closing.length <= 400) {
+      block += line;
+    }
+  }
+
   block += closing;
-  return { block, notes: included, key: normalizedKey };
+  return { block, notes: included, key: normalizedKey, facets };
 }
 
 function buildCardContextBlock(cards, fallbackTopic) {
@@ -3354,6 +3381,7 @@ wss.on("connection", (ws, req) => {
             let conceptContextBlock = "";
             let conceptContextNotes = [];
             let conceptContextKey = "";
+            let conceptContextFacets = [];
             let freshnessEventSent = false;
             const sendFreshnessEvent = () => {
               if (freshnessEventSent) return;
@@ -3605,18 +3633,20 @@ wss.on("connection", (ws, req) => {
                 conceptContextBlock = context.block;
                 conceptContextNotes = context.notes.slice(0, 3);
                 conceptContextKey = context.key || keyCandidate;
+                conceptContextFacets = Array.isArray(context.facets) ? context.facets.slice(0, 3) : [];
                 break;
               }
             }
           }
-      
+
           if (conceptContextBlock && conceptContextNotes.length) {
             for (const entry of conceptContextNotes) {
               if (entry?.card) touchCardOnce(entry.card);
             }
             emitEventLog(ws, "concept_context", {
               key: conceptContextKey,
-              cards_used: conceptContextNotes.length
+              cards_used: conceptContextNotes.length,
+              facets: conceptContextFacets
             });
             if (!note) {
               const conceptNote = conceptContextNotes[0]?.card || null;
@@ -3630,7 +3660,8 @@ wss.on("connection", (ws, req) => {
             ? {
                 conceptContextBlock,
                 conceptContextKey,
-                conceptContextCount: conceptContextNotes.length
+                conceptContextCount: conceptContextNotes.length,
+                conceptContextFacets
               }
             : null;
           const withConceptContext = (meta = {}) => {
@@ -3648,7 +3679,17 @@ wss.on("connection", (ws, req) => {
           };
       
           appendMessage(sessionId, { role: "user", content });
-      
+
+          const ackOnly = /^(ok|okay|sounds good|👍)$/i.test(trimmedContent);
+          if (ackOnly) {
+            const ackReply = "👍";
+            appendMessage(sessionId, { role: "assistant", content: ackReply });
+            ws.send(JSON.stringify({ type: "assistant_message", content: ackReply }));
+            sendKdn(ws, sessionId, { state: "KNOWN", reason: "ack", ambiguous: false });
+            flushCardUsage();
+            return;
+          }
+
           if (await handleAnalogyResponse(ws, sessionId, trimmedContent)) {
             flushCardUsage();
             sendFreshnessEvent();
@@ -3801,7 +3842,7 @@ wss.on("connection", (ws, req) => {
               conceptKey: conceptContextKey,
               conceptLabel
             }));
-            const replyCandidate = twoSentenceFromNotes(enrichedNotes);
+            const replyCandidate = twoSentenceFromNotes(enrichedNotes, { facets: conceptContextFacets });
             const reply = replyCandidate || "I don't have any notes on that yet.";
             freshnessAction = "note";
             registerConceptUsage(conceptContextKey, conceptContextNotes.length, conceptContextBlock.length);
@@ -3838,6 +3879,7 @@ wss.on("connection", (ws, req) => {
               conceptContextBlock,
               conceptContextKey,
               conceptContextCount: conceptContextNotes.length,
+              conceptContextFacets,
               turnHooks
             });
           } catch (err) {
@@ -4481,7 +4523,10 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
       ? {
           conceptContextBlock: meta.conceptContextBlock,
           conceptContextKey: meta.conceptContextKey || "",
-          conceptContextCount: meta.conceptContextCount || 0
+          conceptContextCount: meta.conceptContextCount || 0,
+          conceptContextFacets: Array.isArray(meta.conceptContextFacets)
+            ? meta.conceptContextFacets.slice(0, 3)
+            : []
         }
       : {};
     await executeTool(ws, { userId, sessionId, spec, requestText: fallbackText, topic, banditKeys: keysUsed, runNumber, ...conceptMeta, turnHooks });
@@ -4525,6 +4570,9 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
         nextMeta.conceptContextBlock = meta.conceptContextBlock;
         nextMeta.conceptContextKey = meta.conceptContextKey || "";
         nextMeta.conceptContextCount = meta.conceptContextCount || 0;
+        if (Array.isArray(meta.conceptContextFacets)) {
+          nextMeta.conceptContextFacets = meta.conceptContextFacets.slice(0, 3);
+        }
       }
       if (meta?.autoResearch) nextMeta.autoResearch = true;
       await executeTool(ws, nextMeta, meta?.autoResearch ? "auto_research" : "auto");

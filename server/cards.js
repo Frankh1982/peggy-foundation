@@ -878,7 +878,23 @@ function resolveConceptLabel(notes) {
   return "Concept";
 }
 
-export function twoSentenceFromNotes(notes = []) {
+const dedupeFacetLabels = (values = []) => {
+  const seen = new Set();
+  const out = [];
+  for (const value of values) {
+    const raw = String(value || "").trim();
+    if (!raw) continue;
+    const display = raw.replace(/[_\s]+/g, " ").trim();
+    if (!display) continue;
+    const key = display.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(display);
+  }
+  return out;
+};
+
+export function twoSentenceFromNotes(notes = [], options = {}) {
   if (!Array.isArray(notes) || notes.length === 0) {
     return "";
   }
@@ -893,8 +909,12 @@ export function twoSentenceFromNotes(notes = []) {
     summaryClause = "No recent notes";
   }
 
-  const facetsBase = collectFacetsFromNotes(entries);
-  let facets = facetsBase.length ? facetsBase.slice(0, 3) : ["n/a"];
+  const overrideFacets = Array.isArray(options?.facets) ? options.facets : [];
+  let facets = dedupeFacetLabels(overrideFacets).slice(0, 3);
+  if (!facets.length) {
+    const facetsBase = collectFacetsFromNotes(entries);
+    facets = dedupeFacetLabels(facetsBase).slice(0, 3);
+  }
   const noteCard = primary?.card || {};
   const host = extractHost(noteCard) || "unknown";
   const age = formatAgeFromTimestamp(extractNoteTimestamp(noteCard)) || "?";
@@ -902,8 +922,11 @@ export function twoSentenceFromNotes(notes = []) {
 
   const buildSentences = () => {
     const sentenceOne = ensureSentence(`${prefix}${summaryClause}`);
-    const facetsLabel = facets.length ? facets.join(", ") : "n/a";
-    const sentenceTwo = ensureSentence(`Key facets: ${facetsLabel} — source ${host}, ${age}`);
+    const facetsLabel = facets.length ? facets.join(", ") : "";
+    const secondLine = facetsLabel
+      ? `Key facets: ${facetsLabel} — source ${host}, ${age}`
+      : `Source ${host}, ${age}`;
+    const sentenceTwo = ensureSentence(secondLine);
     return { sentenceOne, sentenceTwo };
   };
 
@@ -925,9 +948,6 @@ export function twoSentenceFromNotes(notes = []) {
 
   if (combined.length > 220 && facets.length) {
     facets = [facets[0]];
-    if (!facets[0] || facets[0] === "n/a") {
-      facets[0] = "n/a";
-    }
     ({ sentenceOne, sentenceTwo } = buildSentences());
     combined = `${sentenceOne} ${sentenceTwo}`.trim();
   }
@@ -985,7 +1005,7 @@ function readConceptEdges() {
     .filter(Boolean);
 }
 
-export function extractFacetsFromNotes(notes = []) {
+export function extractFacetsFromNotes(notes = [], { topN = null } = {}) {
   const parties = new Set();
   const facets = new Set();
   const textChunks = [];
@@ -1020,9 +1040,15 @@ export function extractFacetsFromNotes(notes = []) {
     }
   }
 
+  let facetList = Array.from(facets);
+  if (Number.isFinite(topN) && topN > 0) {
+    const limit = Math.max(1, Math.floor(topN));
+    facetList = facetList.slice(0, limit);
+  }
+
   return {
     parties: Array.from(parties),
-    facets: Array.from(facets)
+    facets: facetList
   };
 }
 
