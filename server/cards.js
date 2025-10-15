@@ -962,6 +962,43 @@ export function twoSentenceFromNotes(notes = [], options = {}) {
   return combined;
 }
 
+const FACET_EQUIV = {
+  supply: ["capacity", "capacity commitments", "supply capacity"],
+  "staged deploy": ["phased", "phased rollout", "rollout", "staged", "staged_deploy"],
+  credits: ["cloud credits", "usage credits"],
+  governance: ["governance conditions", "conditions"]
+};
+
+const FACET_EQUIV_LOOKUP = (() => {
+  const map = new Map();
+  for (const [canonical, variants] of Object.entries(FACET_EQUIV)) {
+    const base = canonical.toLowerCase().trim();
+    if (base) {
+      map.set(base, canonical);
+      map.set(base.replace(/\s+/g, " "), canonical);
+      map.set(base.replace(/\s+/g, "_"), canonical);
+    }
+    for (const variant of variants || []) {
+      const raw = String(variant || "").toLowerCase().trim();
+      if (!raw) continue;
+      map.set(raw, canonical);
+      map.set(raw.replace(/[_\s]+/g, " "), canonical);
+    }
+  }
+  return map;
+})();
+
+export function canonicalizeFacet(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const lowered = raw.toLowerCase();
+  const collapsed = lowered.replace(/[_\s]+/g, " ").trim();
+  if (!collapsed) return "";
+  if (FACET_EQUIV_LOOKUP.has(collapsed)) return FACET_EQUIV_LOOKUP.get(collapsed);
+  if (FACET_EQUIV_LOOKUP.has(lowered)) return FACET_EQUIV_LOOKUP.get(lowered);
+  return collapsed;
+}
+
 const ANALOGY_FACET_RULES = [
   {
     key: "supply",
@@ -972,8 +1009,16 @@ const ANALOGY_FACET_RULES = [
     pattern: /\b(?:warrant|option|stake|equity)\b/i
   },
   {
-    key: "staged_deploy",
+    key: "staged deploy",
     pattern: /\b(?:staged|phased|rollout|h1|h2|q[1-4]|20\d{2}|mi\d+)\b/i
+  },
+  {
+    key: "credits",
+    pattern: /\b(?:credits?|cloud\s+credits?|usage\s+credits?)\b/i
+  },
+  {
+    key: "governance",
+    pattern: /\b(?:governance(?:\s+conditions)?|conditions)\b/i
   }
 ];
 
@@ -1034,13 +1079,14 @@ export function extractFacetsFromNotes(notes = [], { topN = null } = {}) {
     const blob = textChunks.join(" \n ");
     for (const rule of ANALOGY_FACET_RULES) {
       if (rule.pattern.test(blob)) {
-        facets.add(rule.key);
+        const canonical = canonicalizeFacet(rule.key);
+        if (canonical) facets.add(canonical);
       }
       rule.pattern.lastIndex = 0;
     }
   }
 
-  let facetList = Array.from(facets);
+  let facetList = Array.from(facets).filter(Boolean);
   if (Number.isFinite(topN) && topN > 0) {
     const limit = Math.max(1, Math.floor(topN));
     facetList = facetList.slice(0, limit);
