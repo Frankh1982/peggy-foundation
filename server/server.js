@@ -12,6 +12,8 @@ import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
 import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeConceptKey, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance, canonicalizeFacet, buildAnalogyQuery } from "./cards.js";
 import { maybeBridge } from "../lib/bridge.js";
+import { handleContractTurn } from "./contractor.js";
+import { runAutoCardPipeline, appendLedgerEntry } from "./autocard.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -4457,6 +4459,52 @@ wss.on("connection", (ws, req) => {
           if (handleConceptCommand(ws, sessionId, trimmedContent)) {
             flushCardUsage();
             sendFreshnessEvent();
+            return;
+          }
+
+          const contractTurnId = `turn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const contractResult = handleContractTurn({ text: content, now: new Date() });
+          if (contractResult && contractResult.handled) {
+            freshnessAction = contractResult.requiresBrowse ? "search" : "answer";
+            if (contractResult.topicKey) {
+              freshnessTopic = contractResult.topicKey;
+              freshnessTopicSource = "contract";
+            }
+            if (Array.isArray(contractResult.searchLogs)) {
+              for (const log of contractResult.searchLogs) {
+                if (!log || !log.q) continue;
+                appendLedgerEntry({ action: "search", q: log.q, hits: Number(log.hits) || 0 });
+              }
+            }
+            const pipelineResult = runAutoCardPipeline({
+              facts: contractResult.facts || [],
+              sources: contractResult.sources || [],
+              intent: contractResult.intent,
+              turnId: contractTurnId,
+              provenance: { intent: contractResult.intent }
+            });
+            emitInspectorEvent(ws, "router.intent", {
+              intent: contractResult.intent,
+              requires_browse: Boolean(contractResult.requiresBrowse)
+            });
+            emitInspectorEvent(ws, "compose.qa", {
+              has_date: Boolean(contractResult.hasDate),
+              citations: Boolean(contractResult.citationsOk),
+              sections_ok: Boolean(contractResult.sectionsOk)
+            });
+            emitInspectorEvent(ws, "cards.saved", {
+              count: Number(pipelineResult?.count || 0),
+              keys: pipelineResult?.topicKeys || []
+            });
+            emitInspectorEvent(ws, "links.proposed", {
+              count: Number(pipelineResult?.linksCount || 0)
+            });
+            const reply = contractResult.reply || "";
+            sendFreshnessEvent();
+            appendMessage(sessionId, { role: "assistant", content: reply });
+            ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+            sendKdn(ws, sessionId, { state: "KNOWN", reason: "contract", ambiguous: false });
+            flushCardUsage();
             return;
           }
       
