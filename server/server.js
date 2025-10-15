@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import http from "http";
 import express from "express";
+import { createHash } from "crypto";
 import { WebSocketServer } from "ws";
 import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
@@ -36,6 +37,26 @@ const MAX_AUTO_NOTES_PER_SESSION = (() => {
   const num = Number(envAutoNotesSession);
   if (!Number.isFinite(num) || num < 0) return 3;
   return Math.max(0, Math.floor(num));
+})();
+const envAutoLearn = (process.env.AUTO_LEARN ?? "").trim();
+const AUTO_LEARN_ENABLED = (() => {
+  if (!envAutoLearn) return false;
+  const normalized = envAutoLearn.toLowerCase();
+  if (["0", "false", "off", "no"].includes(normalized)) return false;
+  if (["1", "true", "on", "yes"].includes(normalized)) return true;
+  const numeric = Number(envAutoLearn);
+  if (Number.isFinite(numeric)) return numeric > 0;
+  return false;
+})();
+const envMinWriteScore = (process.env.MIN_WRITE_SCORE ?? "").trim();
+const MIN_WRITE_SCORE = (() => {
+  const numeric = Number(envMinWriteScore);
+  if (Number.isFinite(numeric)) {
+    if (numeric <= 0) return 0;
+    if (numeric >= 1) return 1;
+    return numeric;
+  }
+  return 0.6;
 })();
 const AUTO_RESEARCH_CONFIG = {
   max_searches_per_turn: MAX_AUTO_SEARCHES_PER_TURN,
@@ -343,6 +364,16 @@ function getSessionTopicRecord(sessionId) {
   return record;
 }
 
+function getActiveTopicKey(sessionId) {
+  if (!sessionId) return "";
+  const record = getSessionTopicRecord(sessionId);
+  const raw = record?.active ? String(record.active).trim() : "";
+  if (!raw) return "";
+  const normalized = normalizeTopicKey(raw, "news");
+  if (normalized) return normalized;
+  return "";
+}
+
 function toConceptKey(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
@@ -624,6 +655,17 @@ function incrementAutoResearchSearchCount(sessionId) {
   return next;
 }
 
+function getSearchBudget(sessionId) {
+  return {
+    turn: () => {
+      if (!sessionId) return 0;
+      if (MAX_AUTO_SEARCHES_PER_TURN <= 0) return 0;
+      const remaining = MAX_AUTO_SEARCHES_PER_TURN - getAutoResearchSearchCount(sessionId);
+      return remaining > 0 ? remaining : 0;
+    }
+  };
+}
+
 function finalizeAutoResearchEvent(ws, sessionId, context) {
   if (!context || !context.trigger) {
     clearAutoResearchContext(sessionId);
@@ -671,6 +713,37 @@ function detectNamedEntityPair(text) {
     if (seen.size >= 2) return true;
   }
   return false;
+}
+
+function extractEntitiesToKey(text) {
+  const raw = typeof text === "string" ? text : "";
+  if (!raw) return "";
+  const matches = raw.match(/\b[A-Z][\w&.'-]*\b/g);
+  if (!matches) return "";
+  const seen = new Set();
+  const tokens = [];
+  for (const match of matches) {
+    const cleaned = match.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "");
+    if (!cleaned) continue;
+    const lower = cleaned.toLowerCase();
+    if (ENTITY_STOPWORDS.has(lower)) continue;
+    if (/^\d+$/.test(lower)) continue;
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    tokens.push(cleaned);
+    if (tokens.length >= 4) break;
+  }
+  if (!tokens.length) return "";
+  const phrase = tokens.join(" ");
+  const normalized = normalizeTopicKey(phrase, "news");
+  return normalized;
+}
+
+function makeFallbackDkTopicKey(text) {
+  const raw = typeof text === "string" ? text : "";
+  if (!raw) return "dk/" + Math.random().toString(36).slice(2, 10);
+  const hash = createHash("sha1").update(raw).digest("hex");
+  return `dk/${hash.slice(0, 10)}`;
 }
 
 function cleanAutoResearchQuery(text, topicKey, listQuery) {
@@ -828,6 +901,9 @@ async function maybeRunAutoResearch({
 
 async function runAutoResearchForDK({ ws, userId, sessionId }) {
   if (!sessionId || !userId) return;
+  if (!AUTO_LEARN_ENABLED) return;
+  const searchBudget = getSearchBudget(sessionId);
+  if (!searchBudget || searchBudget.turn() <= 0) return;
   if (MAX_AUTO_SEARCHES_PER_TURN <= 0) return;
   if (getAutoResearchSearchCount(sessionId) >= MAX_AUTO_SEARCHES_PER_TURN) return;
 
@@ -837,21 +913,23 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
   const userText = userTextRaw.replace(/[\r\n]+/g, " ").trim();
   if (!userText) return;
 
-  const normalizedTopic = normalizeTopic(userText);
-  const baseTopicKey = normalizeTopicKey(normalizedTopic || userText, "news");
-  const query = cleanAutoResearchQuery(userText, baseTopicKey, null);
-  const queryTopicKey = normalizeTopicKey(query, "news");
-  const topicKey = queryTopicKey || baseTopicKey || normalizeTopicKey(userText, "news") || "";
+  const activeTopicKey = getActiveTopicKey(sessionId);
+  const entityTopicKey = extractEntitiesToKey(userText);
+  const topicKey = (activeTopicKey || entityTopicKey || makeFallbackDkTopicKey(userText)).slice(0, 200);
   const context = {
     trigger: "dk",
     topic: topicKey,
     searched: false,
     wrote: false,
     candidate: null,
-    lastError: null
+    lastError: null,
+    lastScore: null,
+    lastSummary: null,
+    lastUrl: null
   };
   setAutoResearchContext(sessionId, context);
 
+  const query = cleanAutoResearchQuery(userText, topicKey, null);
   if (!query) {
     finalizeAutoResearchEvent(ws, sessionId, context);
     return;
@@ -870,6 +948,8 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
   }
 
   let run = null;
+  let noteSaved = false;
+
   try {
     const result = await tool_web_search(args, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
     run = saveRunRecord("web_search", args, result);
@@ -888,16 +968,6 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
     });
     const reward = Math.max(0, Math.min(1, k / 3)) - 0.02 * (latency_ms / 1000);
     if (Array.isArray(keysUsed) && keysUsed.length) updateBandit(keysUsed, reward);
-    recordEpisode({
-      userId,
-      sessionId,
-      topic: topicForSearch,
-      success: k > 0,
-      note_saved: false,
-      tokens_total: null,
-      calls: { web_search: 1, web_get: 0 }
-    });
-    ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
 
     const entries = Array.isArray(result?.results) ? result.results : [];
     const scoredCandidates = entries
@@ -930,11 +1000,12 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
     if (!cleanCandidates.length) {
       context.lastError = "no_primary_hit";
     } else {
-      const best = cleanCandidates[0].entry;
+      const bestCandidate = cleanCandidates[0];
+      const best = bestCandidate.entry;
       const title = (best.title || "").replace(/[\r\n]+/g, " ").trim();
       const snippet = (best.snippet || "").replace(/[\r\n]+/g, " ").trim();
-      const topicLabel = topicKey ? detokenizeTopicKey(topicKey) : (normalizedTopic || "");
-      const fallbackTopic = topicLabel || normalizedTopic || query || userText;
+      const topicLabel = detokenizeTopicKey(topicKey) || detokenizeTopicKey(topicForSearch) || "";
+      const fallbackTopic = topicLabel || query || userText;
       let summary = [title, snippet].filter(Boolean).join(" — ");
       summary = summary.replace(/\s+/g, " ").trim();
       if (!summary) summary = fallbackTopic.replace(/\s+/g, " ").trim();
@@ -942,45 +1013,73 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
       if (!summary) {
         context.lastError = "missing_summary";
       } else {
-        const payload = {
-          topic: fallbackTopic || summary,
-          summary,
-          source: { url: best.url },
-          ttl_days: AUTO_RESEARCH_CONFIG.note_ttl_days
-        };
-        if (title) payload.source.title = title.slice(0, 200);
-        const noteResult = saveNoteCardFromPayload({
-          payload,
-          explicitness: 0,
-          userId,
-          sessionId,
-          run,
-          reason: "auto_research_dk",
-          topicHint: fallbackTopic || summary,
-          autoResearch: true
-        });
-        if (noteResult?.saved && noteResult.card?.id) {
-          ws.send(JSON.stringify({
-            type: "note_saved",
-            note: { topic: noteResult.card.topic, score: Number(noteResult.score ?? 0) }
-          }));
-          rememberLastSavedNoteId(sessionId, noteResult.card.id);
-          autoLinkNoteToInferredConcept(ws, sessionId, noteResult.card);
-          maybeSuggestConceptLink(ws, sessionId, noteResult.card);
-          maybeProposeAnalogyFromNote(ws, sessionId, noteResult.card);
-          if (turnHooks?.registerConceptSave && noteResult.conceptKey) {
-            turnHooks.registerConceptSave(noteResult.conceptKey, 1);
+        const frequency = computeFrequencyScore(runNumber);
+        const metrics = { explicitness: 0, recency: bestCandidate.recency, frequency, taskGain: 0 };
+        const noteScore = scoreImportance(metrics);
+        context.lastScore = noteScore;
+        context.lastSummary = summary;
+        context.lastUrl = best.url;
+
+        if (noteScore < MIN_WRITE_SCORE) {
+          context.lastError = "score_low";
+          context.candidate = { summary, url: best.url, score: noteScore };
+        } else {
+          const payload = {
+            topic: topicKey || fallbackTopic || summary,
+            summary,
+            source: { url: best.url },
+            ttl_days: AUTO_RESEARCH_CONFIG.note_ttl_days
+          };
+          if (title) payload.source.title = title.slice(0, 200);
+          const noteResult = saveNoteCardFromPayload({
+            payload,
+            explicitness: 0,
+            userId,
+            sessionId,
+            run,
+            reason: "auto_research_dk",
+            topicHint: fallbackTopic || summary,
+            autoResearch: true
+          });
+          if (noteResult?.saved && noteResult.card?.id) {
+            noteSaved = true;
+            context.wrote = true;
+            context.lastError = null;
+            context.candidate = null;
+            ws.send(JSON.stringify({
+              type: "note_saved",
+              note: { topic: noteResult.card.topic, score: Number(noteResult.score ?? 0) }
+            }));
+            rememberLastSavedNoteId(sessionId, noteResult.card.id);
+            autoLinkNoteToInferredConcept(ws, sessionId, noteResult.card);
+            maybeSuggestConceptLink(ws, sessionId, noteResult.card);
+            maybeProposeAnalogyFromNote(ws, sessionId, noteResult.card);
+            if (updateLastEpisode({ note_saved: true })) {
+              ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
+            }
+          } else if (noteResult?.error === "duplicate_note" && noteResult?.conceptKey) {
+            context.lastError = "duplicate";
+          } else if (noteResult?.error === "auto_paused") {
+            context.lastError = "auto_paused";
+          } else if (noteResult?.error === "auto_note_limit") {
+            context.lastError = "auto_limit";
+          } else if (noteResult?.error) {
+            context.lastError = noteResult.error;
           }
-          if (updateLastEpisode({ note_saved: true })) {
-            ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
-          }
-        } else if (noteResult?.error === "duplicate_note" && noteResult?.conceptKey) {
-          context.lastError = "duplicate";
-        } else if (noteResult?.error === "auto_paused") {
-          context.lastError = "auto_paused";
         }
       }
     }
+
+    recordEpisode({
+      userId,
+      sessionId,
+      topic: topicForSearch,
+      success: k > 0,
+      note_saved: noteSaved,
+      tokens_total: null,
+      calls: { web_search: 1, web_get: 0 }
+    });
+    ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
   } catch (err) {
     context.lastError = "search_error";
     console.error("auto_research_dk_error", err);
