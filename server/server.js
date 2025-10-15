@@ -10,7 +10,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance, canonicalizeFacet } from "./cards.js";
+import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeConceptKey, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance, canonicalizeFacet } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -343,11 +343,34 @@ function normalizeListItems(items) {
 }
 
 function getSessionTopicRecord(sessionId) {
-  if (!sessionId) return { active: "", lastList: "", lastConcept: "" };
+  const emptySlots = () => ({ key: null, ts: 0 });
+  const makeRecord = () => ({
+    active: null,
+    lastList: emptySlots(),
+    lastConcept: emptySlots(),
+    lastAuto: emptySlots()
+  });
+  if (!sessionId) return makeRecord();
   let record = sessionTopicTracker.get(sessionId);
   if (!record) {
-    record = { active: "", lastList: "", lastConcept: "" };
+    record = makeRecord();
     sessionTopicTracker.set(sessionId, record);
+  } else {
+    if (!record.lastList || typeof record.lastList !== "object") {
+      const legacy = typeof record.lastList === "string" ? record.lastList.trim() : "";
+      record.lastList = legacy ? { key: legacy, ts: 0 } : emptySlots();
+    }
+    if (!record.lastConcept || typeof record.lastConcept !== "object") {
+      const legacy = typeof record.lastConcept === "string" ? record.lastConcept.trim() : "";
+      record.lastConcept = legacy ? { key: legacy, ts: 0 } : emptySlots();
+    }
+    if (!record.lastAuto || typeof record.lastAuto !== "object") {
+      const legacy = typeof record.lastAuto === "string" ? record.lastAuto.trim() : "";
+      record.lastAuto = legacy ? { key: legacy, ts: 0 } : emptySlots();
+    }
+    if (record.active !== null && typeof record.active !== "string") {
+      record.active = String(record.active || "").trim() || null;
+    }
   }
   return record;
 }
@@ -355,7 +378,7 @@ function getSessionTopicRecord(sessionId) {
 function getActiveTopicKey(sessionId) {
   if (!sessionId) return "";
   const record = getSessionTopicRecord(sessionId);
-  const raw = record?.active ? String(record.active).trim() : "";
+  const raw = typeof record?.active === "string" ? record.active.trim() : "";
   if (!raw) return "";
   const normalized = normalizeTopicKey(raw, "news");
   if (normalized) return normalized;
@@ -382,10 +405,9 @@ function updateSessionTopicLastList(sessionId, { topicKey = "", query = "" } = {
     }
   }
   if (!finalKey) return;
-  record.lastList = finalKey;
-  if (!record.active) {
-    record.active = finalKey;
-  }
+  const now = Date.now();
+  record.lastList = { key: finalKey, ts: now };
+  record.active = finalKey;
 }
 
 function updateSessionTopicLastConcept(sessionId, key) {
@@ -393,8 +415,17 @@ function updateSessionTopicLastConcept(sessionId, key) {
   const conceptKey = toConceptKey(key);
   if (!conceptKey) return;
   const record = getSessionTopicRecord(sessionId);
-  record.lastConcept = conceptKey;
+  const now = Date.now();
+  record.lastConcept = { key: conceptKey, ts: now };
   record.active = conceptKey;
+}
+
+function updateSessionTopicLastAuto(sessionId, key) {
+  if (!sessionId) return;
+  const conceptKey = toConceptKey(key);
+  if (!conceptKey) return;
+  const record = getSessionTopicRecord(sessionId);
+  record.lastAuto = { key: conceptKey, ts: Date.now() };
 }
 
 function setLastListContext(sessionId, { topicKey, qBase, items }) {
@@ -846,6 +877,9 @@ async function maybeRunAutoResearch({
   if (!trigger) return null;
 
   const topicKey = canonicalTopic || normalizeTopicKey(trimmed, "news") || "";
+  if (topicKey) {
+    updateSessionTopicLastAuto(sessionId, topicKey);
+  }
   const query = cleanAutoResearchQuery(trimmed, topicKey, listIntent?.query);
   const context = {
     trigger,
@@ -928,6 +962,9 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
     lastUrl: null
   };
   setAutoResearchContext(sessionId, context);
+  if (topicKey) {
+    updateSessionTopicLastAuto(sessionId, topicKey);
+  }
 
   emitInspectorEvent(ws, "auto_research", { trigger: "dk", planned: true, topic: topicKey });
 
@@ -1055,7 +1092,9 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
               note: { topic: noteResult.card.topic, score: Number(noteResult.score ?? 0) }
             }));
             rememberLastSavedNoteId(sessionId, noteResult.card.id);
-            const linkResult = autoLinkNoteToInferredConcept(ws, sessionId, noteResult.card);
+            const linkResult = autoLinkNoteToTopic(ws, sessionId, noteResult.card, { isAutoNote: true });
+            const autoTopicKey = getSlotConceptKey(getSessionTopicRecord(sessionId).lastAuto);
+            emitInspectorEvent(ws, "auto_research_note", { topic: autoTopicKey });
             maybeSuggestConceptLink(ws, sessionId, noteResult.card);
             maybeProposeAnalogyFromNote(ws, sessionId, noteResult.card, linkResult?.conceptKey);
             if (updateLastEpisode({ note_saved: true })) {
@@ -1226,10 +1265,6 @@ function logCardWrite(entry) {
   }
 }
 
-function normalizeConceptKey(key) {
-  return String(key || "").trim().toLowerCase();
-}
-
 function readConceptEdges() {
   try {
     const raw = fs.readFileSync(conceptEdgesFile, "utf8");
@@ -1382,85 +1417,126 @@ function resolveNoteHost(note) {
   }
 }
 
-function deriveConceptKey(candidate) {
-  const raw = String(candidate || "").trim();
+function getSlotConceptKey(slot) {
+  if (!slot || typeof slot !== "object") return "";
+  const raw = typeof slot.key === "string" ? slot.key.trim() : "";
   if (!raw) return "";
-  if (TOPIC_COMMAND_PREFIX_RE.test(raw)) return "";
-  const direct = toConceptKey(raw);
-  if (direct) return direct;
-  const normalizedTopicKey = normalizeTopicKey(raw, "news");
-  return toConceptKey(normalizedTopicKey);
+  return toConceptKey(raw);
 }
 
-function inferConceptKeyForNote(sessionId, noteCard, { message: _message } = {}) {
-  const record = getSessionTopicRecord(sessionId);
-  const active = toConceptKey(record.active);
-  if (active) return active;
-  const lastList = toConceptKey(record.lastList);
-  if (lastList) return lastList;
-
+function resolveFallbackConceptFromLastList(sessionId) {
+  if (!sessionId) return "";
+  const ctx = getLastListContext(sessionId);
+  if (!ctx) return "";
   const candidates = [];
-  const lastContext = getLastListContext(sessionId);
-  if (lastContext?.lastTopicKey) candidates.push(lastContext.lastTopicKey);
-  if (lastContext?.lastQBase) candidates.push(lastContext.lastQBase);
-  const storedSearch = sessionSearch.get(sessionId);
-  if (storedSearch?.lastTopicKey) candidates.push(storedSearch.lastTopicKey);
-  if (storedSearch?.lastQBase) candidates.push(storedSearch.lastQBase);
-
+  if (ctx.lastTopicKey) candidates.push(ctx.lastTopicKey);
+  if (ctx.lastQBase) candidates.push(ctx.lastQBase);
   for (const candidate of candidates) {
-    const derived = deriveConceptKey(candidate);
-    if (derived) return derived;
+    const raw = String(candidate || "").trim();
+    if (!raw || TOPIC_COMMAND_PREFIX_RE.test(raw)) continue;
+    const normalized = normalizeTopicKey(raw, "news");
+    const conceptKey = toConceptKey(normalized || raw);
+    if (conceptKey) return conceptKey;
   }
-
   return "";
 }
 
-function autoLinkNoteToInferredConcept(ws, sessionId, noteCard, { message: _message } = {}) {
-  if (!noteCard || !noteCard.id) return null;
-  const inferred = inferConceptKeyForNote(sessionId, noteCard, { message: _message });
-  const conceptKey = normalizeConceptKey(inferred);
-  if (!conceptKey) return null;
-
-  let promoted = false;
-  let concept = findConceptCard(conceptKey);
-  if (!concept) {
-    const metadata = inferConceptMetadata(conceptKey);
-    const now = Date.now();
-    const title = detokenizeTopicKey(conceptKey) || conceptKey;
-    const conceptCard = {
-      ...ConceptCard,
-      key: conceptKey,
-      title,
-      tags: metadata.tags,
-      entities: metadata.entities,
-      confidence: metadata.confidence,
-      ts: now,
-      last_used: null,
-      created_at: now,
-      ttl_days: null
-    };
-    const id = persistCard(conceptCard);
-    if (!id) {
-      return null;
-    }
-    concept = { ...conceptCard, id };
-    promoted = true;
-    invalidateConceptCache();
-    logCardWrite({ ts: now, type: "concept", topic: conceptKey, score: metadata.confidence, reason: "auto_promote" });
+function resolveNoteTopic(sessionId, { isAutoNote = false, now = Date.now() } = {}) {
+  const resolution = { key: "", source: "" };
+  if (!sessionId) return resolution;
+  const record = getSessionTopicRecord(sessionId);
+  if (isAutoNote) {
+    const key = getSlotConceptKey(record.lastAuto);
+    return { key, source: "lastAuto" };
   }
 
-  const result = addConceptEdge(noteCard.id, conceptKey);
+  const currentTs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const lastListKey = getSlotConceptKey(record.lastList);
+  const lastListTs = Number(record?.lastList?.ts) || 0;
+  if (lastListKey && currentTs - lastListTs <= 90_000) {
+    return { key: lastListKey, source: "lastList" };
+  }
+
+  const lastConceptKey = getSlotConceptKey(record.lastConcept);
+  if (lastConceptKey) {
+    return { key: lastConceptKey, source: "lastConcept" };
+  }
+
+  const activeKey = toConceptKey(record.active);
+  if (activeKey) {
+    return { key: activeKey, source: "active" };
+  }
+
+  const fallbackKey = resolveFallbackConceptFromLastList(sessionId);
+  if (fallbackKey) {
+    return { key: fallbackKey, source: "fallback" };
+  }
+
+  return resolution;
+}
+
+function ensureConceptForKey(conceptKey) {
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  if (!normalizedKey) {
+    return { promoted: false, concept: null };
+  }
+  let concept = findConceptCard(normalizedKey);
+  if (concept) {
+    return { promoted: false, concept };
+  }
+
+  const metadata = inferConceptMetadata(normalizedKey);
+  const now = Date.now();
+  const title = detokenizeTopicKey(normalizedKey) || normalizedKey;
+  const conceptCard = {
+    ...ConceptCard,
+    key: normalizedKey,
+    title,
+    tags: metadata.tags,
+    entities: metadata.entities,
+    confidence: metadata.confidence,
+    ts: now,
+    last_used: null,
+    created_at: now,
+    ttl_days: null
+  };
+  const id = persistCard(conceptCard);
+  if (!id) {
+    return { promoted: false, concept: null };
+  }
+  concept = { ...conceptCard, id };
+  invalidateConceptCache();
+  logCardWrite({ ts: now, type: "concept", topic: normalizedKey, score: metadata.confidence, reason: "auto_promote" });
+  return { promoted: true, concept };
+}
+
+function linkNoteToConceptEdge(noteId, conceptKey) {
+  const cleanId = String(noteId || "").trim();
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  if (!cleanId || !normalizedKey) {
+    return { added: false, edge: null };
+  }
+  return addConceptEdge(cleanId, normalizedKey);
+}
+
+function autoLinkNoteToTopic(ws, sessionId, noteCard, { isAutoNote = false } = {}) {
+  const resolution = resolveNoteTopic(sessionId, { isAutoNote });
+  const topicKey = resolution.key;
+  if (!noteCard || !noteCard.id || !topicKey) {
+    return { ...resolution, conceptKey: topicKey || "", promoted: false, added: false, linked: false };
+  }
+
+  const ensure = ensureConceptForKey(topicKey);
+  if (!ensure.concept) {
+    return { ...resolution, conceptKey: topicKey, promoted: false, added: false, linked: false };
+  }
+  const result = linkNoteToConceptEdge(noteCard.id, topicKey);
   if (!result?.edge) {
-    return null;
+    return { ...resolution, conceptKey: topicKey, promoted: Boolean(ensure.promoted), added: Boolean(result?.added), linked: false };
   }
 
-  updateSessionTopicLastConcept(sessionId, conceptKey);
-
-  if (ws) {
-    emitEventLog(ws, "auto_link", { noteId: noteCard.id, key: conceptKey, promoted });
-  }
-
-  return { promoted, added: result.added, conceptKey };
+  emitInspectorEvent(ws, "auto_link", { noteId: noteCard.id, key: topicKey, promoted: Boolean(ensure.promoted) });
+  return { ...resolution, conceptKey: topicKey, promoted: Boolean(ensure.promoted), added: Boolean(result.added), linked: true };
 }
 
 function maybeSuggestConceptLink(ws, sessionId, noteCard) {
@@ -3565,7 +3641,11 @@ wss.on("connection", (ws, req) => {
               if (noteId) {
                 rememberLastSavedNoteId(sessionId, noteId);
               }
-              const linkResult = autoLinkNoteToInferredConcept(ws, sessionId, result.card);
+              const linkResult = autoLinkNoteToTopic(ws, sessionId, result.card);
+              emitInspectorEvent(ws, "user_note_attributed", {
+                topic: linkResult?.conceptKey || "",
+                source: linkResult?.source || ""
+              });
               maybeSuggestConceptLink(ws, sessionId, result.card);
               maybeProposeAnalogyFromNote(ws, sessionId, result.card, linkResult?.conceptKey);
               if (updateLastEpisode({ note_saved: true })) {
@@ -3604,7 +3684,11 @@ wss.on("connection", (ws, req) => {
               if (result.card?.id) {
                 rememberLastSavedNoteId(sessionId, result.card.id);
               }
-              const linkResult = autoLinkNoteToInferredConcept(ws, sessionId, result.card);
+              const linkResult = autoLinkNoteToTopic(ws, sessionId, result.card);
+              emitInspectorEvent(ws, "user_note_attributed", {
+                topic: linkResult?.conceptKey || "",
+                source: linkResult?.source || ""
+              });
               maybeSuggestConceptLink(ws, sessionId, result.card);
               maybeProposeAnalogyFromNote(ws, sessionId, result.card, linkResult?.conceptKey);
               if (updateLastEpisode({ note_saved: true })) {
@@ -4681,11 +4765,22 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
         if (result.card?.id) {
           rememberLastSavedNoteId(meta.sessionId, result.card.id);
         }
-        const linkResult = autoLinkNoteToInferredConcept(ws, meta.sessionId, result.card);
+        const isAutoNote = Boolean(meta?.autoResearch);
+        const linkResult = autoLinkNoteToTopic(ws, meta.sessionId, result.card, { isAutoNote });
+        if (isAutoNote) {
+          const autoTopicKey = getSlotConceptKey(getSessionTopicRecord(meta.sessionId).lastAuto);
+          emitInspectorEvent(ws, "auto_research_note", { topic: autoTopicKey });
+        } else {
+          emitInspectorEvent(ws, "user_note_attributed", {
+            topic: linkResult?.conceptKey || "",
+            source: linkResult?.source || ""
+          });
+        }
         maybeSuggestConceptLink(ws, meta.sessionId, result.card);
         maybeProposeAnalogyFromNote(ws, meta.sessionId, result.card, linkResult?.conceptKey);
-        if (meta?.autoResearch && turnHooks?.registerConceptSave && result.conceptKey) {
-          turnHooks.registerConceptSave(result.conceptKey, 1);
+        const conceptForRegister = linkResult?.conceptKey || result.conceptKey;
+        if (meta?.autoResearch && turnHooks?.registerConceptSave && conceptForRegister) {
+          turnHooks.registerConceptSave(conceptForRegister, 1);
         }
         if (updateLastEpisode({ note_saved: true })) {
           ws.send(JSON.stringify({ type:"learning_stats", stats: recentStats(20) }));
