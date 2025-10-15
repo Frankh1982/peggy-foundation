@@ -4,12 +4,13 @@ import path from "path";
 import http from "http";
 import express from "express";
 import { createHash } from "crypto";
+import { EventEmitter } from "events";
 import { WebSocketServer } from "ws";
 import { buildSystemPrompt } from "./prompt.js";
 import { getUserProfile, updateUserProfile, appendMessage, getRecentMessages, appendGap, closeGap } from "./memory.js";
 import { tool_web_get, tool_web_search, saveRunRecord } from "./tools.js";
 import { bucketTopic, recordSearch, recordFetch, recordEpisode, recentStats, buildQueryList, playbookFor, updateBandit, updateLastEpisode } from "./learn.js";
-import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance } from "./cards.js";
+import { ConceptCard, inferConceptKey, inferConceptMetadata, normalizeTopic, normalizeTopicKey, writeCard, updateIndex, readAllCards, getTopByTopic, touch, scoreImportance, shouldSave, isStale, reindexTopicKeys, twoSentenceFromNotes, extractFacetsFromNotes, getConcept, getLinkedNotes, getConceptSignature, scoreAnalogy, writeAnalogyCard, computeNoteFingerprint, simhashDistance, canonicalizeFacet } from "./cards.js";
 
 const PORT = process.env.PORT || 8787;
 const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || "").trim();
@@ -39,15 +40,7 @@ const MAX_AUTO_NOTES_PER_SESSION = (() => {
   return Math.max(0, Math.floor(num));
 })();
 const envAutoLearn = (process.env.AUTO_LEARN ?? "").trim();
-const AUTO_LEARN_ENABLED = (() => {
-  if (!envAutoLearn) return false;
-  const normalized = envAutoLearn.toLowerCase();
-  if (["0", "false", "off", "no"].includes(normalized)) return false;
-  if (["1", "true", "on", "yes"].includes(normalized)) return true;
-  const numeric = Number(envAutoLearn);
-  if (Number.isFinite(numeric)) return numeric > 0;
-  return false;
-})();
+const AUTO_LEARN_ENABLED = envAutoLearn === "1";
 const envMinWriteScore = (process.env.MIN_WRITE_SCORE ?? "").trim();
 const MIN_WRITE_SCORE = (() => {
   const numeric = Number(envMinWriteScore);
@@ -87,22 +80,14 @@ const ANALOGY_MIN_SCORE = (() => {
 })();
 const ANALOGY_NOTE_LIMIT = 5;
 const envAutoAnalogy = (process.env.AUTO_ANALOGY ?? "").trim();
-const AUTO_ANALOGY_ENABLED = (() => {
-  if (!envAutoAnalogy) return false;
-  const normalized = envAutoAnalogy.toLowerCase();
-  if (["0", "false", "off", "no"].includes(normalized)) return false;
-  if (["1", "true", "on", "yes"].includes(normalized)) return true;
-  const num = Number(envAutoAnalogy);
-  if (Number.isFinite(num)) return num > 0;
-  return true;
-})();
+const AUTO_ANALOGY_ENABLED = envAutoAnalogy === "1";
 const envAnalogyMinNotes = (process.env.ANALOGY_MIN_NOTES_PER_CONCEPT ?? "").trim();
 const ANALOGY_MIN_NOTES_PER_CONCEPT = (() => {
   const num = Number(envAnalogyMinNotes);
   if (Number.isFinite(num) && num > 0) {
     return Math.floor(num);
   }
-  return 2;
+  return 1;
 })();
 const envAnalogyMaxDaily = (process.env.ANALOGY_MAX_PROPOSALS_PER_DAY ?? "").trim();
 const ANALOGY_MAX_PROPOSALS_PER_DAY = (() => {
@@ -163,8 +148,11 @@ const sessionLastKdnState = new Map();
 const sessionConceptSuggestions = new Map();
 const sessionAnalogyProposals = new Map();
 const sessionTopicTracker = new Map();
+const pendingAnalogyTimers = new Map();
 
-const TOPIC_COMMAND_PREFIX_RE = /^\s*(save|link)\s+(note|concept)\b/i;
+export const inspector = new EventEmitter();
+
+const TOPIC_COMMAND_PREFIX_RE = /^(?:\s*(?:save|link|promote)\s+(?:note|concept)|\s*notes?)\b/i;
 
 function refreshNoteDemotions() {
   try {
@@ -583,6 +571,16 @@ function emitEventLog(ws, label, payload) {
   } catch {}
 }
 
+function emitInspectorEvent(ws, label, payload) {
+  if (!label) return;
+  try {
+    inspector.emit(label, payload ?? {});
+  } catch (err) {
+    console.error("inspector_emit_error", err);
+  }
+  emitEventLog(ws, label, payload);
+}
+
 function sendKdn(ws, sessionId, payload) {
   if (!ws) return;
   let normalized = payload;
@@ -672,7 +670,7 @@ function finalizeAutoResearchEvent(ws, sessionId, context) {
     return;
   }
   const topic = typeof context.topic === "string" ? context.topic : "";
-  emitEventLog(ws, "auto_research", {
+  emitInspectorEvent(ws, "auto_research", {
     trigger: context.trigger,
     searched: Boolean(context.searched),
     wrote: Boolean(context.wrote),
@@ -680,7 +678,7 @@ function finalizeAutoResearchEvent(ws, sessionId, context) {
   });
   if (context.lastError === "score_low" && context.candidate) {
     const summary = String(context.candidate.summary || "").slice(0, 200);
-    emitEventLog(ws, "auto_research_candidate", {
+    emitInspectorEvent(ws, "auto_research_candidate", {
       topic,
       url: context.candidate.url || "",
       score: context.candidate.score,
@@ -931,6 +929,8 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
   };
   setAutoResearchContext(sessionId, context);
 
+  emitInspectorEvent(ws, "auto_research", { trigger: "dk", planned: true, topic: topicKey });
+
   const query = cleanAutoResearchQuery(userText, topicKey, null);
   if (!query) {
     finalizeAutoResearchEvent(ws, sessionId, context);
@@ -1033,6 +1033,8 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
             ttl_days: AUTO_RESEARCH_CONFIG.note_ttl_days
           };
           if (title) payload.source.title = title.slice(0, 200);
+          const confidence = Math.max(0, Math.min(1, Number(noteScore) || 0));
+          payload.confidence = Math.round(confidence * 1000) / 1000;
           const noteResult = saveNoteCardFromPayload({
             payload,
             explicitness: 0,
@@ -1053,9 +1055,9 @@ async function runAutoResearchForDK({ ws, userId, sessionId }) {
               note: { topic: noteResult.card.topic, score: Number(noteResult.score ?? 0) }
             }));
             rememberLastSavedNoteId(sessionId, noteResult.card.id);
-            autoLinkNoteToInferredConcept(ws, sessionId, noteResult.card);
+            const linkResult = autoLinkNoteToInferredConcept(ws, sessionId, noteResult.card);
             maybeSuggestConceptLink(ws, sessionId, noteResult.card);
-            maybeProposeAnalogyFromNote(ws, sessionId, noteResult.card);
+            maybeProposeAnalogyFromNote(ws, sessionId, noteResult.card, linkResult?.conceptKey);
             if (updateLastEpisode({ note_saved: true })) {
               ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
             }
@@ -1552,7 +1554,7 @@ function handleConceptSuggestionResponse(ws, sessionId, content) {
     emitEventLog(ws, "concept_link", { noteId: note.id, key: suggestion.conceptKey, accepted: true });
     if (result.added) {
       registerSuggestionCooldown(sessionId, { noteId: note.id, conceptKey: suggestion.conceptKey });
-      maybeAutoProposeAnalogy(ws, sessionId, suggestion.conceptKey);
+      scheduleAnalogyProposal(ws, sessionId, suggestion.conceptKey);
     }
     updateSessionTopicLastConcept(sessionId, suggestion.conceptKey);
     return true;
@@ -1605,7 +1607,7 @@ function linkNoteToConcept(ws, sessionId, noteId, conceptKeyRaw, { via = "comman
   }
   if (result.added) {
     registerSuggestionCooldown(sessionId, { noteId: cleanId, conceptKey });
-    maybeAutoProposeAnalogy(ws, sessionId, conceptKey);
+    scheduleAnalogyProposal(ws, sessionId, conceptKey);
   }
   const title = concept.title || conceptKey;
   const reply = result.added
@@ -1656,6 +1658,8 @@ function gatherParties(signature, concept) {
 }
 
 function labelFacet(value) {
+  const canonical = canonicalizeFacet(value);
+  if (canonical) return canonical;
   return String(value || "")
     .trim()
     .replace(/[\s_]+/g, " ")
@@ -1746,6 +1750,24 @@ function resetAnalogyAutoStateIfNeeded() {
   }
 }
 
+function scheduleAnalogyProposal(ws, sessionId, conceptKey) {
+  if (!AUTO_ANALOGY_ENABLED) return;
+  const normalizedKey = normalizeConceptKey(conceptKey);
+  if (!normalizedKey) return;
+  const timerKey = `${sessionId || ""}::${normalizedKey}`;
+  if (pendingAnalogyTimers.has(timerKey)) return;
+  const timer = setTimeout(() => {
+    pendingAnalogyTimers.delete(timerKey);
+    try {
+      maybeAutoProposeAnalogy(ws, sessionId, normalizedKey);
+    } catch (err) {
+      console.error("auto_analogy_schedule_error", err);
+    }
+  }, 25);
+  if (timer && typeof timer.unref === "function") timer.unref();
+  pendingAnalogyTimers.set(timerKey, timer);
+}
+
 function dedupeCaseInsensitive(values = []) {
   const seen = new Set();
   const out = [];
@@ -1761,7 +1783,11 @@ function dedupeCaseInsensitive(values = []) {
 }
 
 function sanitizeAnalogySignature(signature = {}) {
-  const facets = dedupeCaseInsensitive(Array.isArray(signature.facets) ? signature.facets : []);
+  const rawFacets = Array.isArray(signature.facets) ? signature.facets : [];
+  const canonicalFacets = rawFacets
+    .map(value => canonicalizeFacet(value))
+    .filter(Boolean);
+  const facets = dedupeCaseInsensitive(canonicalFacets);
   const parties = dedupeCaseInsensitive(Array.isArray(signature.parties) ? signature.parties : []);
   return { facets, parties };
 }
@@ -1804,6 +1830,7 @@ function maybeAutoProposeAnalogy(ws, sessionId, conceptKey) {
   let bestScore = 0;
   let highestScore = 0;
   let hadShared = false;
+  let bestOverlap = [];
 
   for (const candidate of concepts) {
     if (!candidate || candidate.type !== "concept") continue;
@@ -1820,7 +1847,8 @@ function maybeAutoProposeAnalogy(ws, sessionId, conceptKey) {
     if (sanitizedTargetSig.facets.length < 2) continue;
 
     const sharedFacets = sanitizedTargetSig.facets.filter(facet => sanitizedSourceSig.facets.includes(facet));
-    if (sharedFacets.length < 2) continue;
+    const overlap = Array.from(new Set(sharedFacets.map(value => canonicalizeFacet(value)).filter(Boolean)));
+    if (overlap.length < 2) continue;
 
     hadShared = true;
     const score = scoreAnalogy(sanitizedSourceSig, sanitizedTargetSig);
@@ -1828,10 +1856,11 @@ function maybeAutoProposeAnalogy(ws, sessionId, conceptKey) {
 
     if (score > highestScore) {
       highestScore = score;
+      bestOverlap = overlap.slice(0, 3);
     }
 
     if (score >= ANALOGY_MIN_SCORE && (!best || score > bestScore)) {
-      best = { concept: candidate, targetSig: sanitizedTargetSig, sharedFacets };
+      best = { concept: candidate, targetSig: sanitizedTargetSig, sharedFacets: overlap };
       bestScore = score;
     }
   }
@@ -1839,9 +1868,9 @@ function maybeAutoProposeAnalogy(ws, sessionId, conceptKey) {
   if (!best) {
     if (hadShared) {
       const scoreLabel = Number(highestScore.toFixed(3));
-      emitEventLog(ws, "analogy_proposal", { from: normalizedKey, to: null, score: scoreLabel, reason: "below_threshold" });
+      emitInspectorEvent(ws, "analogy_proposal", { from: normalizedKey, to: null, score: scoreLabel, reason: "below_threshold", overlap: bestOverlap.map(labelFacet) });
     } else {
-      emitEventLog(ws, "analogy_proposal", { from: normalizedKey, to: null, score: 0, reason: "no_candidates" });
+      emitInspectorEvent(ws, "analogy_proposal", { from: normalizedKey, to: null, score: 0, reason: "no_candidates", overlap: [] });
     }
     return false;
   }
@@ -1861,11 +1890,12 @@ function maybeAutoProposeAnalogy(ws, sessionId, conceptKey) {
   const message = formatAnalogyProposalMessage(suggestion);
   appendMessage(sessionId, { role: "assistant", content: message });
   ws.send(JSON.stringify({ type: "assistant_message", content: message }));
-  emitEventLog(ws, "analogy_proposal", {
+  emitInspectorEvent(ws, "analogy_proposal", {
     from: suggestion.from,
     to: suggestion.to,
     score: Number(bestScore.toFixed(3)),
-    reason: "ok"
+    reason: "ok",
+    overlap: suggestion.sharedFacets.map(labelFacet)
   });
 
   ANALOGY_AUTO_STATE.total += 1;
@@ -1873,17 +1903,22 @@ function maybeAutoProposeAnalogy(ws, sessionId, conceptKey) {
   return true;
 }
 
-function maybeProposeAnalogyFromNote(ws, sessionId, noteCard) {
+function maybeProposeAnalogyFromNote(ws, sessionId, noteCard, conceptHint = null) {
   if (!AUTO_ANALOGY_ENABLED) return;
   if (!noteCard || !noteCard.id) return;
+  const targets = new Set();
+  if (conceptHint) {
+    const normalizedHint = normalizeConceptKey(conceptHint);
+    if (normalizedHint) targets.add(normalizedHint);
+  }
   const conceptKeys = getNoteConceptKeys(noteCard.id);
-  if (!conceptKeys.length) return;
-  const seen = new Set();
   for (const key of conceptKeys) {
     const normalizedKey = normalizeConceptKey(key);
-    if (!normalizedKey || seen.has(normalizedKey)) continue;
-    seen.add(normalizedKey);
-    maybeAutoProposeAnalogy(ws, sessionId, normalizedKey);
+    if (!normalizedKey) continue;
+    targets.add(normalizedKey);
+  }
+  for (const key of targets) {
+    scheduleAnalogyProposal(ws, sessionId, key);
   }
 }
 
@@ -1897,7 +1932,7 @@ function handleAnalogyCommand(ws, sessionId, content) {
     const reply = "no structural analogy proposed.";
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-    emitEventLog(ws, "analogy_proposal", { from: conceptKeyRaw || "", to: null, score: 0, reason: "no_candidates" });
+    emitInspectorEvent(ws, "analogy_proposal", { from: conceptKeyRaw || "", to: null, score: 0, reason: "no_candidates", overlap: [] });
     sessionAnalogyProposals.delete(sessionId);
     return true;
   }
@@ -1906,28 +1941,35 @@ function handleAnalogyCommand(ws, sessionId, content) {
     const reply = "no structural analogy proposed.";
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-    emitEventLog(ws, "analogy_proposal", { from: normalizedKey, to: null, score: 0, reason: "no_candidates" });
+    emitInspectorEvent(ws, "analogy_proposal", { from: normalizedKey, to: null, score: 0, reason: "no_candidates", overlap: [] });
     sessionAnalogyProposals.delete(sessionId);
     return true;
   }
-  const sourceSig = extractFacetsFromNotes(sourceNotes);
+  const sourceSig = sanitizeAnalogySignature(extractFacetsFromNotes(sourceNotes));
   const concepts = getConceptCards();
   let best = null;
   let bestScore = 0;
   let hadShared = false;
+  let bestOverlap = [];
+  let peakScore = 0;
   for (const candidate of concepts) {
     if (!candidate || candidate.type !== "concept") continue;
     const candidateKey = normalizeConceptKey(candidate.key);
     if (!candidateKey || candidateKey === normalizedKey) continue;
     const targetNotes = getLinkedNotes(candidateKey, { limit: ANALOGY_NOTE_LIMIT });
     if (!targetNotes.length) continue;
-    const targetSig = extractFacetsFromNotes(targetNotes);
+    const targetSig = sanitizeAnalogySignature(extractFacetsFromNotes(targetNotes));
     const sharedFacets = targetSig.facets.filter(facet => sourceSig.facets.includes(facet));
-    if (sharedFacets.length < 2) continue;
+    const overlap = Array.from(new Set(sharedFacets.map(value => canonicalizeFacet(value)).filter(Boolean)));
+    if (overlap.length < 2) continue;
     hadShared = true;
     const score = scoreAnalogy(sourceSig, targetSig);
+    if (score > peakScore) {
+      peakScore = score;
+      bestOverlap = overlap.slice(0, 3);
+    }
     if (score >= ANALOGY_MIN_SCORE && (!best || score > bestScore)) {
-      best = { concept: candidate, sharedFacets, targetSig };
+      best = { concept: candidate, sharedFacets: overlap, targetSig };
       bestScore = score;
     }
   }
@@ -1936,7 +1978,8 @@ function handleAnalogyCommand(ws, sessionId, content) {
     const reply = "no structural analogy proposed.";
     appendMessage(sessionId, { role: "assistant", content: reply });
     ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
-    emitEventLog(ws, "analogy_proposal", { from: normalizedKey, to: null, score: 0, reason });
+    const overlap = reason === "below_threshold" ? bestOverlap.map(labelFacet) : [];
+    emitInspectorEvent(ws, "analogy_proposal", { from: normalizedKey, to: null, score: Number(peakScore.toFixed(3)), reason, overlap });
     sessionAnalogyProposals.delete(sessionId);
     return true;
   }
@@ -1953,7 +1996,7 @@ function handleAnalogyCommand(ws, sessionId, content) {
   const message = formatAnalogyProposalMessage(suggestion);
   appendMessage(sessionId, { role: "assistant", content: message });
   ws.send(JSON.stringify({ type: "assistant_message", content: message }));
-  emitEventLog(ws, "analogy_proposal", { from: suggestion.from, to: suggestion.to, score: Number(bestScore.toFixed(3)), reason: "ok" });
+  emitInspectorEvent(ws, "analogy_proposal", { from: suggestion.from, to: suggestion.to, score: Number(bestScore.toFixed(3)), reason: "ok", overlap: suggestion.sharedFacets.map(labelFacet) });
   return true;
 }
 
@@ -3099,6 +3142,12 @@ function saveNoteCardFromPayload({ payload, explicitness, userId, sessionId, run
     ttl_days: ttlDays
   };
 
+  const payloadConfidence = Number(payload.confidence);
+  if (Number.isFinite(payloadConfidence)) {
+    const bounded = Math.max(0, Math.min(1, payloadConfidence));
+    card.confidence = bounded;
+  }
+
   const fingerprint = computeNoteFingerprint(card);
   if (fingerprint?.simhash) {
     card.value.metadata.simhash = fingerprint.simhash;
@@ -3516,9 +3565,9 @@ wss.on("connection", (ws, req) => {
               if (noteId) {
                 rememberLastSavedNoteId(sessionId, noteId);
               }
-              autoLinkNoteToInferredConcept(ws, sessionId, result.card);
+              const linkResult = autoLinkNoteToInferredConcept(ws, sessionId, result.card);
               maybeSuggestConceptLink(ws, sessionId, result.card);
-              maybeProposeAnalogyFromNote(ws, sessionId, result.card);
+              maybeProposeAnalogyFromNote(ws, sessionId, result.card, linkResult?.conceptKey);
               if (updateLastEpisode({ note_saved: true })) {
                 ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
               }
@@ -3555,9 +3604,9 @@ wss.on("connection", (ws, req) => {
               if (result.card?.id) {
                 rememberLastSavedNoteId(sessionId, result.card.id);
               }
-              autoLinkNoteToInferredConcept(ws, sessionId, result.card);
+              const linkResult = autoLinkNoteToInferredConcept(ws, sessionId, result.card);
               maybeSuggestConceptLink(ws, sessionId, result.card);
-              maybeProposeAnalogyFromNote(ws, sessionId, result.card);
+              maybeProposeAnalogyFromNote(ws, sessionId, result.card, linkResult?.conceptKey);
               if (updateLastEpisode({ note_saved: true })) {
                 ws.send(JSON.stringify({ type: "learning_stats", stats: recentStats(20) }));
               }
@@ -4587,10 +4636,17 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
 
   const trimmedAssistant = cleanText ? cleanText.trim() : "";
   if (!origin && !meta?.autoResearch && trimmedAssistant && isDKMarkerReply(trimmedAssistant)) {
-    try {
-      await runAutoResearchForDK({ ws, userId, sessionId });
-    } catch (err) {
-      console.error("auto_research_dk_invoke_error", err);
+    if (AUTO_LEARN_ENABLED) {
+      const searchBudget = getSearchBudget(sessionId);
+      const remaining = searchBudget ? searchBudget.turn() : 0;
+      if (remaining > 0 && getAutoResearchSearchCount(sessionId) < MAX_AUTO_SEARCHES_PER_TURN) {
+        const timer = setTimeout(() => {
+          runAutoResearchForDK({ ws, userId, sessionId }).catch(err => {
+            console.error("auto_research_dk_invoke_error", err);
+          });
+        }, 0);
+        if (timer && typeof timer.unref === "function") timer.unref();
+      }
     }
   }
 
@@ -4625,9 +4681,9 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
         if (result.card?.id) {
           rememberLastSavedNoteId(meta.sessionId, result.card.id);
         }
-        autoLinkNoteToInferredConcept(ws, meta.sessionId, result.card);
+        const linkResult = autoLinkNoteToInferredConcept(ws, meta.sessionId, result.card);
         maybeSuggestConceptLink(ws, meta.sessionId, result.card);
-        maybeProposeAnalogyFromNote(ws, meta.sessionId, result.card);
+        maybeProposeAnalogyFromNote(ws, meta.sessionId, result.card, linkResult?.conceptKey);
         if (meta?.autoResearch && turnHooks?.registerConceptSave && result.conceptKey) {
           turnHooks.registerConceptSave(result.conceptKey, 1);
         }
