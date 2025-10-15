@@ -1,55 +1,53 @@
-import { NEWS_TOPICS, RECIPE_LIBRARY, formatDate, matchByAlias } from "./contract_data.js";
+import { NEWS_TOPICS, formatDate, matchByAlias } from "./contract_data.js";
 import { getCardsByTopic, formatTopicTitle } from "./autocard.js";
 
-const ACTION_WORDS = /\b(announced|plans|threatens|files|launches)\b/i;
-const LATEST_WORDS = /\b(latest|today|this\s*week)\b/i;
-const TRIGGER_TERMS = /(tariff|ban|recall|acquisition|files|threatens|plans)/i;
-const NOTES_CMD_RE = /^notes(\b|\s)/i;
-const RECIPE_WORDS = /(recipe|bake|how\s+to\s+cook)/i;
+const SMALLTALK_RE = /^(hi|hello|hey|thanks|thank you)\b|what'?s your name|who are you|^my name is\b|^my (favorite|favourite)\b/i;
+const ACTION_RE = /\b(announced|files|threatens|plans|recalls?|acquires?|ban|tariff|tariffs)\b/i;
+const ENTITY_RE = /\b(US|U\.S\.|United States|China|India|Tesla|BYD|OpenAI|AMD|Microsoft|Google|Apple|NVIDIA|Broadcom)\b/;
 
-function detectProperNounAction(text) {
-  if (!text) return false;
-  const actionMatch = ACTION_WORDS.test(text);
-  if (!actionMatch) return false;
-  const properNoun = /\b([A-Z][a-z]+\s+[A-Z][a-z]+|[A-Z]{2,})\b/.test(text);
-  return properNoun;
+export function classifyIntent(text) {
+  const t = (text || "").trim();
+  if (!t || t === "." || t.length < 2) {
+    return { intent: "generic", requiresBrowse: false, reason: "short" };
+  }
+  if (SMALLTALK_RE.test(t)) {
+    return { intent: "smalltalk", requiresBrowse: false, reason: "smalltalk" };
+  }
+
+  const hasRecency = /\b(latest|today|this week|update|what happened|news)\b/i.test(t);
+  if (hasRecency || /\b(find (more )?sites|sources?)\b/i.test(t)) {
+    return { intent: "news_latest", requiresBrowse: true, reason: "recency/sites" };
+  }
+
+  if (/^(notes|save note)\b/i.test(t)) {
+    return { intent: "notes_cmd", requiresBrowse: false, reason: "notes" };
+  }
+
+  const requiresBrowse = ACTION_RE.test(t) && ENTITY_RE.test(t);
+  return { intent: "generic", requiresBrowse, reason: requiresBrowse ? "action+entity" : "default" };
 }
 
 export function routeContractIntent(text) {
-  const raw = String(text || "");
-  const lower = raw.toLowerCase();
-  if (NOTES_CMD_RE.test(raw)) {
-    return { intent: "notes_cmd", requiresBrowse: false };
-  }
-  if (RECIPE_WORDS.test(lower)) {
-    return { intent: "how_to_recipe", requiresBrowse: false };
-  }
-  if (LATEST_WORDS.test(lower) || TRIGGER_TERMS.test(lower)) {
-    return { intent: "news_latest", requiresBrowse: true };
-  }
-  if (detectProperNounAction(raw)) {
-    return { intent: "news_latest", requiresBrowse: true };
-  }
-  return { intent: "generic", requiresBrowse: false };
+  return classifyIntent(text);
 }
 
 function buildNewsResponse(entry, now = new Date()) {
   if (!entry) return null;
   const today = formatDate(now);
   const sources = entry.sources.slice(0, 5);
-  if (sources.length < 2) return null;
-  const updates = entry.updates.slice(0, 3);
-  const updatesLine = updates.map(update => `• ${update.text}`).join(" ");
-  const watchLine = `• ${entry.watch}`;
-  const sourceRefs = sources.map((source, idx) => `[${idx + 1}] ${source.title} — ${source.date} (${source.url})`);
-  const sourceLine = `Sources: ${sources.map((_s, idx) => `[${idx + 1}]`).join(" ")}`;
-  const reply = [
-    `As of ${today}, ${entry.summary}`,
-    `Last 72h: ${updatesLine}`,
-    `What’s next: ${watchLine}`,
-    sourceLine,
-    ...sourceRefs
-  ].join("\n");
+  if (sources.length < 1) return null;
+  const summary = entry.summary.endsWith(".") ? entry.summary : `${entry.summary}.`;
+  const sentences = summary.split(/(?<=\.)\s+/).filter(Boolean);
+  const trimmedSummary = sentences.slice(0, 2).join(" ");
+  const watchLine = `What’s next: • ${entry.watch}`;
+  const sourceRefs = sources.map((_source, idx) => `[${idx + 1}]`).join(" ");
+  const detailed = sources.map((source, idx) => `[${idx + 1}] ${source.title} — ${source.date} (${source.url})`);
+  const sourceLine = sources.length === 1 ? "Sources: best single source [1]" : `Sources: ${sourceRefs}`;
+  const replyParts = [`As of ${today}: ${trimmedSummary}`];
+  replyParts.push(watchLine);
+  replyParts.push(sourceLine);
+  replyParts.push(...detailed);
+  const reply = replyParts.join("\n");
   const facts = entry.facts.map(fact => ({
     ...fact,
     topic_key: entry.topic_key,
@@ -67,39 +65,12 @@ function buildNewsResponse(entry, now = new Date()) {
   };
 }
 
-function buildRecipeResponse(entry) {
-  if (!entry) return null;
-  const sections = [];
-  sections.push("Ingredients:\n" + entry.ingredients.map(item => `- ${item}`).join("\n"));
-  sections.push("Steps:\n" + entry.steps.map((step, idx) => `${idx + 1}. ${step}`).join("\n"));
-  sections.push("Variants:\n" + entry.variants.map(variant => `- ${variant}`).join("\n"));
-  const reply = sections.join("\n\n");
-  const fact = {
-    topic_key: entry.topic_key,
-    claim: entry.fact.claim,
-    evidence: entry.fact.evidence,
-    tags: entry.fact.tags,
-    facets: entry.fact.facets,
-    confidence: entry.fact.confidence,
-    from_user_text: true,
-    ttl_days: null
-  };
-  return {
-    reply,
-    sources: [],
-    facts: [fact],
-    hasDate: false,
-    citationsOk: false,
-    sectionsOk: true,
-    topicKey: entry.topic_key
-  };
-}
-
 function buildGenericResponse(text) {
   const cleaned = String(text || "").trim();
   const reply = cleaned
-    ? `Thanks for the context. I heard you mention "${cleaned}"—let me know where you’d like to go next.`
-    : "Let me know how I can help.";
+    ? `Thanks for sharing that. I can dig into "${cleaned}" with you and outline what’s happening if you’d like.`
+      + " Let me know if you want the latest update, background, or notes."
+    : "I’m ready when you are. Tell me what topic or question you want to explore.";
   return {
     reply,
     sources: [],
@@ -109,6 +80,32 @@ function buildGenericResponse(text) {
     sectionsOk: true,
     topicKey: ""
   };
+}
+
+function buildSmalltalkResponse(text) {
+  const raw = String(text || "").trim();
+  const lower = raw.toLowerCase();
+  if (!raw) {
+    return "Hi there! What’s on your mind today?";
+  }
+  const nameMatch = raw.match(/^my name is\s+([A-Za-z][\w\-']*)/i);
+  if (nameMatch) {
+    return `Nice to meet you, ${nameMatch[1]}! What should we chat about?`;
+  }
+  const favMatch = raw.match(/^my (favorite|favourite)\s+(.+)/i);
+  if (favMatch) {
+    return `Good to know your ${favMatch[1]} ${favMatch[2].trim()}. Want to dig into it?`;
+  }
+  if (/thanks|thank you/i.test(lower)) {
+    return "You’re welcome! Happy to help.";
+  }
+  if (/^(hi|hello|hey)\b/i.test(lower)) {
+    return "Hi! How can I help today?";
+  }
+  if (/who are you|what'?s your name/i.test(lower)) {
+    return "I’m Peggy, your research buddy. What would you like to know?";
+  }
+  return "Hi there! What should we tackle?";
 }
 
 function parseNotesTopic(text) {
@@ -142,7 +139,8 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
         citationsOk: false,
         sectionsOk: true,
         topicKey: "",
-        searchLogs: []
+        searchLogs: [],
+        routerReason: route.reason || "notes"
       };
     }
     const cards = getCardsByTopic(topicKey);
@@ -159,7 +157,8 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
         citationsOk: false,
         sectionsOk: true,
         topicKey,
-        searchLogs: []
+        searchLogs: [],
+        routerReason: route.reason || "notes"
       };
     }
     const lines = cards.slice(0, 5).map((card, idx) => {
@@ -177,26 +176,26 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
       citationsOk: false,
       sectionsOk: true,
       topicKey,
-      searchLogs: []
+      searchLogs: [],
+      routerReason: route.reason || "notes"
     };
   }
 
-  if (route.intent === "how_to_recipe") {
-    const match = matchByAlias(RECIPE_LIBRARY, text);
-    if (!match) return { handled: false };
-    const response = buildRecipeResponse(match);
+  if (route.intent === "smalltalk") {
+    const reply = buildSmalltalkResponse(text);
     return {
       handled: true,
       intent: route.intent,
-      requiresBrowse: route.requiresBrowse,
-      reply: response.reply,
-      sources: response.sources,
-      facts: response.facts,
-      hasDate: response.hasDate,
-      citationsOk: response.citationsOk,
-      sectionsOk: response.sectionsOk,
-      topicKey: response.topicKey,
-      searchLogs: []
+      requiresBrowse: false,
+      reply,
+      sources: [],
+      facts: [],
+      hasDate: false,
+      citationsOk: false,
+      sectionsOk: true,
+      topicKey: "",
+      searchLogs: [],
+      routerReason: route.reason || "smalltalk"
     };
   }
 
@@ -208,7 +207,7 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
     return {
       handled: true,
       intent: route.intent,
-      requiresBrowse: true,
+      requiresBrowse: Boolean(route.requiresBrowse),
       reply: response.reply,
       sources: response.sources,
       facts: response.facts,
@@ -216,7 +215,8 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
       citationsOk: response.citationsOk,
       sectionsOk: response.sectionsOk,
       topicKey: response.topicKey,
-      searchLogs: [{ q: match.searchQuery, hits: match.sources.length }]
+      searchLogs: [{ q: match.searchQuery, hits: match.sources.length }],
+      routerReason: route.reason || "news"
     };
   }
 
@@ -235,7 +235,8 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
         citationsOk: response.citationsOk,
         sectionsOk: response.sectionsOk,
         topicKey: response.topicKey,
-        searchLogs: []
+        searchLogs: [],
+        routerReason: route.reason || "default"
       };
     }
     return { handled: false };

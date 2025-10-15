@@ -4485,7 +4485,8 @@ wss.on("connection", (ws, req) => {
             });
             emitInspectorEvent(ws, "router.intent", {
               intent: contractResult.intent,
-              requires_browse: Boolean(contractResult.requiresBrowse)
+              requires_browse: Boolean(contractResult.requiresBrowse),
+              reason: contractResult.routerReason || ""
             });
             emitInspectorEvent(ws, "compose.qa", {
               has_date: Boolean(contractResult.hasDate),
