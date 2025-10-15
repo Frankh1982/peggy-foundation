@@ -479,6 +479,10 @@ export function normalizeTopicKey(text, kind = "news") {
   return `${topicKind}:${tokens.join("/")}`;
 }
 
+export function normalizeConceptKey(key) {
+  return String(key || "").trim().toLowerCase();
+}
+
 function ensureStorage() {
   fs.mkdirSync(cardsDir, { recursive: true });
   fs.mkdirSync(indexDir, { recursive: true });
