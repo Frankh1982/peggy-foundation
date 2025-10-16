@@ -96,6 +96,7 @@ const OFFICIAL_PR_DOMAINS = parseHostList(process.env.OFFICIAL_PR_DOMAINS || pro
 const PRIORITIZE_OFFICIAL_PR = parseHostList(process.env.PRIORITIZE_OFFICIAL_PR || "");
 const FOLLOWUP_KEYWORD_REGEX = /^(?:find\s+more(?:\s+(?:sites?|sources?|links?|stories))?|more(?:\s+(?:sites?|sources?|links?|stories))?|more)$/i;
 const FIND_MORE_SITES_RE = /\bfind (more )?sites\b/i;
+const FINANCE_ACTION_RE = /(?:\b(?:guide|guidance|outlook|forecast|results|earnings|revenue|update|announced|files|launches|plans|recalls?|acquires?|ban|tariff|tariffs|threatens)\b|\bQ[1-4]\b|\bFY\d{2}\b)/i;
 const FOLLOWUP_BANNED_HOSTS = ["apps.apple.com", "play.google.com", "support.google.com", "help.apple.com"];
 const ETLD_EXCEPTIONS = new Set([
   "co.uk",
@@ -606,6 +607,19 @@ function _norm(s) {
   return (s || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function canonicalTopicKey(k) {
+  if (!k) return "notes/inbox";
+  let t = String(k)
+    .trim()
+    .replace(/[:]+/g, "/")
+    .replace(/\/+/g, "/");
+  t = t.replace(/^notes\//i, "notes/");
+  t = t.replace(/^notes:$/i, "notes");
+  t = t.replace(/^notes:\//i, "notes/");
+  t = t.replace(/^notes:notes\//i, "notes/");
+  return t || "notes/inbox";
+}
+
 function headlineOneLiner(cites = []) {
   if (!Array.isArray(cites) || !cites.length) {
     return "No major developments found.";
@@ -647,6 +661,24 @@ function watchItem(cites = []) {
   return "";
 }
 
+function buildNewsAnswer(stamp, cites = []) {
+  const citeList = Array.isArray(cites) ? cites.slice(0, 5) : [];
+  const refs = citeList.length ? citeList.map((_, i) => `[${i + 1}]`).join(" ") : "(none)";
+  const head = headlineOneLiner(cites);
+  let next = watchItem(cites);
+  if (next && _norm(next) === _norm(head)) next = null;
+  const detailLines = citeList.map((cite, idx) => {
+    const title = cleanNewsText(cite?.title || cite?.url || cite?.domain || "");
+    const url = cite?.url || "(no url)";
+    return `[${idx + 1}] ${title || "(no title)"} — ${url}`;
+  });
+  const parts = [`As of ${stamp}: ${head}`];
+  if (next) parts.push(`What’s next: • ${next}`);
+  parts.push(`Sources: ${refs}`);
+  parts.push(...detailLines);
+  return parts.filter(Boolean).join("\n");
+}
+
 function hostLabelFromCite(cite) {
   if (!cite) return "";
   if (cite.domain) return cite.domain;
@@ -678,16 +710,16 @@ function maybeHandleNotes(text) {
   const t = (text || "").trim();
   let m;
   if ((m = t.match(RX_SAVE_NOTE_COLON))) {
-    return { kind: "save_free", key: "notes/inbox", body: m[1].trim() };
+    return { kind: "save_free", key: canonicalTopicKey("notes/inbox"), body: m[1].trim() };
   }
   if ((m = t.match(RX_NOTES_ADD))) {
-    return { kind: "save_keyed", key: m[1].trim(), body: m[2].trim() };
+    return { kind: "save_keyed", key: canonicalTopicKey(m[1].trim()), body: m[2].trim() };
   }
   if ((m = t.match(RX_NOTES_EXPORT))) {
-    return { kind: "export", key: m[1].trim() };
+    return { kind: "export", key: canonicalTopicKey(m[1].trim()) };
   }
   if ((m = t.match(RX_NOTES_LIST))) {
-    return { kind: "list", key: m[1].trim() };
+    return { kind: "list", key: canonicalTopicKey(m[1].trim()) };
   }
   return null;
 }
@@ -714,7 +746,8 @@ function mergeTopicVariants(target, value) {
 }
 
 function collectUserNotesByTopic(topicKey) {
-  const targetVariants = topicVariantSet(topicKey);
+  const targetKey = canonicalTopicKey(topicKey);
+  const targetVariants = topicVariantSet(targetKey);
   if (!targetVariants.size) return [];
   const all = readAllCards();
   const matches = [];
@@ -768,7 +801,7 @@ function limitSummaryLength(text, max = 200) {
 }
 
 function renderNotesList(topicKey) {
-  const key = String(topicKey || "").trim();
+  const key = canonicalTopicKey(topicKey);
   if (!key) return "No notes yet.";
   const notes = collectUserNotesByTopic(key);
   if (!notes.length) {
@@ -790,7 +823,7 @@ function renderNotesList(topicKey) {
 }
 
 function renderNotesExport(topicKey) {
-  const key = String(topicKey || "").trim();
+  const key = canonicalTopicKey(topicKey);
   if (!key) return "No notes yet.";
   const notes = collectUserNotesByTopic(key);
   if (!notes.length) {
@@ -810,11 +843,11 @@ function renderNotesExport(topicKey) {
 }
 
 function upsertUserNoteCard({ topicKey, claim }) {
-  const topic = String(topicKey || "").trim();
+  const canonical = canonicalTopicKey(topicKey);
+  const topic = String(canonical || "").trim();
   const summary = String(claim || "").replace(/\s+/g, " ").trim();
   if (!topic || !summary) return null;
   const now = Date.now();
-  const normalizedKey = normalizeTopicKey(topic, "notes") || normalizeTopicKey(topic, "news") || topic;
   const card = {
     type: "note",
     topic,
@@ -826,7 +859,7 @@ function upsertUserNoteCard({ topicKey, claim }) {
         saved_by: "user",
         reason: "chat_note",
         saved_at: now,
-        topic_key: normalizedKey
+        topic_key: canonical
       }
     },
     tags: ["user", "note"],
@@ -4896,19 +4929,17 @@ wss.on("connection", (ws, req) => {
           const noteCommand = maybeHandleNotes(trimmedContent);
           if (noteCommand) {
             if (noteCommand.kind === "save_free" || noteCommand.kind === "save_keyed") {
-              const topicKey = noteCommand.key;
+              const topicKey = canonicalTopicKey(noteCommand.key);
               const claim = noteCommand.body.slice(0, 400);
               const saved = upsertUserNoteCard({ topicKey, claim });
               if (saved) {
-                const normalizedKey = normalizeTopicKey(topicKey, "notes")
-                  || normalizeTopicKey(topicKey, "news")
-                  || topicKey;
+                const inspectorKey = topicKey;
                 emitInspectorEvent(ws, "card_upsert", {
-                  topicKey: normalizedKey,
+                  topicKey: inspectorKey,
                   noteId: saved.id,
                   sources: ["user://chat"]
                 });
-                emitInspectorEvent(ws, "cards.saved", { count: 1, keys: [normalizedKey] });
+                emitInspectorEvent(ws, "cards.saved", { count: 1, keys: [topicKey] });
                 send(`Saved to ${topicKey}.`);
               } else {
                 send("Couldn't save that note.");
@@ -5705,8 +5736,31 @@ async function executeTool(ws, meta, call_id="auto") {
       };
 
       const isFindMoreSites = Boolean(meta?.findMoreSites);
+      const financeContextText = [meta?.requestText, meta?.spec?.args?.q]
+        .filter(value => typeof value === "string" && value.trim())
+        .join(" ");
+      const financeActionMatch = FINANCE_ACTION_RE.test(financeContextText);
+      const applyFinanceHosts = meta.intent === "news_latest" || financeActionMatch;
+      if (applyFinanceHosts) {
+        prioritizeHosts([
+          "investor.nvidia.com",
+          "ir.amd.com",
+          "reuters.com",
+          "apnews.com",
+          "bloomberg.com",
+          "wsj.com",
+          "ft.com",
+          "sec.gov"
+        ]);
+        downrankHosts([
+          "resources.nvidia.com",
+          "apps.apple.com",
+          "play.google.com",
+          "support.google.com",
+          "help.apple.com"
+        ]);
+      }
       if (meta.intent === "news_latest" || isFindMoreSites) {
-        downrankHosts(["apps.apple.com", "play.google.com", "support.google.com", "help.apple.com"]);
         allowlistHosts(Array.from(NEWS_ALLOWLIST));
         prioritizeHosts(Array.from(PRIORITIZE_OFFICIAL_PR));
       }
@@ -6041,7 +6095,7 @@ async function executeTool(ws, meta, call_id="auto") {
             body: safeBody
           });
         }
-        const citeCount = citeEntries.filter(c => c.url).length;
+        const citeCount = Array.isArray(citeEntries) ? citeEntries.length : 0;
         const sendAssistant = (text) => {
           appendMessage(meta.sessionId, { role: "assistant", content: text });
           ws.send(JSON.stringify({ type: "assistant_message", content: text }));
@@ -6071,42 +6125,15 @@ async function executeTool(ws, meta, call_id="auto") {
             sendAssistant(payload);
             handedToModel = true;
           } else {
-            const tzCandidates = [meta?.userTimezone, meta?.timezone, meta?.user_tz];
-            const preferredTz = tzCandidates.find(value => typeof value === "string" && value.trim())?.trim() || "America/New_York";
-            let todayStamp = todayISO(preferredTz);
-            const buildAnswerBlock = (stamp) => {
-              const refs = citeEntries.length
-                ? citeEntries.slice(0, 5).map((_, i) => `[${i + 1}]`).join(" ")
-                : "(none)";
-              const head = headlineOneLiner(citeEntries);
-              let nextLine = watchItem(citeEntries);
-              if (nextLine && _norm(nextLine) === _norm(head)) {
-                nextLine = "";
-              }
-              const parts = [`As of ${stamp}: ${head}`];
-              if (nextLine) parts.push(`What’s next: • ${nextLine}`);
-              parts.push(`Sources: ${refs}`);
-              return parts.filter(Boolean).join("\n");
-            };
-            let answerBlock = buildAnswerBlock(todayStamp);
-            const nyToday = todayISO("America/New_York");
-            if (todayStamp > nyToday) {
-              todayStamp = nyToday;
-              answerBlock = buildAnswerBlock(todayStamp);
-            }
-            const detailLines = citeEntries.map(c => {
-              const title = cleanNewsText(c.title || c.url || c.domain);
-              return `[${c.index}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
-            });
-            const composed = [answerBlock, ...detailLines].filter(Boolean).join("\n");
-            const hasDate = /\d{4}-\d{2}-\d{2}/.test(answerBlock);
-            const badBoiler = /privacy policy|recaptcha|cookies|terms of service/i.test(answerBlock);
-            const ok = hasDate && citeCount >= 2 && !badBoiler;
-            emitInspectorEvent(ws, "compose.qa", { has_date: hasDate, citations: citeCount, sections_ok: !badBoiler });
-            if (ok) {
-              sendAssistant(composed);
-            } else {
+            const todayStamp = todayISO("America/New_York");
+            const answer = buildNewsAnswer(todayStamp, citeEntries);
+            const hasDate = /\d{4}-\d{2}-\d{2}/.test(answer);
+            const ok = hasDate && citeCount >= 2;
+            emitInspectorEvent(ws, "compose.qa", { has_date: hasDate, citations: citeCount, sections_ok: true });
+            if (!ok) {
               sendAssistant(fallbackFromLastReliable(citeEntries));
+            } else {
+              sendAssistant(answer);
             }
             handedToModel = true;
           }
