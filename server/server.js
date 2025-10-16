@@ -131,9 +131,9 @@ const DROP_PATTERNS = [
   /consent/i,
   /recaptcha/i,
   /terms of service/i,
-  /sign up/i,
-  /subscribe/i,
-  /advertisement/i
+  /advertisement/i,
+  /^for more information about how we use your data/i,
+  /(subscribe|sign in|sign up|membership required)/i
 ];
 const AUTO_RESEARCH_CONFIG = {
   max_searches_per_turn: MAX_AUTO_SEARCHES_PER_TURN,
@@ -531,6 +531,17 @@ function resolveTopicKey(userText, state) {
   return { topicKey: key, advanceOffset: false };
 }
 
+function resolveTopicKeyFromQuery(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  const normalized = normalizeTopicKey(raw, "news");
+  if (normalized) return normalized;
+  const bucketed = bucketTopic(raw);
+  const bucketedKey = normalizeTopicKey(bucketed, "news");
+  if (bucketedKey) return bucketedKey;
+  return "";
+}
+
 function todayISO(tz = "America/New_York") {
   try {
     const now = new Date();
@@ -589,6 +600,10 @@ function ensureSentence(text) {
   if (!clean) return "";
   const hasTerminal = /[.!?]$/.test(clean);
   return hasTerminal ? clean : `${clean}.`;
+}
+
+function _norm(s) {
+  return (s || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 function headlineOneLiner(cites = []) {
@@ -653,6 +668,179 @@ function fallbackFromLastReliable(cites = []) {
 export const inspector = new EventEmitter();
 
 const TOPIC_COMMAND_PREFIX_RE = /^(?:\s*(?:save|link|promote)\s+(?:note|concept)|\s*notes?)\b/i;
+
+const RX_SAVE_NOTE_COLON = /^save\s+note\s*:\s*(.+)$/i;
+const RX_NOTES_ADD = /^notes\s+([^\s]+)\s+add\s+(.+)$/i;
+const RX_NOTES_EXPORT = /^notes\s+([^\s]+)\s+export$/i;
+const RX_NOTES_LIST = /^notes\s+([^\s]+)\s*$/i;
+
+function maybeHandleNotes(text) {
+  const t = (text || "").trim();
+  let m;
+  if ((m = t.match(RX_SAVE_NOTE_COLON))) {
+    return { kind: "save_free", key: "notes/inbox", body: m[1].trim() };
+  }
+  if ((m = t.match(RX_NOTES_ADD))) {
+    return { kind: "save_keyed", key: m[1].trim(), body: m[2].trim() };
+  }
+  if ((m = t.match(RX_NOTES_EXPORT))) {
+    return { kind: "export", key: m[1].trim() };
+  }
+  if ((m = t.match(RX_NOTES_LIST))) {
+    return { kind: "list", key: m[1].trim() };
+  }
+  return null;
+}
+
+function topicVariantSet(value) {
+  const raw = String(value || "").trim();
+  const variants = new Set();
+  if (!raw) return variants;
+  variants.add(raw.toLowerCase());
+  const normalizedNews = normalizeTopicKey(raw, "news");
+  if (normalizedNews) variants.add(normalizedNews.toLowerCase());
+  const normalizedNotes = normalizeTopicKey(raw, "notes");
+  if (normalizedNotes) variants.add(normalizedNotes.toLowerCase());
+  const normalizedTopic = normalizeTopic(raw);
+  if (normalizedTopic) variants.add(normalizedTopic.toLowerCase());
+  return variants;
+}
+
+function mergeTopicVariants(target, value) {
+  const variants = topicVariantSet(value);
+  for (const variant of variants) {
+    target.add(variant);
+  }
+}
+
+function collectUserNotesByTopic(topicKey) {
+  const targetVariants = topicVariantSet(topicKey);
+  if (!targetVariants.size) return [];
+  const all = readAllCards();
+  const matches = [];
+  for (const card of all) {
+    if (!card || card.type !== "note") continue;
+    const sourceUrl = String(card?.value?.source?.url || "").trim();
+    if (!sourceUrl || !sourceUrl.startsWith("user://")) continue;
+    const cardVariants = new Set();
+    mergeTopicVariants(cardVariants, card.topic);
+    mergeTopicVariants(cardVariants, card?.value?.topic);
+    mergeTopicVariants(cardVariants, card?.value?.data?.topic);
+    mergeTopicVariants(cardVariants, card?.value?.data?.topic_key);
+    mergeTopicVariants(cardVariants, card?.value?.metadata?.topic);
+    mergeTopicVariants(cardVariants, card?.value?.metadata?.topic_key);
+    let matched = false;
+    for (const variant of cardVariants) {
+      if (targetVariants.has(variant)) {
+        matched = true;
+        break;
+      }
+    }
+    if (matched) {
+      matches.push(card);
+    }
+  }
+  matches.sort((a, b) => (noteTimestamp(b) || 0) - (noteTimestamp(a) || 0));
+  return matches;
+}
+
+function extractNoteSummary(card) {
+  const candidates = [
+    card?.summary,
+    card?.value?.summary,
+    card?.value?.data?.summary,
+    card?.value?.data?.claim,
+    card?.value?.data?.text
+  ];
+  for (const candidate of candidates) {
+    const str = typeof candidate === "string" ? candidate : "";
+    const clean = str.replace(/\s+/g, " ").trim();
+    if (clean) return clean;
+  }
+  return "";
+}
+
+function limitSummaryLength(text, max = 200) {
+  const clean = String(text || "").trim();
+  if (!clean) return "";
+  if (clean.length <= max) return clean;
+  return `${clean.slice(0, Math.max(1, max - 1))}…`;
+}
+
+function renderNotesList(topicKey) {
+  const key = String(topicKey || "").trim();
+  if (!key) return "No notes yet.";
+  const notes = collectUserNotesByTopic(key);
+  if (!notes.length) {
+    return `No notes saved for ${key}.`;
+  }
+  const seen = new Set();
+  const lines = [];
+  for (let idx = 0; idx < notes.length && lines.length < 10; idx += 1) {
+    const note = notes[idx];
+    const summary = limitSummaryLength(extractNoteSummary(note), 180);
+    const dedupeKey = _norm(summary);
+    if (!summary || (dedupeKey && seen.has(dedupeKey))) continue;
+    if (dedupeKey) seen.add(dedupeKey);
+    const ts = noteTimestamp(note);
+    const age = ts ? formatAgeLabel(ts) : "?";
+    lines.push(`${lines.length + 1}. ${summary}${age ? ` (${age})` : ""}`);
+  }
+  return lines.length ? `Notes for ${key}:\n${lines.join("\n")}` : `No notes saved for ${key}.`;
+}
+
+function renderNotesExport(topicKey) {
+  const key = String(topicKey || "").trim();
+  if (!key) return "No notes yet.";
+  const notes = collectUserNotesByTopic(key);
+  if (!notes.length) {
+    return `No notes saved for ${key}.`;
+  }
+  const seen = new Set();
+  const bullets = [];
+  for (const note of notes) {
+    if (bullets.length >= 12) break;
+    const summary = limitSummaryLength(extractNoteSummary(note), 220);
+    const dedupeKey = _norm(summary);
+    if (!summary || (dedupeKey && seen.has(dedupeKey))) continue;
+    if (dedupeKey) seen.add(dedupeKey);
+    bullets.push(`- ${summary}`);
+  }
+  return bullets.length ? bullets.join("\n") : `No notes saved for ${key}.`;
+}
+
+function upsertUserNoteCard({ topicKey, claim }) {
+  const topic = String(topicKey || "").trim();
+  const summary = String(claim || "").replace(/\s+/g, " ").trim();
+  if (!topic || !summary) return null;
+  const now = Date.now();
+  const normalizedKey = normalizeTopicKey(topic, "notes") || normalizeTopicKey(topic, "news") || topic;
+  const card = {
+    type: "note",
+    topic,
+    summary,
+    value: {
+      source: { url: "user://chat", ts: now },
+      data: { topic, summary, claim: summary },
+      metadata: {
+        saved_by: "user",
+        reason: "chat_note",
+        saved_at: now,
+        topic_key: normalizedKey
+      }
+    },
+    tags: ["user", "note"],
+    entities: [],
+    confidence: 0.7,
+    created_at: now,
+    last_used: now,
+    ttl_days: null
+  };
+  const id = persistCard(card);
+  if (!id) return null;
+  logCardWrite({ ts: now, type: card.type, topic: topic, score: 0.7, reason: "user_note" });
+  return { ...card, id };
+}
 
 function refreshNoteDemotions() {
   try {
@@ -4699,11 +4887,51 @@ wss.on("connection", (ws, req) => {
       
           appendMessage(sessionId, { role: "user", content });
 
+          const send = (reply) => {
+            const text = String(reply ?? "");
+            appendMessage(sessionId, { role: "assistant", content: text });
+            ws.send(JSON.stringify({ type: "assistant_message", content: text }));
+          };
+
+          const noteCommand = maybeHandleNotes(trimmedContent);
+          if (noteCommand) {
+            if (noteCommand.kind === "save_free" || noteCommand.kind === "save_keyed") {
+              const topicKey = noteCommand.key;
+              const claim = noteCommand.body.slice(0, 400);
+              const saved = upsertUserNoteCard({ topicKey, claim });
+              if (saved) {
+                const normalizedKey = normalizeTopicKey(topicKey, "notes")
+                  || normalizeTopicKey(topicKey, "news")
+                  || topicKey;
+                emitInspectorEvent(ws, "card_upsert", {
+                  topicKey: normalizedKey,
+                  noteId: saved.id,
+                  sources: ["user://chat"]
+                });
+                emitInspectorEvent(ws, "cards.saved", { count: 1, keys: [normalizedKey] });
+                send(`Saved to ${topicKey}.`);
+              } else {
+                send("Couldn't save that note.");
+              }
+              flushCardUsage();
+              return;
+            }
+            if (noteCommand.kind === "list") {
+              send(renderNotesList(noteCommand.key));
+              flushCardUsage();
+              return;
+            }
+            if (noteCommand.kind === "export") {
+              send(renderNotesExport(noteCommand.key));
+              flushCardUsage();
+              return;
+            }
+          }
+
           const ackOnly = /^(ok|okay|sounds good|👍)$/i.test(trimmedContent);
           if (ackOnly) {
             const ackReply = "👍";
-            appendMessage(sessionId, { role: "assistant", content: ackReply });
-            ws.send(JSON.stringify({ type: "assistant_message", content: ackReply }));
+            send(ackReply);
             sendKdn(ws, sessionId, { state: "KNOWN", reason: "ack", ambiguous: false });
             flushCardUsage();
             return;
@@ -5749,8 +5977,12 @@ async function executeTool(ws, meta, call_id="auto") {
           canonicalTopicKey = targetConceptKey;
         }
         const listItems = selected.map(r => ({ title: r.title || "", url: r.url, host: r.domain || null }));
+        const followupState = meta.sessionId ? getFollowupState(meta.sessionId) : null;
+        const stateTopicKey = followupState?.lastTopicKey ? normalizeTopicKey(followupState.lastTopicKey, "news") : "";
+        const queryTopicKey = resolveTopicKeyFromQuery(meta.requestText || originalUserQuery || normalizedTopic || topic || "");
+        const topicKeyForSave = stateTopicKey || canonicalHintKey || canonicalTopicKey || queryTopicKey;
         setLastListContext(meta.sessionId, {
-          topicKey: canonicalTopicKey,
+          topicKey: topicKeyForSave,
           qBase: originalUserQuery,
           items: listItems
         });
@@ -5763,21 +5995,21 @@ async function executeTool(ws, meta, call_id="auto") {
           normalizedTopic,
           list: listItems,
           ts: Date.now(),
-          lastTopicKey: canonicalTopicKey,
+          lastTopicKey: topicKeyForSave,
           lastQBase: originalUserQuery,
           lastQuery: baseQuery,
           pageIndex: Number.isFinite(meta?.pageIndex) ? Math.max(0, Number(meta.pageIndex)) : 0
         });
 
         const usedOffset = Number.isFinite(meta?.spec?.args?.offset) ? Math.max(0, Number(meta.spec.args.offset)) : 0;
-        rememberFollowupState(meta.sessionId, canonicalTopicKey || canonicalHintKey || "", baseQuery || normalizedQuery, usedOffset);
+        rememberFollowupState(meta.sessionId, topicKeyForSave || canonicalHintKey || canonicalTopicKey || "", baseQuery || normalizedQuery, usedOffset);
 
         const averageScore = selected.length
           ? selected.reduce((sum, entry) => sum + (Number(entry.score) || 0), 0) / selected.length
           : 0;
         maybeUpsertNewsCard({
           ws,
-          topicKey: canonicalTopicKey,
+          topicKey: topicKeyForSave,
           topicLabel: normalizedTopic || topic,
           selected,
           qualityScore: averageScore
@@ -5846,14 +6078,15 @@ async function executeTool(ws, meta, call_id="auto") {
               const refs = citeEntries.length
                 ? citeEntries.slice(0, 5).map((_, i) => `[${i + 1}]`).join(" ")
                 : "(none)";
-              return [
-                `As of ${stamp}: ${headlineOneLiner(citeEntries)}`,
-                (() => {
-                  const watchLine = watchItem(citeEntries);
-                  return watchLine ? `What’s next: • ${watchLine}` : null;
-                })(),
-                `Sources: ${refs}`
-              ].filter(Boolean).join("\n");
+              const head = headlineOneLiner(citeEntries);
+              let nextLine = watchItem(citeEntries);
+              if (nextLine && _norm(nextLine) === _norm(head)) {
+                nextLine = "";
+              }
+              const parts = [`As of ${stamp}: ${head}`];
+              if (nextLine) parts.push(`What’s next: • ${nextLine}`);
+              parts.push(`Sources: ${refs}`);
+              return parts.filter(Boolean).join("\n");
             };
             let answerBlock = buildAnswerBlock(todayStamp);
             const nyToday = todayISO("America/New_York");

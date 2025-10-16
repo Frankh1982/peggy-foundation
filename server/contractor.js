@@ -2,8 +2,8 @@ import { NEWS_TOPICS, formatDate, matchByAlias } from "./contract_data.js";
 import { getCardsByTopic, formatTopicTitle } from "./autocard.js";
 
 const SMALLTALK_RE = /^(hi|hello|hey|thanks|thank you)\b|what'?s your name|who are you|^my name is\b|^my (favorite|favourite)\b/i;
-const ACTION_RE = /\b(announced|files|threatens|plans|recalls?|acquires?|ban|tariff|tariffs)\b/i;
-const ENTITY_RE = /\b(US|U\.S\.|United States|China|India|Tesla|BYD|OpenAI|AMD|Microsoft|Google|Apple|NVIDIA|Broadcom)\b/;
+const ACTION_RE = /\b(announced|files|threatens|plans|recalls?|acquires?|ban|tariff|tariffs|guide|guidance|outlook|forecast|results|earnings|Q[1-4]|FY\d{2}|launches)\b/i;
+const ENTITY_RE = /\b(US|U\.S\.|United States|China|India|Tesla|TSLA|BYD|OpenAI|AMD|NVIDIA|NVDA|TSMC|Broadcom|AVGO|Intel|INTC|Microsoft|Google|Apple|Meta)\b/;
 
 export function classifyIntent(text) {
   const t = (text || "").trim();
@@ -23,8 +23,11 @@ export function classifyIntent(text) {
     return { intent: "notes_cmd", requiresBrowse: false, reason: "notes" };
   }
 
-  const requiresBrowse = ACTION_RE.test(t) && ENTITY_RE.test(t);
-  return { intent: "generic", requiresBrowse, reason: requiresBrowse ? "action+entity" : "default" };
+  if (ACTION_RE.test(t) && ENTITY_RE.test(t)) {
+    return { intent: "news_latest", requiresBrowse: true, reason: "action+entity" };
+  }
+
+  return { intent: "generic", requiresBrowse: false, reason: "default" };
 }
 
 export function routeContractIntent(text) {
