@@ -279,6 +279,11 @@ function sanitizeQuery(value) {
   return query;
 }
 
+function normalizeQuery(value) {
+  const sanitized = sanitizeQuery(value);
+  return sanitized.replace(/\s+/g, " ").trim();
+}
+
 function queryTokenLength(query) {
   if (!query) return 0;
   return query.replace(/[^A-Za-z0-9]+/g, "").length;
@@ -740,6 +745,45 @@ function saveCitedFactCards(cites = [], { topicKey, ttlDays } = {}) {
   });
 }
 
+function handleAutoCarding({ intent = "", citeEntries = [], answerText = "", followupState = null, ws = null, userText = "" } = {}) {
+  if (!AUTO_LEARN_ENABLED) return;
+  if (intent === "news_latest") {
+    const usedCitations = Array.isArray(citeEntries)
+      ? citeEntries.filter(cite => {
+          const marker = `[${cite.index}]`;
+          return marker && answerText.includes(marker);
+        })
+      : [];
+    if (!usedCitations.length) {
+      inspect.emit("qa", { on_topic: false });
+      return;
+    }
+    const followupKey = (followupState?.lastTopicKey || "").trim();
+    const inferredTopicKey = followupKey
+      ? normalizeTopicKey(followupKey, "news") || followupKey
+      : "";
+    if (!inferredTopicKey) {
+      inspect.emit("qa", { on_topic: false });
+      return;
+    }
+    const ttlEnv = Number(process.env.PEG_NEWS_TTL_DAYS);
+    const ttlDays = Number.isFinite(ttlEnv) && ttlEnv > 0 ? Math.floor(ttlEnv) : 21;
+    const saveResult = saveCitedFactCards(usedCitations, { topicKey: inferredTopicKey, ttlDays });
+    const savedCount = Number.isFinite(saveResult?.count) ? saveResult.count : usedCitations.length;
+    const savedKeys = Array.isArray(saveResult?.topicKeys) && saveResult.topicKeys.length
+      ? saveResult.topicKeys
+      : [normalizeTopicKey(inferredTopicKey, "news") || inferredTopicKey];
+    if (savedCount > 0 && ws) {
+      emitInspectorEvent(ws, "cards.saved", { count: savedCount, keys: savedKeys });
+    }
+    return;
+  }
+  if (isUserProfileNote(userText)) {
+    // Allow downstream pipelines to use user://chat for profile/preferences.
+    return;
+  }
+}
+
 function canonicalTopicKey(k) {
   if (!k) return "notes/inbox";
   let t = String(k)
@@ -841,6 +885,7 @@ function fallbackFromLastReliable(cites = []) {
 }
 
 export const inspector = new EventEmitter();
+const inspect = inspector;
 
 const TOPIC_COMMAND_PREFIX_RE = /^(?:\s*(?:save|link|promote)\s+(?:note|concept)|\s*notes?)\b/i;
 
@@ -4556,6 +4601,19 @@ function detectListIntent(text) {
 
 function wantsListOnly(text) { return Boolean(detectListIntent(text)); }
 
+function isUserProfileNote(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  if (/^notes?\b/.test(lower)) return false;
+  const patterns = [
+    /\bmy (name|birthday|birthdate|age|hometown|home town|job|role|title|wife|husband|partner|spouse|kid|kids|son|daughter|family|favorite|favourite|hobby|interest|pronouns?)\b/,
+    /\bi (?:am|work|live|was born)\b/,
+    /\bcall me\b/
+  ];
+  return patterns.some(pattern => pattern.test(lower));
+}
+
 function cleanConceptPhrase(text) {
   if (!text) return "";
   return String(text)
@@ -5462,6 +5520,18 @@ wss.on("connection", (ws, req) => {
           if (listIntent) {
             const storedList = getStoredListContext(sessionId);
             const followupState = getFollowupState(sessionId);
+            if (followupState) {
+              const topicFromUser = slugTopic(content);
+              const normalizedUserQuery = normalizeQuery(content);
+              if (topicFromUser) {
+                followupState.lastTopicKey = topicFromUser;
+                if (normalizedUserQuery) {
+                  followupState.lastQueryFor[topicFromUser] = normalizedUserQuery;
+                }
+                followupState.updatedAt = Date.now();
+                listFollowupStore.set(sessionId, followupState);
+              }
+            }
             if (findMoreSites && !(followupState?.lastTopicKey)) {
               flushCardUsage();
               const reply = 'Which topic? e.g., "US–China Nov 1 tariffs"';
@@ -5602,8 +5672,8 @@ wss.on("connection", (ws, req) => {
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topic);
             const args = { q: base, qlist: qlist.slice(), k: SEARCH_K };
-            const normalizedQueryForState = sanitizeQuery(args.q || base);
-            const topicKeyCandidate = slugTopic(base || content);
+            const normalizedQueryForState = normalizeQuery(content) || sanitizeQuery(args.q || base);
+            const topicKeyCandidate = slugTopic(content) || slugTopic(base || content);
             if (followupState && topicKeyCandidate && normalizedQueryForState) {
               followupState.lastTopicKey = topicKeyCandidate;
               followupState.lastQueryFor[topicKeyCandidate] = normalizedQueryForState;
@@ -6265,12 +6335,12 @@ async function executeTool(ws, meta, call_id="auto") {
           ws.send(JSON.stringify({ type: "assistant_message", content: text }));
         };
 
-        if (meta.intent === "news_latest") {
-          if (meta.findMoreSites) {
-            const downrankHostPatterns = [
-              "resources.nvidia.com",
-              "apps.apple.com",
-              "play.google.com"
+          if (meta.intent === "news_latest") {
+            if (meta.findMoreSites) {
+              const downrankHostPatterns = [
+                "resources.nvidia.com",
+                "apps.apple.com",
+                "play.google.com"
             ];
             const downrankUrlPatterns = [
               "nvidia.com/en-us/data-center/where-to-buy",
@@ -6368,80 +6438,50 @@ async function executeTool(ws, meta, call_id="auto") {
               }
             }
 
-            const lines = filteredList.map((c, i) => {
-              const title = cleanNewsText(c.title || c.url || c.domain);
-              return `[${i + 1}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
-            });
-            emitInspectorEvent(ws, "qa", {
-              intent: meta.intent,
-              has_date: false,
-              citations: filteredList.length,
-              sections_ok: true,
-              on_topic: Boolean(topic)
-            });
-            const payload = filteredList.length ? lines.join("\n") : "No additional sources found.";
-            sendAssistant(payload);
+            if (!followupState?.lastTopicKey) {
+              sendAssistant('Which topic? e.g., "US–China Nov 1 tariffs"');
+            } else {
+              const limitedList = filteredList.slice(0, 5);
+              const lines = limitedList.map((c, i) => {
+                const title = cleanNewsText(c.title || c.url || c.domain);
+                return `[${i + 1}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
+              });
+              emitInspectorEvent(ws, "qa", {
+                intent: meta.intent,
+                has_date: false,
+                citations: limitedList.length,
+                sections_ok: true,
+                on_topic: Boolean(topic)
+              });
+              const payload = limitedList.length >= 2 ? lines.join("\n") : "No additional sources found.";
+              sendAssistant(payload);
+            }
             handedToModel = true;
           } else {
             const todayStamp = todayISO("America/New_York");
             const answerText = buildNewsAnswer(todayStamp, citeEntries);
             const hasDate = /\d{4}-\d{2}-\d{2}/.test(answerText);
-            emitInspectorEvent(ws, "qa", {
+            const qaPayload = {
               intent: meta.intent,
               has_date: hasDate,
               citations: citeCount,
               sections_ok: true,
               on_topic: true
-            });
+            };
+            inspect.emit("qa", qaPayload);
+            emitEventLog(ws, "qa", qaPayload);
             if (!(hasDate && citeCount >= 2)) {
               sendAssistant(fallbackFromLastReliable(citeEntries));
             } else {
               sendAssistant(answerText);
-              if (AUTO_LEARN_ENABLED) {
-                const followupKey = (followupState?.lastTopicKey || "").trim();
-                const inferredTopicKey = followupKey
-                  ? normalizeTopicKey(followupKey, "news") || followupKey
-                  : "";
-                if (inferredTopicKey) {
-                  const entities = topicEntities(inferredTopicKey);
-                  if (!entities.size) {
-                    emitInspectorEvent(ws, "compose.qa", { contamination: true });
-                  } else {
-                    const alignedCites = citeEntries.filter(cite => overlaps(citeHostEntities(cite), entities));
-                    if (!alignedCites.length) {
-                      emitInspectorEvent(ws, "compose.qa", { contamination: true });
-                      emitInspectorEvent(ws, "qa", {
-                        intent: meta.intent,
-                        has_date: hasDate,
-                        citations: citeCount,
-                        sections_ok: true,
-                        on_topic: false
-                      });
-                    } else {
-                      const ttlEnv = Number(process.env.PEG_NEWS_TTL_DAYS);
-                      const ttlDays = Number.isFinite(ttlEnv) && ttlEnv > 0 ? Math.floor(ttlEnv) : 21;
-                      const saveResult = saveCitedFactCards(alignedCites, { topicKey: inferredTopicKey, ttlDays });
-                      const savedCount = Number.isFinite(saveResult?.count) ? saveResult.count : alignedCites.length;
-                      const savedKeys = Array.isArray(saveResult?.topicKeys) && saveResult.topicKeys.length
-                        ? saveResult.topicKeys
-                        : [normalizeTopicKey(inferredTopicKey, "news") || inferredTopicKey];
-                      if (savedCount > 0) {
-                        emitInspectorEvent(ws, "cards.saved", { count: savedCount, keys: savedKeys });
-                      }
-                    }
-                  }
-                }
-                if (!inferredTopicKey) {
-                  emitInspectorEvent(ws, "compose.qa", { contamination: true });
-                  emitInspectorEvent(ws, "qa", {
-                    intent: meta.intent,
-                    has_date: hasDate,
-                    citations: citeCount,
-                    sections_ok: true,
-                    on_topic: false
-                  });
-                }
-              }
+              handleAutoCarding({
+                intent: meta.intent,
+                citeEntries,
+                answerText,
+                followupState,
+                ws,
+                userText: meta.requestText || originalUserQuery
+              });
             }
             handedToModel = true;
           }
