@@ -2,7 +2,7 @@ import { NEWS_TOPICS, formatDate, matchByAlias } from "./contract_data.js";
 import { getCardsByTopic, formatTopicTitle } from "./autocard.js";
 
 const SMALLTALK_RE = /^(hi|hello|hey|thanks|thank you)\b|what'?s your name|who are you|^my name is\b|^my (favorite|favourite)\b/i;
-const ACTION_RE = /(?:\b(?:guide|guidance|outlook|forecast|results|earnings|revenue|update|announced|files|launches|plans|recalls?|acquires?|ban|tariff|tariffs|threatens|likelihood|likely|odds|chance|chances?|impact|issues?|backlash|fallout|reaction|deal|partnership|agreement|warrant|stake|options?)\b|what happened|\bQ[1-4]\b|\bFY\d{2}\b)/i;
+const ACTION_RE = /(?:\b(?:guide|guidance|outlook|forecast|results|earnings|revenue|update|announced|files|launches|plans|recalls?|acquires?|ban|tariff|tariffs|threatens|likelihood|likely|odds|chance|chances?|impact|issues?|backlash|fallout|reaction|deal|partnership|agreement|warrant|stake|options?)\b|what happened|\bimpact\b|\bissues?\b|\bbacklash\b|\bfallout\b|\bdeal\b|\bpartnership\b|\bagreement\b|\btariffs?\b|\bannounced\b|\bplans?\b|\bupdate\b|\bQ[1-4]\b|\bFY\d{2}\b)/i;
 const DATE_CUE_RE = /((?:on|by|before|after)\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|\d{1,2}|20\d{2})\b|\b\d{4}-\d{2}-\d{2}\b)/i;
 
 const ENTITY_TERMS = [
@@ -86,7 +86,7 @@ export function classifyIntent(text) {
     return { intent: "notes_cmd", requiresBrowse: false, reason: "notes" };
   }
 
-  if ((ACTION_RE.test(t) || DATE_CUE_RE.test(t)) && ENTITY_RE.test(t)) {
+  if (ENTITY_RE.test(t) && (ACTION_RE.test(t) || DATE_CUE_RE.test(t))) {
     return { intent: "news_latest", requiresBrowse: true, reason: "action+entity" };
   }
 

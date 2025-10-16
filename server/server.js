@@ -511,12 +511,16 @@ function resetOffset(state, key) {
 function rememberFollowupState(sessionId, topicKey, query, offset = 0) {
   if (!sessionId) return;
   const state = getFollowupState(sessionId);
-  const cleanKey = topicKey ? normalizeTopicKey(topicKey, "news") || topicKey : "";
-  if (cleanKey) {
-    state.lastTopicKey = cleanKey;
-    state.pageOffsetFor[cleanKey] = Math.max(0, Number(offset) || 0);
-    if (query) {
-      state.lastQueryFor[cleanKey] = sanitizeQuery(query);
+  const cleanQuery = query ? sanitizeQuery(query) : "";
+  const derivedKey = topicKey ? normalizeTopicKey(topicKey, "news") || topicKey : "";
+  const fallbackKey = !derivedKey && cleanQuery ? slugTopic(cleanQuery) : "";
+  const keyToStore = derivedKey || fallbackKey;
+  if (keyToStore) {
+    state.lastTopicKey = keyToStore;
+    state.pageOffsetFor[keyToStore] = Math.max(0, Number(offset) || 0);
+    if (cleanQuery) {
+      const normalizedQuery = normalizeQuery(cleanQuery) || cleanQuery;
+      state.lastQueryFor[keyToStore] = normalizedQuery;
     }
   }
   state.updatedAt = Date.now();
@@ -777,8 +781,7 @@ function handleAutoCarding({ intent = "", citeEntries = [], answerText = "", fol
       emitInspectorEvent(ws, "cards.saved", { count: savedCount, keys: savedKeys });
     }
     return;
-  }
-  if (isUserProfileNote(userText)) {
+  } else if (isUserProfileNote(userText)) {
     // Allow downstream pipelines to use user://chat for profile/preferences.
     return;
   }
@@ -836,6 +839,23 @@ function watchItem(cites = []) {
     }
   }
   return "";
+}
+
+function ensureBeginsWithAsOf(answer, stamp) {
+  const text = String(answer || "").trim();
+  const dateStamp = String(stamp || "").trim();
+  if (!dateStamp) {
+    return text;
+  }
+  if (!text) {
+    return `As of ${dateStamp}:`;
+  }
+  const [firstLine, ...restLines] = text.split("\n");
+  const prefix = `As of ${dateStamp}:`;
+  const normalizedFirst = firstLine.replace(/^As of\s+\d{4}-\d{2}-\d{2}:\s*/i, "").trim();
+  const rebuiltFirst = normalizedFirst ? `${prefix} ${normalizedFirst}` : `${prefix}`;
+  const remainder = restLines.length ? `\n${restLines.join("\n")}` : "";
+  return `${rebuiltFirst}${remainder}`.trim();
 }
 
 function buildNewsAnswer(stamp, cites = []) {
@@ -5521,12 +5541,14 @@ wss.on("connection", (ws, req) => {
             const storedList = getStoredListContext(sessionId);
             const followupState = getFollowupState(sessionId);
             if (followupState) {
-              const topicFromUser = slugTopic(content);
               const normalizedUserQuery = normalizeQuery(content);
-              if (topicFromUser) {
-                followupState.lastTopicKey = topicFromUser;
+              const topicFromUser = slugTopic(content);
+              const fallbackTopic = !topicFromUser && normalizedUserQuery ? slugTopic(normalizedUserQuery) : "";
+              const topicKeyForState = topicFromUser || fallbackTopic;
+              if (topicKeyForState) {
+                followupState.lastTopicKey = topicKeyForState;
                 if (normalizedUserQuery) {
-                  followupState.lastQueryFor[topicFromUser] = normalizedUserQuery;
+                  followupState.lastQueryFor[topicKeyForState] = normalizedUserQuery;
                 }
                 followupState.updatedAt = Date.now();
                 listFollowupStore.set(sessionId, followupState);
@@ -6337,25 +6359,48 @@ async function executeTool(ws, meta, call_id="auto") {
 
           if (meta.intent === "news_latest") {
             if (meta.findMoreSites) {
+              const MIN_HOSTS = 4;
               const downrankHostPatterns = [
                 "resources.nvidia.com",
                 "apps.apple.com",
-                "play.google.com"
-            ];
-            const downrankUrlPatterns = [
-              "nvidia.com/en-us/data-center/where-to-buy",
-              "where-to-buy"
-            ];
-            const financePriorityHosts = [
-              "investor.nvidia.com",
-              "ir.amd.com",
-              "reuters.com",
-              "apnews.com",
-              "bloomberg.com",
-              "wsj.com",
-              "ft.com",
-              "sec.gov"
-            ];
+                "play.google.com",
+                "nvidia.com",
+                "amd.com",
+                "intel.com",
+                "qualcomm.com",
+                "samsung.com",
+                "tesla.com",
+                "byd.com",
+                "press.nvidia.com",
+                "press.amd.com",
+                "prnewswire.com",
+                "businesswire.com",
+                "globenewswire.com",
+                "medium.com",
+                "blog.google",
+                "blog.google.com",
+                "newsroom.apple.com",
+                "blog.nvidia.com"
+              ];
+              const downrankUrlPatterns = [
+                "nvidia.com/en-us/data-center/where-to-buy",
+                "where-to-buy",
+                "press-release",
+                "pressroom",
+                "blog",
+                "newsroom",
+                "/app/"
+              ];
+              const financePriorityHosts = [
+                "investor.nvidia.com",
+                "ir.amd.com",
+                "reuters.com",
+                "apnews.com",
+                "bloomberg.com",
+                "wsj.com",
+                "ft.com",
+                "sec.gov"
+              ];
             const matchesAnyDomain = (host, patterns) => {
               return patterns.some(pattern => domainMatches(host, pattern));
             };
@@ -6379,10 +6424,11 @@ async function executeTool(ws, meta, call_id="auto") {
                 const hostKey = registrableDomain(domain) || domain.toLowerCase();
                 if (!hostKey) continue;
                 let weight = idx;
-                if (matchesAnyDomain(domain, downrankHostPatterns) || matchesAnyUrlPattern(url, downrankUrlPatterns)) {
+                const isPriority = matchesAnyDomain(domain, financePriorityHosts);
+                if ((matchesAnyDomain(domain, downrankHostPatterns) || matchesAnyUrlPattern(url, downrankUrlPatterns)) && !isPriority) {
                   weight += 5;
                 }
-                if (matchesAnyDomain(domain, financePriorityHosts)) {
+                if (isPriority) {
                   weight -= 2;
                 }
                 scored.push({ cite, hostKey: hostKey.toLowerCase(), weight, order: idx });
@@ -6405,7 +6451,7 @@ async function executeTool(ws, meta, call_id="auto") {
             };
 
             let filteredList = applyHostFilters(citeEntries);
-            if (filteredList.length < 2) {
+            if (filteredList.length < MIN_HOSTS) {
               try {
                 const baseOffsetRaw = Number(meta?.spec?.args?.offset ?? 0);
                 const baseOffset = Number.isFinite(baseOffsetRaw) ? baseOffsetRaw : 0;
@@ -6446,6 +6492,11 @@ async function executeTool(ws, meta, call_id="auto") {
                 const title = cleanNewsText(c.title || c.url || c.domain);
                 return `[${i + 1}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
               });
+              const uniqueHosts = new Set(
+                limitedList
+                  .map(item => registrableDomain(item.domain || "") || extractDomain(item.url || "") || "")
+                  .filter(Boolean)
+              );
               emitInspectorEvent(ws, "qa", {
                 intent: meta.intent,
                 has_date: false,
@@ -6453,38 +6504,41 @@ async function executeTool(ws, meta, call_id="auto") {
                 sections_ok: true,
                 on_topic: Boolean(topic)
               });
-              const payload = limitedList.length >= 2 ? lines.join("\n") : "No additional sources found.";
+              const payload = limitedList.length >= 2 && uniqueHosts.size >= MIN_HOSTS
+                ? lines.join("\n")
+                : "No additional sources found.";
               sendAssistant(payload);
             }
             handedToModel = true;
-          } else {
-            const todayStamp = todayISO("America/New_York");
-            const answerText = buildNewsAnswer(todayStamp, citeEntries);
-            const hasDate = /\d{4}-\d{2}-\d{2}/.test(answerText);
-            const qaPayload = {
-              intent: meta.intent,
-              has_date: hasDate,
-              citations: citeCount,
-              sections_ok: true,
-              on_topic: true
-            };
-            inspect.emit("qa", qaPayload);
-            emitEventLog(ws, "qa", qaPayload);
-            if (!(hasDate && citeCount >= 2)) {
-              sendAssistant(fallbackFromLastReliable(citeEntries));
             } else {
-              sendAssistant(answerText);
-              handleAutoCarding({
+              const today = todayISO("America/New_York");
+              let answer = buildNewsAnswer(today, citeEntries);
+              answer = ensureBeginsWithAsOf(answer, today);
+              const hasDate = /\d{4}-\d{2}-\d{2}/.test(answer);
+              const qaPayload = {
                 intent: meta.intent,
-                citeEntries,
-                answerText,
-                followupState,
-                ws,
-                userText: meta.requestText || originalUserQuery
-              });
+                has_date: hasDate,
+                citations: citeCount,
+                sections_ok: true,
+                on_topic: true
+              };
+              inspect.emit("qa", qaPayload);
+              emitEventLog(ws, "qa", qaPayload);
+              if (!(hasDate && citeCount >= 2)) {
+                sendAssistant(fallbackFromLastReliable(citeEntries));
+              } else {
+                sendAssistant(answer);
+                handleAutoCarding({
+                  intent: meta.intent,
+                  citeEntries,
+                  answerText: answer,
+                  followupState,
+                  ws,
+                  userText: meta.requestText || originalUserQuery
+                });
+              }
+              handedToModel = true;
             }
-            handedToModel = true;
-          }
         } else {
           const msg = `Here are ${selected.length} sources:\n${lines}`;
           sendAssistant(msg);
