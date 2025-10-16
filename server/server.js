@@ -5462,6 +5462,14 @@ wss.on("connection", (ws, req) => {
           if (listIntent) {
             const storedList = getStoredListContext(sessionId);
             const followupState = getFollowupState(sessionId);
+            if (findMoreSites && !(followupState?.lastTopicKey)) {
+              flushCardUsage();
+              const reply = 'Which topic? e.g., "US–China Nov 1 tariffs"';
+              appendMessage(sessionId, { role: "assistant", content: reply });
+              ws.send(JSON.stringify({ type: "assistant_message", content: reply }));
+              sendFreshnessEvent();
+              return;
+            }
             const resolvedFollowup = resolveTopicKey(content, followupState);
             if (resolvedFollowup?.reject) {
               flushCardUsage();
@@ -5594,6 +5602,14 @@ wss.on("connection", (ws, req) => {
             const { qlist, keysUsed } = buildQueryList(base, { max: 8 });
             const runNumber = touchTopicRun(sessionId, topic);
             const args = { q: base, qlist: qlist.slice(), k: SEARCH_K };
+            const normalizedQueryForState = sanitizeQuery(args.q || base);
+            const topicKeyCandidate = slugTopic(base || content);
+            if (followupState && topicKeyCandidate && normalizedQueryForState) {
+              followupState.lastTopicKey = topicKeyCandidate;
+              followupState.lastQueryFor[topicKeyCandidate] = normalizedQueryForState;
+              followupState.updatedAt = Date.now();
+              listFollowupStore.set(sessionId, followupState);
+            }
             const previousTopicKey = previous?.lastTopicKey || "";
             let pageIndex = 0;
             let offsetToUse = 0;
@@ -6256,7 +6272,10 @@ async function executeTool(ws, meta, call_id="auto") {
               "apps.apple.com",
               "play.google.com"
             ];
-            const downrankUrlPatterns = ["nvidia.com/en-us/data-center/where-to-buy"];
+            const downrankUrlPatterns = [
+              "nvidia.com/en-us/data-center/where-to-buy",
+              "where-to-buy"
+            ];
             const financePriorityHosts = [
               "investor.nvidia.com",
               "ir.amd.com",
@@ -6365,24 +6384,24 @@ async function executeTool(ws, meta, call_id="auto") {
             handedToModel = true;
           } else {
             const todayStamp = todayISO("America/New_York");
-            const answer = buildNewsAnswer(todayStamp, citeEntries);
-            const hasDate = /\d{4}-\d{2}-\d{2}/.test(answer);
-            const ok = hasDate && citeCount >= 2;
+            const answerText = buildNewsAnswer(todayStamp, citeEntries);
+            const hasDate = /\d{4}-\d{2}-\d{2}/.test(answerText);
             emitInspectorEvent(ws, "qa", {
               intent: meta.intent,
               has_date: hasDate,
               citations: citeCount,
               sections_ok: true,
-              on_topic: Boolean(topic)
+              on_topic: true
             });
-            if (!ok) {
+            if (!(hasDate && citeCount >= 2)) {
               sendAssistant(fallbackFromLastReliable(citeEntries));
             } else {
-              sendAssistant(answer);
+              sendAssistant(answerText);
               if (AUTO_LEARN_ENABLED) {
                 const followupKey = (followupState?.lastTopicKey || "").trim();
                 const inferredTopicKey = followupKey
-                  || resolveTopicKeyFromQuery(meta.requestText || originalUserQuery || normalizedTopic || topic || "");
+                  ? normalizeTopicKey(followupKey, "news") || followupKey
+                  : "";
                 if (inferredTopicKey) {
                   const entities = topicEntities(inferredTopicKey);
                   if (!entities.size) {
@@ -6391,6 +6410,13 @@ async function executeTool(ws, meta, call_id="auto") {
                     const alignedCites = citeEntries.filter(cite => overlaps(citeHostEntities(cite), entities));
                     if (!alignedCites.length) {
                       emitInspectorEvent(ws, "compose.qa", { contamination: true });
+                      emitInspectorEvent(ws, "qa", {
+                        intent: meta.intent,
+                        has_date: hasDate,
+                        citations: citeCount,
+                        sections_ok: true,
+                        on_topic: false
+                      });
                     } else {
                       const ttlEnv = Number(process.env.PEG_NEWS_TTL_DAYS);
                       const ttlDays = Number.isFinite(ttlEnv) && ttlEnv > 0 ? Math.floor(ttlEnv) : 21;
@@ -6404,6 +6430,16 @@ async function executeTool(ws, meta, call_id="auto") {
                       }
                     }
                   }
+                }
+                if (!inferredTopicKey) {
+                  emitInspectorEvent(ws, "compose.qa", { contamination: true });
+                  emitInspectorEvent(ws, "qa", {
+                    intent: meta.intent,
+                    has_date: hasDate,
+                    citations: citeCount,
+                    sections_ok: true,
+                    on_topic: false
+                  });
                 }
               }
             }
