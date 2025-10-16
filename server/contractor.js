@@ -3,7 +3,69 @@ import { getCardsByTopic, formatTopicTitle } from "./autocard.js";
 
 const SMALLTALK_RE = /^(hi|hello|hey|thanks|thank you)\b|what'?s your name|who are you|^my name is\b|^my (favorite|favourite)\b/i;
 const ACTION_RE = /(?:\b(?:guide|guidance|outlook|forecast|results|earnings|revenue|update|announced|files|launches|plans|recalls?|acquires?|ban|tariff|tariffs|threatens)\b|\bQ[1-4]\b|\bFY\d{2}\b)/i;
-const ENTITY_RE = /\b(NVIDIA|NVDA|AMD|TSMC|Broadcom|AVGO|Intel|INTC|Microsoft|Google|Apple|Meta|United States|U\.S\.|US|China|India|Tesla|TSLA|BYD|OpenAI)\b/i;
+
+const ENTITY_TERMS = [
+  "NVIDIA",
+  "NVDA",
+  "AMD",
+  "TSMC",
+  "Broadcom",
+  "AVGO",
+  "Intel",
+  "INTC",
+  "Microsoft",
+  "Google",
+  "Alphabet",
+  "Apple",
+  "Meta",
+  "Tesla",
+  "TSLA",
+  "BYD",
+  "OpenAI",
+  "Samsung",
+  "Sony",
+  "Qualcomm",
+  "ARM",
+  "IBM",
+  "Oracle",
+  "Netflix",
+  "Amazon",
+  "United States",
+  "U.S.",
+  "US",
+  "United Kingdom",
+  "UK",
+  "England",
+  "Britain",
+  "China",
+  "India",
+  "Taiwan",
+  "Japan",
+  "Germany",
+  "France",
+  "Canada",
+  "Australia",
+  "South Korea",
+  "Korea",
+  "Saudi Arabia",
+  "Mexico",
+  "Brazil"
+];
+
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildEntityRegex(terms = []) {
+  const pattern = terms
+    .map(term => term.trim())
+    .filter(Boolean)
+    .map(term => term.split(/\s+/).map(escapeRegex).join("\\s+"))
+    .join("|");
+  return new RegExp(`\\b(${pattern})\\b`, "i");
+}
+
+const ENTITY_RE = buildEntityRegex(ENTITY_TERMS);
 
 export function classifyIntent(text) {
   const t = (text || "").trim();
@@ -34,6 +96,39 @@ export function routeContractIntent(text) {
   return classifyIntent(text);
 }
 
+function buildFallbackFromSources(sources = []) {
+  if (!Array.isArray(sources) || !sources.length) {
+    return {
+      reply: "No authoritative updates in the last 72 h.",
+      sources: [],
+      facts: [],
+      hasDate: false,
+      citationsOk: false,
+      sectionsOk: true
+    };
+  }
+  const primary = sources[0];
+  const labelParts = [];
+  if (primary?.title) {
+    labelParts.push(primary.title.trim());
+  }
+  if (primary?.date) {
+    labelParts.push(primary.date.trim());
+  }
+  if (primary?.url) {
+    labelParts.push(primary.url.trim());
+  }
+  const detail = labelParts.length ? ` Last reliable report noted ${labelParts.join(" — ")}.` : "";
+  return {
+    reply: `No authoritative updates in the last 72 h.${detail}`,
+    sources: sources.slice(0, 1),
+    facts: [],
+    hasDate: false,
+    citationsOk: false,
+    sectionsOk: true
+  };
+}
+
 function buildNewsResponse(entry, now = new Date()) {
   if (!entry) return null;
   const today = formatDate(now);
@@ -44,13 +139,24 @@ function buildNewsResponse(entry, now = new Date()) {
   const trimmedSummary = sentences.slice(0, 2).join(" ");
   const watchLine = `What’s next: • ${entry.watch}`;
   const sourceRefs = sources.map((_source, idx) => `[${idx + 1}]`).join(" ");
-  const detailed = sources.map((source, idx) => `[${idx + 1}] ${source.title} — ${source.date} (${source.url})`);
-  const sourceLine = sources.length === 1 ? "Sources: best single source [1]" : `Sources: ${sourceRefs}`;
+  const detailedPairs = sources.map((source, idx) => {
+    const bits = [];
+    if (source.title) bits.push(source.title);
+    if (source.date) bits.push(source.date);
+    if (source.url) bits.push(source.url);
+    return `[${idx + 1}] ${bits.join(" — ")}`;
+  });
   const replyParts = [`As of ${today}: ${trimmedSummary}`];
-  replyParts.push(watchLine);
-  replyParts.push(sourceLine);
-  replyParts.push(...detailed);
+  if (entry.watch) {
+    replyParts.push(watchLine);
+  }
+  replyParts.push(sources.length === 1 ? "Sources: best single source [1]" : `Sources: ${sourceRefs}`);
+  if (detailedPairs.length) {
+    replyParts.push(`Details: ${detailedPairs.join("; ")}`);
+  }
   const reply = replyParts.join("\n");
+  const hasDate = /\d{4}-\d{2}-\d{2}/.test(reply);
+  const citationsOk = sources.length >= 2;
   const facts = entry.facts.map(fact => ({
     ...fact,
     topic_key: entry.topic_key,
@@ -60,9 +166,9 @@ function buildNewsResponse(entry, now = new Date()) {
     reply,
     sources,
     facts,
-    hasDate: true,
-    citationsOk: true,
-    sectionsOk: true,
+    hasDate,
+    citationsOk,
+    sectionsOk: replyParts.length <= 4,
     topicKey: entry.topic_key,
     summary: entry.summary
   };
@@ -207,6 +313,25 @@ export function handleContractTurn({ text = "", now = new Date() } = {}) {
     if (!match) return { handled: false };
     const response = buildNewsResponse(match, now);
     if (!response) return { handled: false };
+    const citationCount = Array.isArray(response.sources) ? response.sources.length : 0;
+    const hasDate = /\d{4}-\d{2}-\d{2}/.test(response.reply || "");
+    if (!hasDate || citationCount < 2) {
+      const fallback = buildFallbackFromSources(response.sources);
+      return {
+        handled: true,
+        intent: route.intent,
+        requiresBrowse: Boolean(route.requiresBrowse),
+        reply: fallback.reply,
+        sources: fallback.sources,
+        facts: [],
+        hasDate: fallback.hasDate,
+        citationsOk: fallback.citationsOk,
+        sectionsOk: fallback.sectionsOk,
+        topicKey: response.topicKey,
+        searchLogs: [{ q: match.searchQuery, hits: match.sources.length }],
+        routerReason: route.reason || "news"
+      };
+    }
     return {
       handled: true,
       intent: route.intent,

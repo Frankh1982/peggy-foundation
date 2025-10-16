@@ -607,81 +607,69 @@ function _norm(s) {
   return (s || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-const ENTITY_TOKEN_WHITELIST = new Set([
-  "nvidia",
-  "nvda",
-  "amd",
-  "tsmc",
-  "broadcom",
-  "avgo",
-  "intel",
-  "intc",
-  "microsoft",
-  "google",
-  "alphabet",
-  "apple",
-  "meta",
-  "tesla",
-  "tsla",
-  "byd",
-  "openai",
-  "us",
-  "unitedstates",
-  "china",
-  "india"
+const TOPIC_STOP_TOKENS = new Set([
+  "news",
+  "latest",
+  "update",
+  "today",
+  "outlook",
+  "forecast",
+  "analysis",
+  "report",
+  "reports",
+  "stocks",
+  "stock"
 ]);
 
-function normalizeEntityToken(token) {
+function normalizeTopicToken(token) {
   const raw = String(token || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "");
   if (!raw) return "";
   if (raw === "usa") return "us";
+  if (raw === "u" || raw === "s") return "";
   if (raw === "unitedstate" || raw === "unitedstates" || raw === "united" || raw === "states") {
     return "unitedstates";
   }
+  if (raw === "unitedkingdom") return "uk";
   return raw;
 }
 
 function topicEntities(topicKey = "") {
   const raw = String(topicKey || "");
   if (!raw) return new Set();
-  const tokens = raw
-    .split(/[\/:,\-]+/)
-    .map(normalizeEntityToken)
-    .filter(Boolean);
-  const entities = new Set();
-  for (const token of tokens) {
-    if (ENTITY_TOKEN_WHITELIST.has(token)) {
-      entities.add(token);
-    }
+  const pieces = raw.split(/[\s/:,\-]+/);
+  const tokens = new Set();
+  for (const piece of pieces) {
+    const normalized = normalizeTopicToken(piece);
+    if (!normalized) continue;
+    if (TOPIC_STOP_TOKENS.has(normalized)) continue;
+    if (normalized.length < 2) continue;
+    tokens.add(normalized);
   }
-  return entities;
+  return tokens;
 }
 
 function citeHostEntities(cite = {}) {
   const tokens = new Set();
-  const host = cite?.domain || extractDomain(cite?.url || "") || "";
-  const addTokens = (value) => {
+  const collect = (value) => {
     const words = String(value || "")
       .toLowerCase()
       .split(/[^a-z0-9]+/)
-      .map(normalizeEntityToken)
+      .map(normalizeTopicToken)
       .filter(Boolean);
     for (const word of words) {
-      if (ENTITY_TOKEN_WHITELIST.has(word)) {
-        tokens.add(word);
-      }
+      if (word.length < 2) continue;
+      if (TOPIC_STOP_TOKENS.has(word)) continue;
+      tokens.add(word);
     }
   };
+  const host = cite?.domain || extractDomain(cite?.url || "") || "";
   if (host) {
-    addTokens(host);
+    collect(host);
   }
   if (cite?.title) {
-    addTokens(cite.title);
-  }
-  if (cite?.snippet) {
-    addTokens(cite.snippet);
+    collect(cite.title);
   }
   return tokens;
 }
@@ -812,15 +800,24 @@ function buildNewsAnswer(stamp, cites = []) {
   const head = headlineOneLiner(cites);
   let next = watchItem(cites);
   if (next && _norm(next) === _norm(head)) next = null;
-  const detailLines = citeList.map((cite, idx) => {
+  const detailPairs = citeList.map((cite, idx) => {
     const title = cleanNewsText(cite?.title || cite?.url || cite?.domain || "");
-    const url = cite?.url || "(no url)";
-    return `[${idx + 1}] ${title || "(no title)"} — ${url}`;
+    const host = cite?.domain || extractDomain(cite?.url || "") || "";
+    const labelParts = [title || host || "(no title)"];
+    if (cite?.snippet) {
+      const snippet = cleanNewsText(cite.snippet);
+      if (snippet) {
+        labelParts.push(snippet.slice(0, 160));
+      }
+    }
+    return `[${idx + 1}] ${labelParts.join(" — ")}`;
   });
   const parts = [`As of ${stamp}: ${head}`];
   if (next) parts.push(`What’s next: • ${next}`);
   parts.push(`Sources: ${refs}`);
-  parts.push(...detailLines);
+  if (detailPairs.length) {
+    parts.push(`Details: ${detailPairs.join("; ")}`);
+  }
   return parts.filter(Boolean).join("\n");
 }
 
@@ -837,9 +834,10 @@ function fallbackFromLastReliable(cites = []) {
   const primary = cites[0];
   const host = hostLabelFromCite(primary);
   const title = cleanNewsText(primary?.title || "");
-  const citeLine = `[1] ${title || primary?.url || host} — ${primary?.url || "(no url)"}`;
-  const summary = title ? `Last reliable report from ${host} said ${title}.` : `Last reliable report came from ${host}.`;
-  return [`No authoritative updates in the last 72 h. ${summary}`, "Sources: [1]", citeLine].join("\n");
+  const detail = title
+    ? ` Last reliable report from ${host} highlighted ${title}.`
+    : ` Last reliable report came from ${host}.`;
+  return `No authoritative updates in the last 72 h.${detail}`;
 }
 
 export const inspector = new EventEmitter();
@@ -5157,10 +5155,15 @@ wss.on("connection", (ws, req) => {
               requires_browse: Boolean(contractResult.requiresBrowse),
               reason: contractResult.routerReason || ""
             });
-            emitInspectorEvent(ws, "compose.qa", {
+            const citationCount = Array.isArray(contractResult.sources)
+              ? contractResult.sources.length
+              : 0;
+            emitInspectorEvent(ws, "qa", {
+              intent: contractResult.intent,
               has_date: Boolean(contractResult.hasDate),
-              citations: Boolean(contractResult.citationsOk),
-              sections_ok: Boolean(contractResult.sectionsOk)
+              citations: citationCount,
+              sections_ok: Boolean(contractResult.sectionsOk),
+              on_topic: Boolean(contractResult.topicKey)
             });
             emitInspectorEvent(ws, "cards.saved", {
               count: Number(pipelineResult?.count || 0),
@@ -6284,12 +6287,12 @@ async function executeTool(ws, meta, call_id="auto") {
                 const domain = cite.domain || extractDomain(url) || "";
                 if (!domain) continue;
                 if (FOLLOWUP_BANNED_HOSTS.some(pattern => domainMatches(domain, pattern))) continue;
-                if (matchesAnyDomain(domain, downrankHostPatterns) || matchesAnyUrlPattern(url, downrankUrlPatterns)) {
-                  continue;
-                }
                 const hostKey = registrableDomain(domain) || domain.toLowerCase();
                 if (!hostKey) continue;
                 let weight = idx;
+                if (matchesAnyDomain(domain, downrankHostPatterns) || matchesAnyUrlPattern(url, downrankUrlPatterns)) {
+                  weight += 5;
+                }
                 if (matchesAnyDomain(domain, financePriorityHosts)) {
                   weight -= 2;
                 }
@@ -6350,10 +6353,14 @@ async function executeTool(ws, meta, call_id="auto") {
               const title = cleanNewsText(c.title || c.url || c.domain);
               return `[${i + 1}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
             });
-            emitInspectorEvent(ws, "compose.qa", { has_date: false, citations: filteredList.length, sections_ok: true });
-            const payload = filteredList.length
-              ? `More sources:\n${lines.join("\n")}`
-              : "More sources:\n(none)";
+            emitInspectorEvent(ws, "qa", {
+              intent: meta.intent,
+              has_date: false,
+              citations: filteredList.length,
+              sections_ok: true,
+              on_topic: Boolean(topic)
+            });
+            const payload = filteredList.length ? lines.join("\n") : "No additional sources found.";
             sendAssistant(payload);
             handedToModel = true;
           } else {
@@ -6361,7 +6368,13 @@ async function executeTool(ws, meta, call_id="auto") {
             const answer = buildNewsAnswer(todayStamp, citeEntries);
             const hasDate = /\d{4}-\d{2}-\d{2}/.test(answer);
             const ok = hasDate && citeCount >= 2;
-            emitInspectorEvent(ws, "compose.qa", { has_date: hasDate, citations: citeCount, sections_ok: true });
+            emitInspectorEvent(ws, "qa", {
+              intent: meta.intent,
+              has_date: hasDate,
+              citations: citeCount,
+              sections_ok: true,
+              on_topic: Boolean(topic)
+            });
             if (!ok) {
               sendAssistant(fallbackFromLastReliable(citeEntries));
             } else {
