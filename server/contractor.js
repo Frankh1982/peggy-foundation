@@ -3,7 +3,7 @@ import { getCardsByTopic, formatTopicTitle } from "./autocard.js";
 
 const SMALLTALK_RE = /^(hi|hello|hey|thanks|thank you)\b|what'?s your name|who are you|^my name is\b|^my (favorite|favourite)\b/i;
 const ACTION_RE = /(?:\b(?:guide|guidance|outlook|forecast|results|earnings|revenue|update|announced|files|launches|plans|recalls?|acquires?|ban|tariff|tariffs|threatens)\b|\bQ[1-4]\b|\bFY\d{2}\b)/i;
-const ENTITY_RE = /\b(US|U\.S\.|United States|China|India|Tesla|TSLA|BYD|OpenAI|AMD|NVIDIA|NVDA|TSMC|Broadcom|AVGO|Intel|INTC|Microsoft|Google|Apple|Meta)\b/i;
+const ENTITY_RE = /\b(NVIDIA|NVDA|AMD|TSMC|Broadcom|AVGO|Intel|INTC|Microsoft|Google|Apple|Meta|United States|U\.S\.|US|China|India|Tesla|TSLA|BYD|OpenAI)\b/i;
 
 export function classifyIntent(text) {
   const t = (text || "").trim();
