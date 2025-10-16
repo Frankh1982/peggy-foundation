@@ -2,8 +2,8 @@ import { NEWS_TOPICS, formatDate, matchByAlias } from "./contract_data.js";
 import { getCardsByTopic, formatTopicTitle } from "./autocard.js";
 
 const SMALLTALK_RE = /^(hi|hello|hey|thanks|thank you)\b|what'?s your name|who are you|^my name is\b|^my (favorite|favourite)\b/i;
-const ACTION_RE = /\b(announced|files|threatens|plans|recalls?|acquires?|ban|tariff|tariffs|guide|guidance|outlook|forecast|results|earnings|Q[1-4]|FY\d{2}|launches)\b/i;
-const ENTITY_RE = /\b(US|U\.S\.|United States|China|India|Tesla|TSLA|BYD|OpenAI|AMD|NVIDIA|NVDA|TSMC|Broadcom|AVGO|Intel|INTC|Microsoft|Google|Apple|Meta)\b/;
+const ACTION_RE = /(?:\b(?:guide|guidance|outlook|forecast|results|earnings|revenue|update|announced|files|launches|plans|recalls?|acquires?|ban|tariff|tariffs|threatens)\b|\bQ[1-4]\b|\bFY\d{2}\b)/i;
+const ENTITY_RE = /\b(US|U\.S\.|United States|China|India|Tesla|TSLA|BYD|OpenAI|AMD|NVIDIA|NVDA|TSMC|Broadcom|AVGO|Intel|INTC|Microsoft|Google|Apple|Meta)\b/i;
 
 export function classifyIntent(text) {
   const t = (text || "").trim();
