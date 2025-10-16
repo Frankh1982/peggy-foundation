@@ -95,6 +95,46 @@ const NEWS_DOWNRANK = parseHostList(process.env.NEWS_DOWNRANK || "");
 const OFFICIAL_PR_DOMAINS = parseHostList(process.env.OFFICIAL_PR_DOMAINS || process.env.PR_ALLOWLIST || "");
 const PRIORITIZE_OFFICIAL_PR = parseHostList(process.env.PRIORITIZE_OFFICIAL_PR || "");
 const FOLLOWUP_KEYWORD_REGEX = /^(?:find\s+more(?:\s+(?:sites?|sources?|links?|stories))?|more(?:\s+(?:sites?|sources?|links?|stories))?|more)$/i;
+const FIND_MORE_SITES_RE = /\bfind (more )?sites\b/i;
+const FOLLOWUP_BANNED_HOSTS = ["apps.apple.com", "play.google.com", "support.google.com", "help.apple.com"];
+const ETLD_EXCEPTIONS = new Set([
+  "co.uk",
+  "org.uk",
+  "gov.uk",
+  "ac.uk",
+  "co.jp",
+  "or.jp",
+  "ne.jp",
+  "go.jp",
+  "lg.jp",
+  "com.au",
+  "net.au",
+  "org.au",
+  "gov.au",
+  "edu.au",
+  "com.br",
+  "net.br",
+  "gov.br",
+  "com.cn",
+  "net.cn",
+  "gov.cn",
+  "com.sg",
+  "net.sg",
+  "com.tw",
+  "net.tw",
+  "com.hk",
+  "net.hk"
+]);
+const DROP_PATTERNS = [
+  /privacy policy/i,
+  /cookie(s)?/i,
+  /consent/i,
+  /recaptcha/i,
+  /terms of service/i,
+  /sign up/i,
+  /subscribe/i,
+  /advertisement/i
+];
 const AUTO_RESEARCH_CONFIG = {
   max_searches_per_turn: MAX_AUTO_SEARCHES_PER_TURN,
   max_notes_per_session: MAX_AUTO_NOTES_PER_SESSION,
@@ -479,7 +519,7 @@ function rememberFollowupState(sessionId, topicKey, query, offset = 0) {
 
 function resolveTopicKey(userText, state) {
   const text = String(userText || "");
-  const findMore = /\bfind (more )?sites\b/i.test(text);
+  const findMore = FIND_MORE_SITES_RE.test(text);
   if (findMore) {
     if (STRICT_FOLLOWUP && !state?.lastTopicKey) {
       return { reject: true, reason: "no-last-topic" };
@@ -489,6 +529,52 @@ function resolveTopicKey(userText, state) {
   const key = slugTopic(text);
   if (RESET_OFFSET_ON_TOPIC_CHANGE && key) resetOffset(state, key);
   return { topicKey: key, advanceOffset: false };
+}
+
+function todayISO(tz = "America/New_York") {
+  try {
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    });
+    const parts = formatter.formatToParts(now).reduce((acc, part) => {
+      acc[part.type] = part.value;
+      return acc;
+    }, {});
+    if (parts.year && parts.month && parts.day) {
+      return `${parts.year}-${parts.month}-${parts.day}`;
+    }
+  } catch {}
+  return new Date().toISOString().slice(0, 10);
+}
+
+function cleanSnippet(txt) {
+  if (!txt) return "";
+  return String(txt)
+    .split(/\n+/)
+    .map(line => line.replace(/\s+/g, " ").trim())
+    .filter(line => line && !DROP_PATTERNS.some(rx => rx.test(line)))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function registrableDomain(host) {
+  if (!host) return "";
+  const clean = String(host).trim().toLowerCase();
+  if (!clean) return "";
+  const parts = clean.split(".").filter(Boolean);
+  if (parts.length <= 2) return clean;
+  const last = parts[parts.length - 1];
+  const second = parts[parts.length - 2];
+  const sld = `${second}.${last}`;
+  if (ETLD_EXCEPTIONS.has(sld) && parts.length >= 3) {
+    return `${parts[parts.length - 3]}.${sld}`;
+  }
+  return sld;
 }
 
 function cleanNewsText(text) {
@@ -511,7 +597,8 @@ function headlineOneLiner(cites = []) {
   }
   const sentences = [];
   for (const cite of cites.slice(0, 2)) {
-    const snippet = cleanNewsText(cite?.snippet || cite?.title || "");
+    const snippetSource = cite?.snippet || cite?.body || cite?.title || "";
+    const snippet = cleanNewsText(cleanSnippet(snippetSource));
     if (!snippet) continue;
     const sentence = ensureSentence(snippet);
     if (!sentence) continue;
@@ -521,7 +608,7 @@ function headlineOneLiner(cites = []) {
     if (sentences.length >= 2) break;
   }
   if (!sentences.length) {
-    const fallback = cleanNewsText(cites[0]?.title || cites[0]?.snippet || "");
+    const fallback = cleanNewsText(cleanSnippet(cites[0]?.title || cites[0]?.snippet || ""));
     if (fallback) {
       sentences.push(ensureSentence(fallback));
     }
@@ -536,7 +623,7 @@ function watchItem(cites = []) {
   if (!Array.isArray(cites)) return "";
   const patterns = /\b(will|plans?|expected|set to|upcoming|pending|could|watch|awaits?|looking to)\b/i;
   for (const cite of cites) {
-    const snippet = cleanNewsText(cite?.snippet || "");
+    const snippet = cleanNewsText(cleanSnippet(cite?.snippet || cite?.body || ""));
     if (!snippet) continue;
     if (patterns.test(snippet)) {
       return snippet.endsWith(".") ? snippet.slice(0, -1).trim() : snippet;
@@ -1339,7 +1426,7 @@ async function ensureCard(topicKey, intent, { sessionId = null, userId = null } 
     return { wroteCard: false, appendedUpdate: false };
   }
 
-  const summaryBase = (selectedSource.snippet || selectedSource.title || "").replace(/[\r\n]+/g, " ").trim();
+  const summaryBase = cleanSnippet(selectedSource.snippet || selectedSource.title || "");
   const summary = (summaryBase || `Update on ${detokenizeTopicKey(canonicalKey) || canonicalKey}`).slice(0, 400);
   const facetSource = summaryBase.split(/(?:\.|;|\?|!)+/).map(line => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   const facets = facetSource.slice(0, 3);
@@ -1962,6 +2049,10 @@ function maybeUpsertNewsCard({ ws, topicKey, topicLabel, selected, qualityScore 
     topicKey: canonicalKey,
     noteId,
     sources: sources.map(src => src.url)
+  });
+  emitInspectorEvent(ws, "cards.saved", {
+    count: 1,
+    keys: [canonicalKey]
   });
   return { noteId };
 }
@@ -4984,6 +5075,7 @@ wss.on("connection", (ws, req) => {
             const storedTopic = storedList?.topic || previous?.topic || "";
             const storedTopicKey = storedList?.lastTopicKey || previous?.lastTopicKey || "";
             let followupMode = false;
+            const findMoreSites = FIND_MORE_SITES_RE.test(content);
 
             if (advanceOffset && resolvedTopicKey) {
               const storedQueryForTopic = sanitizeQuery(followupState.lastQueryFor[resolvedTopicKey] || "");
@@ -5168,7 +5260,8 @@ wss.on("connection", (ws, req) => {
               listFollowup: Boolean(listIntent.topicless || followupMode || advanceOffset),
               pageIndex,
               searchIntent,
-              intent: "news_latest"
+              intent: "news_latest",
+              findMoreSites
             }));
             return;
           }
@@ -5383,8 +5476,9 @@ async function executeTool(ws, meta, call_id="auto") {
         }
       };
 
-      if (meta.intent === "news_latest") {
-        downrankHosts(["apps.apple.com", "play.google.com"]);
+      const isFindMoreSites = Boolean(meta?.findMoreSites);
+      if (meta.intent === "news_latest" || isFindMoreSites) {
+        downrankHosts(["apps.apple.com", "play.google.com", "support.google.com", "help.apple.com"]);
         allowlistHosts(Array.from(NEWS_ALLOWLIST));
         prioritizeHosts(Array.from(PRIORITIZE_OFFICIAL_PR));
       }
@@ -5417,7 +5511,11 @@ async function executeTool(ws, meta, call_id="auto") {
 
       const hostKeyForEntry = (entry) => {
         if (!entry) return null;
-        if (entry.domain) return entry.domain.toLowerCase();
+        const domain = entry.domain || (entry.url ? extractDomain(entry.url) : "");
+        if (domain) {
+          const registrable = registrableDomain(domain);
+          return registrable || domain.toLowerCase();
+        }
         if (entry.url) return entry.url.split("#")[0].toLowerCase();
         if (Number.isFinite(entry.idx)) return `__idx_${entry.idx}`;
         return null;
@@ -5490,6 +5588,26 @@ async function executeTool(ws, meta, call_id="auto") {
         for (const entry of entries) {
           if (selected.length >= 5) break;
           tryAddEntry(entry, opts);
+        }
+      };
+
+      const enforceHostDiversity = () => {
+        const seen = new Set();
+        const filtered = [];
+        for (const entry of selected) {
+          const key = hostKeyForEntry(entry);
+          if (key && seen.has(key)) continue;
+          if (key) seen.add(key);
+          filtered.push(entry);
+        }
+        if (filtered.length !== selected.length) {
+          selected.length = 0;
+          selected.push(...filtered);
+          selectedHostKeys.clear();
+          for (const entry of filtered) {
+            const key = hostKeyForEntry(entry);
+            if (key) selectedHostKeys.add(key);
+          }
         }
       };
 
@@ -5582,6 +5700,7 @@ async function executeTool(ws, meta, call_id="auto") {
       };
 
       ensureHighTrustQuota();
+      enforceHostDiversity();
 
       if (adjustmentLog.length) {
         const trimmedLog = adjustmentLog.slice(0, 15);
@@ -5669,13 +5788,27 @@ async function executeTool(ws, meta, call_id="auto") {
 
       if (selected.length) {
         const lines = selected.map((r,i) => `#${i+1} — ${r.title || "(no title)"} (score ${formatScore(r.score)}) — ${r.url}`).join("\n");
-        const citeEntries = selected.slice(0, 5).map((entry, idx) => ({
-          index: idx + 1,
-          title: entry?.title || "",
-          url: entry?.url || "",
-          domain: entry?.domain || extractDomain(entry?.url || "") || "",
-          snippet: entry?.snippet || ""
-        }));
+        const citeEntries = [];
+        for (const entry of selected.slice(0, 5)) {
+          const url = entry?.url || "";
+          if (!url) continue;
+          const domain = entry?.domain || extractDomain(url) || "";
+          const rawBody = typeof entry?.body === "string" ? entry.body : "";
+          const safeBody = rawBody ? cleanSnippet(rawBody) : "";
+          if (rawBody && safeBody.length < 200) {
+            continue;
+          }
+          const snippetSource = entry?.snippet || safeBody || entry?.title || "";
+          const snippet = cleanSnippet(snippetSource);
+          citeEntries.push({
+            index: citeEntries.length + 1,
+            title: entry?.title || "",
+            url,
+            domain,
+            snippet,
+            body: safeBody
+          });
+        }
         const citeCount = citeEntries.filter(c => c.url).length;
         const sendAssistant = (text) => {
           appendMessage(meta.sessionId, { role: "assistant", content: text });
@@ -5683,30 +5816,67 @@ async function executeTool(ws, meta, call_id="auto") {
         };
 
         if (meta.intent === "news_latest") {
-          const today = new Date().toISOString().slice(0, 10);
-          const summaryLine = headlineOneLiner(citeEntries);
-          const watchLine = watchItem(citeEntries);
-          const sourcesLine = citeEntries.length
-            ? `Sources: ${citeEntries.map(c => `[${c.index}]`).join(" ")}`
-            : "Sources: (none)";
-          const detailLines = citeEntries.map(c => {
-            const title = cleanNewsText(c.title || c.url || c.domain);
-            return `[${c.index}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
-          });
-          const composed = [
-            `As of ${today}: ${summaryLine}`,
-            watchLine ? `What’s next: • ${watchLine}` : null,
-            sourcesLine,
-            ...detailLines
-          ].filter(Boolean).join("\n");
-          const hasDate = /\d{4}-\d{2}-\d{2}/.test(composed);
-          emitInspectorEvent(ws, "compose.qa", { has_date: hasDate, citations: citeCount, sections_ok: true });
-          if (hasDate && citeCount >= 2) {
-            sendAssistant(composed);
+          if (meta.findMoreSites) {
+            const deduped = [];
+            const seenHosts = new Set();
+            for (const cite of citeEntries) {
+              const host = registrableDomain(cite.domain || extractDomain(cite.url) || "") || (cite.domain || "");
+              if (FOLLOWUP_BANNED_HOSTS.some(b => domainMatches(cite.domain || host, b))) continue;
+              const key = host || cite.url;
+              if (key && seenHosts.has(key)) continue;
+              if (key) seenHosts.add(key);
+              deduped.push(cite);
+              if (deduped.length >= 5) break;
+            }
+            const lines = deduped.map((c, i) => {
+              const title = cleanNewsText(c.title || c.url || c.domain);
+              return `[${i + 1}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
+            });
+            emitInspectorEvent(ws, "compose.qa", { has_date: false, citations: deduped.length, sections_ok: true });
+            const payload = deduped.length
+              ? `More sources:\n${lines.join("\n")}`
+              : "More sources:\n(none)";
+            sendAssistant(payload);
+            handedToModel = true;
           } else {
-            sendAssistant(fallbackFromLastReliable(citeEntries));
+            const tzCandidates = [meta?.userTimezone, meta?.timezone, meta?.user_tz];
+            const preferredTz = tzCandidates.find(value => typeof value === "string" && value.trim())?.trim() || "America/New_York";
+            let todayStamp = todayISO(preferredTz);
+            const buildAnswerBlock = (stamp) => {
+              const refs = citeEntries.length
+                ? citeEntries.slice(0, 5).map((_, i) => `[${i + 1}]`).join(" ")
+                : "(none)";
+              return [
+                `As of ${stamp}: ${headlineOneLiner(citeEntries)}`,
+                (() => {
+                  const watchLine = watchItem(citeEntries);
+                  return watchLine ? `What’s next: • ${watchLine}` : null;
+                })(),
+                `Sources: ${refs}`
+              ].filter(Boolean).join("\n");
+            };
+            let answerBlock = buildAnswerBlock(todayStamp);
+            const nyToday = todayISO("America/New_York");
+            if (todayStamp > nyToday) {
+              todayStamp = nyToday;
+              answerBlock = buildAnswerBlock(todayStamp);
+            }
+            const detailLines = citeEntries.map(c => {
+              const title = cleanNewsText(c.title || c.url || c.domain);
+              return `[${c.index}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
+            });
+            const composed = [answerBlock, ...detailLines].filter(Boolean).join("\n");
+            const hasDate = /\d{4}-\d{2}-\d{2}/.test(answerBlock);
+            const badBoiler = /privacy policy|recaptcha|cookies|terms of service/i.test(answerBlock);
+            const ok = hasDate && citeCount >= 2 && !badBoiler;
+            emitInspectorEvent(ws, "compose.qa", { has_date: hasDate, citations: citeCount, sections_ok: !badBoiler });
+            if (ok) {
+              sendAssistant(composed);
+            } else {
+              sendAssistant(fallbackFromLastReliable(citeEntries));
+            }
+            handedToModel = true;
           }
-          handedToModel = true;
         } else {
           const msg = `Here are ${selected.length} sources:\n${lines}`;
           sendAssistant(msg);
@@ -5858,6 +6028,7 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
     const storedTopic = storedList?.topic || previous?.topic || "";
     const storedTopicKey = storedList?.lastTopicKey || previous?.lastTopicKey || "";
     let followupMode = false;
+    const findMoreSites = FIND_MORE_SITES_RE.test(fallbackText);
 
     if (advanceOffset && resolvedTopicKey) {
       const storedQueryForTopic = sanitizeQuery(followupState.lastQueryFor[resolvedTopicKey] || "");
@@ -6007,6 +6178,7 @@ async function handleAssistantResponse(ws, { completion, usage, userId, sessionI
       searchIntent,
       intent: "news_latest",
       listFollowup: Boolean(followupMode || advanceOffset),
+      findMoreSites,
       ...conceptMeta,
       turnHooks
     });
@@ -6179,10 +6351,11 @@ function cleanAndCapDoc(raw, limit) {
   if (!limit) return "";
   const text = typeof raw === "string" ? raw : "";
   const normalized = text.replace(/\r\n/g, "\n");
-  const paragraphs = normalized.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  const paragraphs = normalized.split(/\n{2,}/).map(p => cleanSnippet(p)).filter(Boolean);
   const filtered = paragraphs.filter(p => p.replace(/\s+/g, " ").trim().length >= 60);
   const joined = (filtered.length ? filtered : paragraphs).join("\n\n");
-  return joined.slice(0, limit);
+  const cleaned = cleanSnippet(joined);
+  return cleaned.slice(0, limit);
 }
 
 async function callOpenAI(messages) {
