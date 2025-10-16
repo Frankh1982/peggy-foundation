@@ -607,6 +607,151 @@ function _norm(s) {
   return (s || "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+const ENTITY_TOKEN_WHITELIST = new Set([
+  "nvidia",
+  "nvda",
+  "amd",
+  "tsmc",
+  "broadcom",
+  "avgo",
+  "intel",
+  "intc",
+  "microsoft",
+  "google",
+  "alphabet",
+  "apple",
+  "meta",
+  "tesla",
+  "tsla",
+  "byd",
+  "openai",
+  "us",
+  "unitedstates",
+  "china",
+  "india"
+]);
+
+function normalizeEntityToken(token) {
+  const raw = String(token || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+  if (!raw) return "";
+  if (raw === "usa") return "us";
+  if (raw === "unitedstate" || raw === "unitedstates" || raw === "united" || raw === "states") {
+    return "unitedstates";
+  }
+  return raw;
+}
+
+function topicEntities(topicKey = "") {
+  const raw = String(topicKey || "");
+  if (!raw) return new Set();
+  const tokens = raw
+    .split(/[\/:,\-]+/)
+    .map(normalizeEntityToken)
+    .filter(Boolean);
+  const entities = new Set();
+  for (const token of tokens) {
+    if (ENTITY_TOKEN_WHITELIST.has(token)) {
+      entities.add(token);
+    }
+  }
+  return entities;
+}
+
+function citeHostEntities(cite = {}) {
+  const tokens = new Set();
+  const host = cite?.domain || extractDomain(cite?.url || "") || "";
+  const addTokens = (value) => {
+    const words = String(value || "")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map(normalizeEntityToken)
+      .filter(Boolean);
+    for (const word of words) {
+      if (ENTITY_TOKEN_WHITELIST.has(word)) {
+        tokens.add(word);
+      }
+    }
+  };
+  if (host) {
+    addTokens(host);
+  }
+  if (cite?.title) {
+    addTokens(cite.title);
+  }
+  if (cite?.snippet) {
+    addTokens(cite.snippet);
+  }
+  return tokens;
+}
+
+function overlaps(setA, setB) {
+  if (!setA || !setB || typeof setA.size !== "number" || typeof setB.size !== "number") {
+    return false;
+  }
+  if (setA.size === 0 || setB.size === 0) return false;
+  for (const value of setA) {
+    if (setB.has(value)) return true;
+  }
+  return false;
+}
+
+function saveCitedFactCards(cites = [], { topicKey, ttlDays } = {}) {
+  if (!Array.isArray(cites) || !cites.length) {
+    return { count: 0, topicKeys: [] };
+  }
+  const normalizedKey = normalizeTopicKey(topicKey || "", "news") || String(topicKey || "").trim();
+  if (!normalizedKey) {
+    return { count: 0, topicKeys: [] };
+  }
+  const ttlNum = Number(ttlDays);
+  const ttl = Number.isFinite(ttlNum) && ttlNum > 0 ? Math.floor(ttlNum) : 21;
+  const todayStamp = todayISO("America/New_York");
+  const facts = [];
+  const seenClaims = new Set();
+  for (const cite of cites) {
+    if (!cite || !cite.url) continue;
+    const snippetSource = cite.snippet || cite.body || cite.title || "";
+    const claimText = cleanNewsText(snippetSource);
+    if (!claimText) continue;
+    const claim = ensureSentence(claimText).slice(0, 360);
+    const claimKey = claim.toLowerCase();
+    if (seenClaims.has(claimKey)) continue;
+    seenClaims.add(claimKey);
+    const sourceTitle = cleanNewsText(cite.title || "");
+    const fact = {
+      topic_key: normalizedKey,
+      claim,
+      source: [
+        {
+          url: cite.url,
+          title: sourceTitle || undefined,
+          date: todayStamp
+        }
+      ],
+      ttl_days: ttl,
+      tags: ["news", "auto"],
+      confidence: 0.6
+    };
+    facts.push(fact);
+  }
+  if (!facts.length) {
+    return { count: 0, topicKeys: [] };
+  }
+  const pipelineSources = facts.map(fact => ({
+    url: fact.source?.[0]?.url,
+    title: fact.source?.[0]?.title,
+    date: fact.source?.[0]?.date
+  }));
+  return runAutoCardPipeline({
+    facts,
+    sources: pipelineSources,
+    intent: "news_latest",
+    provenance: { intent: "news_latest" }
+  });
+}
+
 function canonicalTopicKey(k) {
   if (!k) return "notes/inbox";
   let t = String(k)
@@ -6103,23 +6248,110 @@ async function executeTool(ws, meta, call_id="auto") {
 
         if (meta.intent === "news_latest") {
           if (meta.findMoreSites) {
-            const deduped = [];
-            const seenHosts = new Set();
-            for (const cite of citeEntries) {
-              const host = registrableDomain(cite.domain || extractDomain(cite.url) || "") || (cite.domain || "");
-              if (FOLLOWUP_BANNED_HOSTS.some(b => domainMatches(cite.domain || host, b))) continue;
-              const key = host || cite.url;
-              if (key && seenHosts.has(key)) continue;
-              if (key) seenHosts.add(key);
-              deduped.push(cite);
-              if (deduped.length >= 5) break;
+            const downrankHostPatterns = [
+              "resources.nvidia.com",
+              "apps.apple.com",
+              "play.google.com"
+            ];
+            const downrankUrlPatterns = ["nvidia.com/en-us/data-center/where-to-buy"];
+            const financePriorityHosts = [
+              "investor.nvidia.com",
+              "ir.amd.com",
+              "reuters.com",
+              "apnews.com",
+              "bloomberg.com",
+              "wsj.com",
+              "ft.com",
+              "sec.gov"
+            ];
+            const matchesAnyDomain = (host, patterns) => {
+              return patterns.some(pattern => domainMatches(host, pattern));
+            };
+            const matchesAnyUrlPattern = (url, patterns) => {
+              const lowerUrl = String(url || "").toLowerCase();
+              return patterns.some(pattern => lowerUrl.includes(pattern.toLowerCase()));
+            };
+            const applyHostFilters = (entries) => {
+              if (!Array.isArray(entries)) return [];
+              const seenUrls = new Set();
+              const scored = [];
+              for (let idx = 0; idx < entries.length; idx += 1) {
+                const cite = entries[idx];
+                if (!cite || !cite.url) continue;
+                const url = cite.url;
+                if (seenUrls.has(url)) continue;
+                seenUrls.add(url);
+                const domain = cite.domain || extractDomain(url) || "";
+                if (!domain) continue;
+                if (FOLLOWUP_BANNED_HOSTS.some(pattern => domainMatches(domain, pattern))) continue;
+                if (matchesAnyDomain(domain, downrankHostPatterns) || matchesAnyUrlPattern(url, downrankUrlPatterns)) {
+                  continue;
+                }
+                const hostKey = registrableDomain(domain) || domain.toLowerCase();
+                if (!hostKey) continue;
+                let weight = idx;
+                if (matchesAnyDomain(domain, financePriorityHosts)) {
+                  weight -= 2;
+                }
+                scored.push({ cite, hostKey: hostKey.toLowerCase(), weight, order: idx });
+              }
+              scored.sort((a, b) => {
+                if (a.weight === b.weight) {
+                  return a.order - b.order;
+                }
+                return a.weight - b.weight;
+              });
+              const unique = [];
+              const seenHosts = new Set();
+              for (const entry of scored) {
+                if (seenHosts.has(entry.hostKey)) continue;
+                seenHosts.add(entry.hostKey);
+                unique.push(entry.cite);
+                if (unique.length >= 5) break;
+              }
+              return unique;
+            };
+
+            let filteredList = applyHostFilters(citeEntries);
+            if (filteredList.length < 2) {
+              try {
+                const baseOffsetRaw = Number(meta?.spec?.args?.offset ?? 0);
+                const baseOffset = Number.isFinite(baseOffsetRaw) ? baseOffsetRaw : 0;
+                const refillOffset = baseOffset + Math.max(5, citeEntries.length || 5);
+                const refillArgs = { ...meta.spec.args, offset: refillOffset };
+                const refillResult = await tool_web_search(refillArgs, { MAX_PAGE_CHARS, BRAVE_API_KEY: process.env.BRAVE_API_KEY });
+                const refillEntries = Array.isArray(refillResult?.results) ? refillResult.results : [];
+                if (refillEntries.length) {
+                  const extraCites = refillEntries
+                    .map((entry, extraIdx) => {
+                      const url = entry?.url || "";
+                      if (!url) return null;
+                      const domain = entry?.domain || extractDomain(url) || "";
+                      return {
+                        index: citeEntries.length + extraIdx + 1,
+                        title: entry?.title || "",
+                        url,
+                        domain,
+                        snippet: cleanSnippet(entry?.snippet || entry?.title || ""),
+                        body: ""
+                      };
+                    })
+                    .filter(Boolean);
+                  if (extraCites.length) {
+                    filteredList = applyHostFilters([...citeEntries, ...extraCites]);
+                  }
+                }
+              } catch (err) {
+                console.error("followup_refill_failed", err);
+              }
             }
-            const lines = deduped.map((c, i) => {
+
+            const lines = filteredList.map((c, i) => {
               const title = cleanNewsText(c.title || c.url || c.domain);
               return `[${i + 1}] ${title || "(no title)"} — ${c.url || "(no url)"}`;
             });
-            emitInspectorEvent(ws, "compose.qa", { has_date: false, citations: deduped.length, sections_ok: true });
-            const payload = deduped.length
+            emitInspectorEvent(ws, "compose.qa", { has_date: false, citations: filteredList.length, sections_ok: true });
+            const payload = filteredList.length
               ? `More sources:\n${lines.join("\n")}`
               : "More sources:\n(none)";
             sendAssistant(payload);
@@ -6134,6 +6366,33 @@ async function executeTool(ws, meta, call_id="auto") {
               sendAssistant(fallbackFromLastReliable(citeEntries));
             } else {
               sendAssistant(answer);
+              if (AUTO_LEARN_ENABLED) {
+                const followupKey = (followupState?.lastTopicKey || "").trim();
+                const inferredTopicKey = followupKey
+                  || resolveTopicKeyFromQuery(meta.requestText || originalUserQuery || normalizedTopic || topic || "");
+                if (inferredTopicKey) {
+                  const entities = topicEntities(inferredTopicKey);
+                  if (!entities.size) {
+                    emitInspectorEvent(ws, "compose.qa", { contamination: true });
+                  } else {
+                    const alignedCites = citeEntries.filter(cite => overlaps(citeHostEntities(cite), entities));
+                    if (!alignedCites.length) {
+                      emitInspectorEvent(ws, "compose.qa", { contamination: true });
+                    } else {
+                      const ttlEnv = Number(process.env.PEG_NEWS_TTL_DAYS);
+                      const ttlDays = Number.isFinite(ttlEnv) && ttlEnv > 0 ? Math.floor(ttlEnv) : 21;
+                      const saveResult = saveCitedFactCards(alignedCites, { topicKey: inferredTopicKey, ttlDays });
+                      const savedCount = Number.isFinite(saveResult?.count) ? saveResult.count : alignedCites.length;
+                      const savedKeys = Array.isArray(saveResult?.topicKeys) && saveResult.topicKeys.length
+                        ? saveResult.topicKeys
+                        : [normalizeTopicKey(inferredTopicKey, "news") || inferredTopicKey];
+                      if (savedCount > 0) {
+                        emitInspectorEvent(ws, "cards.saved", { count: savedCount, keys: savedKeys });
+                      }
+                    }
+                  }
+                }
+              }
             }
             handedToModel = true;
           }
